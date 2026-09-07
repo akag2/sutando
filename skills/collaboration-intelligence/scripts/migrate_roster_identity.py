@@ -959,12 +959,18 @@ def main() -> int:
         print(f"refusing to migrate: {exc}", file=sys.stderr)
         return 2
     dest = a.out or a.roster.with_suffix(".v2.json")
-    if dest.resolve() == a.roster.resolve() or (
-            dest.exists() and dest.samefile(a.roster)):
-        # samefile too: a hardlink has a different resolved NAME and the same
-        # inode, so a name check alone destroys the v1 rollback.
-        print("refusing to overwrite the input roster", file=sys.stderr)
-        return 2
+    # EVERY supplied input, not just the roster: --triage-config X --out X
+    # returned 0, replaced `people` with the v2 map, and printed "input
+    # untouched". samefile too — a hardlink has a different resolved NAME and
+    # the same inode, so a name check alone destroys the rollback copy.
+    for flag, src in (("--roster", a.roster), ("--triage-config", a.triage_config),
+                      ("--peers", a.peers), ("--discord-config", a.discord_config)):
+        if src is None:
+            continue
+        if dest.resolve() == src.resolve() or (
+                dest.exists() and src.exists() and dest.samefile(src)):
+            print(f"refusing to overwrite the input {flag} file", file=sys.stderr)
+            return 2
     # A UNIQUE sibling created O_EXCL: a deterministic name can already be a
     # hardlink or symlink to the roster, and write_text follows it.
     fd, tmp_name = tempfile.mkstemp(dir=str(dest.parent), prefix=dest.name + ".",
