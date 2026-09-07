@@ -137,6 +137,16 @@ class TestHookRegistration(unittest.TestCase):
         self.assertEqual(out["status"], "warn")
         self.assertIn("never run", out["detail"])
 
+    def test_an_unresolvable_override_falls_back_to_the_repo(self):
+        """An override the OS cannot resolve (a symlink loop, a dead mount) must not abort the
+        probe: it reads the repo's file, the same target the installer would have fallen to."""
+        self._settings(self._all_registered())
+        with mock.patch.dict(os.environ, {"SUTANDO_CLAUDE_WORKING_DIR": str(self.repo / "loop")}), \
+             mock.patch.object(Path, "resolve", side_effect=OSError("ELOOP")):
+            self.assertEqual(self.hc._hook_settings_target(self.repo), self.repo)
+            out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
+        self.assertEqual(out["status"], "ok", out["detail"])
+
     def test_malformed_settings_warns_never_raises(self):
         (self.repo / ".claude" / "settings.json").write_text("{not json")
         try:
