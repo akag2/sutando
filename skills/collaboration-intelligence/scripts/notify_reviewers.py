@@ -1315,12 +1315,12 @@ def _stale_repeat_ask(message: str, targets, roster, minutes: int = 30):
     ledger = ledger_path()
     if not ledger.exists():
         return False, ""
-    actor_of = _actor_map(roster)
+    # The SAME identity owner routing and park admission use. `_actor_map` links
+    # only rows that DECLARE same_actor_as, so a shared discord id was two people.
+    person_of = component_resolver(roster)
     prior, earliest = set(), None
     try:
-        # Canonical actors on one axis: mixing spellings makes the subset test
-        # below answer about names rather than people.
-        asked = _first_ask(ledger, canonical=lambda w: actor_of.get(w, w))
+        asked = _first_ask(ledger, canonical=person_of)
     except OSError:
         return False, ""
     per_actor = {}
@@ -1337,16 +1337,18 @@ def _stale_repeat_ask(message: str, targets, roster, minutes: int = 30):
     by_actor: dict = {}
     for k, v in (roster or {}).items():
         for ep in durable_endpoints(v):
-            by_actor.setdefault(actor_of.get(k, k), set()).add(ep)
+            by_actor.setdefault(person_of(k), set()).add(ep)
 
     def _ids(t):
         # From the ROSTER too: a caller may pass a bare {"name": ...} target,
         # and deriving from the dict alone left those on the name axis only.
-        actor = actor_of.get(t["name"], t["name"])
+        actor = person_of(t["name"])
         got = {actor, t["name"], t.get("endpoint")}
         got |= durable_endpoints((roster or {}).get(t["name"]) or {})
         got |= by_actor.get(actor, set())
-        return {i for i in got if i}
+        # Every axis lands on the person key, or two spellings of one human
+        # intersect nothing and the subset test answers about names again.
+        return {person_of(i) for i in got if i}
 
     tids = [_ids(x) for x in targets]
     if not tids or not all(s & prior for s in tids):
@@ -1375,10 +1377,11 @@ def _stale_repeat_ask(message: str, targets, roster, minutes: int = 30):
     for k, v in sorted((roster or {}).items()):
         if not isinstance(v, dict) or k.startswith("_"):
             continue
-        actor = actor_of.get(k, k)
+        actor = person_of(k)
         # The SAME component-wide set the verdict uses: this row's own endpoint
         # alone offered an already-asked person under an earlier-sorting alias.
-        ids = {actor, k} | durable_endpoints(v) | by_actor.get(actor, set())
+        ids = {person_of(i) for i in ({actor, k} | durable_endpoints(v)
+                                      | by_actor.get(actor, set()))}
         # keweichen is deliberately never offered as a widen target; the
         # exclusion is pinned by test_keweichen_is_never_offered_as_the_widen_target.
         if (ids & prior) or k == "keweichen":
