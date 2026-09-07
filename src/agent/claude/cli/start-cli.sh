@@ -47,6 +47,11 @@ fi
 # Single Claude launch chokepoint — covers startup.sh, --restart, menu bar.
 bash "$REPO/scripts/install-personal-claude-hook.sh" || echo "start-cli: personal-claude hook install failed (rc=$?) — hook may be absent" >&2
 
+# Owned project hooks (handoff, pending-tasks, skill-declared) re-registered BEFORE the core
+# spawns: an engine update replaces .claude/settings.json. Unattended, so no ~/Desktop archiver.
+SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1 bash "$REPO/src/install-claude-hooks.sh" \
+  || echo "start-cli: claude hooks install failed (rc=$?) — owned hooks may be absent this session" >&2
+
 # Honor a caller-provided socket (e.g. a desktop app that runs a user-private tmux
 # runtime under its app-support dir); default to the shared /tmp socket for dev/CLI.
 # Backward-compatible: unset → identical to the previous hardcoded value.
