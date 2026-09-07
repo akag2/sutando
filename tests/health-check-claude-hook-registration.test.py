@@ -138,39 +138,53 @@ class TestHookRegistration(unittest.TestCase):
         self.assertIn("never run", out["detail"])
 
     def test_override_contract_matches_the_installer(self):
-        """Absolute or `~/…` only, on both sides: the installer refuses a `~user` form (its shell
-        expansion would mangle it), so the probe reads it as no override instead of resolving it
-        to a directory nothing wrote."""
+        """Absolute or `~/…` only, on both sides: the installer refuses a `~user` or relative form
+        (its shell expansion would mangle it) and installs nothing, so the probe reads it as
+        REFUSED (None) — never as "no override", which would certify a repo file from an earlier
+        launch. tests/core-working-dir.test.sh runs both implementations over the same table."""
         home = self.repo / "home"
         home.mkdir()
         with mock.patch.dict(os.environ, {"HOME": str(home), "SUTANDO_CLAUDE_WORKING_DIR": "~/core home"}):
             self.assertEqual(self.hc._hook_settings_target(self.repo), (home / "core home").resolve())
         with mock.patch.dict(os.environ, {"HOME": str(home), "SUTANDO_CLAUDE_WORKING_DIR": "~root/core"}):
-            self.assertEqual(self.hc._hook_settings_target(self.repo), self.repo)
+            self.assertIsNone(self.hc._hook_settings_target(self.repo))
         with mock.patch.dict(os.environ, {"SUTANDO_CLAUDE_WORKING_DIR": "relative/dir"}):
-            self.assertEqual(self.hc._hook_settings_target(self.repo), self.repo)
+            self.assertIsNone(self.hc._hook_settings_target(self.repo))
         with mock.patch.dict(os.environ, {"SUTANDO_CLAUDE_WORKING_DIR": str(self.repo / "abs")}):
             self.assertEqual(self.hc._hook_settings_target(self.repo), (self.repo / "abs").resolve())
 
-    def test_an_unresolvable_override_falls_back_to_the_repo(self):
-        """An override the OS cannot resolve must not abort the probe: it reads the repo's file,
-        the same target the installer falls to. Two real shapes: a symlink LOOP — which Path.resolve
-        raises as RuntimeError before 3.13, not OSError, so the first guard let it propagate — and
-        a component the OS refuses (OSError)."""
+    def test_a_refused_override_warns_even_when_the_repo_file_is_green(self):
+        """The green-probe-nothing-installed case: the repo holds every hook from an earlier
+        launch, but this launch's override was refused, so the installer wrote nothing. The
+        probe must say so, not certify the stale file."""
+        self._settings(self._all_registered())
+        with mock.patch.dict(os.environ, {"SUTANDO_CLAUDE_WORKING_DIR": "~someone/dir"}):
+            out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
+        self.assertEqual(out["status"], "warn", out["detail"])
+        self.assertIn("refuses it", out["detail"])
+        self.assertIn("~someone/dir", out["detail"])
+        self.assertIn("target unknown", out["detail"])
+
+    def test_an_unresolvable_override_is_reported_not_silently_the_repo(self):
+        """An override the OS cannot resolve must not abort the probe, and must not read the
+        repo's file as if it were the launch dir's. Two real shapes: a symlink LOOP — which
+        Path.resolve raises as RuntimeError before 3.13, not OSError, so the first guard let it
+        propagate — and a component the OS refuses (OSError)."""
         self._settings(self._all_registered())
         loop = self.repo / "loop"
         os.symlink("loop", loop)  # points at itself
         with self.assertRaises((OSError, RuntimeError)):
             loop.resolve()  # the fixture really does raise; a silent resolve would test nothing
         with mock.patch.dict(os.environ, {"SUTANDO_CLAUDE_WORKING_DIR": str(loop)}):
-            self.assertEqual(self.hc._hook_settings_target(self.repo), self.repo)
+            self.assertIsNone(self.hc._hook_settings_target(self.repo))
             out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
-        self.assertEqual(out["status"], "ok", out["detail"])
+        self.assertEqual(out["status"], "warn", out["detail"])
+        self.assertIn("target unknown", out["detail"])
         with mock.patch.dict(os.environ, {"SUTANDO_CLAUDE_WORKING_DIR": str(self.repo / "denied")}), \
              mock.patch.object(Path, "resolve", side_effect=OSError("EACCES")):
-            self.assertEqual(self.hc._hook_settings_target(self.repo), self.repo)
+            self.assertIsNone(self.hc._hook_settings_target(self.repo))
             out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
-        self.assertEqual(out["status"], "ok", out["detail"])
+        self.assertEqual(out["status"], "warn", out["detail"])
 
     def test_malformed_settings_warns_never_raises(self):
         (self.repo / ".claude" / "settings.json").write_text("{not json")

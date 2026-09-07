@@ -10761,23 +10761,27 @@ def check_vault_manifest_integrity(
     }
 
 
-def _hook_settings_target(repo: Path) -> Path:
-    """Where install-claude-hooks.sh writes: the core's launch dir when overridden, else the repo."""
+def _hook_settings_target(repo: Path) -> Optional[Path]:
+    """Where install-claude-hooks.sh writes: the core's launch dir when overridden, else the repo.
+
+    Mirrors scripts/core-working-dir.sh (the launcher and every installer source it) shape for
+    shape — unset → repo; absolute or `~/…` → that path; anything else is REFUSED there, and
+    here it is None: the installer wrote nothing for that launch, so no file can stand for it.
+    tests/core-working-dir.test.sh runs both implementations over one input table.
+    """
     override = os.environ.get("SUTANDO_CLAUDE_WORKING_DIR", "").strip()
     if not override:
         return repo
-    # Mirrors scripts/core-working-dir.sh (the launcher and every installer source it): absolute
-    # or `~/…`; anything else is refused there, so it reads as "no override" here.
     if override.startswith("~/"):
         override = os.path.join(os.path.expanduser("~"), override[2:])
     elif not override.startswith("/"):
-        return repo
+        return None
     # resolve() is non-strict, so a missing path returns; a symlink loop raises RuntimeError
-    # (OSError only from 3.13), a denied component OSError — both fall back to the repo.
+    # (OSError only from 3.13), a denied component OSError — the target is then unknown too.
     try:
         return Path(override).resolve()
     except (OSError, RuntimeError):
-        return repo
+        return None
 
 
 def check_claude_hook_registration(
@@ -10854,6 +10858,13 @@ def check_claude_hook_registration(
     # The installer targets the directory the core launches from (SUTANDO_CLAUDE_WORKING_DIR,
     # else the repo); the probe must read the same file or it reports the wrong tree.
     target = _hook_settings_target(repo)
+    if target is None:
+        # A refused override is not "no override": the launcher installs nothing for it, and a
+        # settings.json left at the repo from an earlier launch must not read as this one's.
+        return {"name": name, "status": "warn",
+                "detail": f"SUTANDO_CLAUDE_WORKING_DIR={os.environ.get('SUTANDO_CLAUDE_WORKING_DIR', '')!r} "
+                          f"is neither absolute nor ~/… (or cannot be resolved) — the installer refuses it, "
+                          f"so no hooks were installed for this launch; target unknown, {len(owned)} hook(s) unverified"}
     settings = (Path(sm.group(1).replace("$TARGET_DIR", str(target)).replace("$REPO_DIR", str(repo)))
                 if sm else target / ".claude" / "settings.json")
     if not settings.is_file():
