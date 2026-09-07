@@ -13,7 +13,8 @@ from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-from skill_hooks import discover
+from skill_hooks import discover, python_runner, LEGACY_SEP
+import os
 
 
 class SkillHookDiscovery(unittest.TestCase):
@@ -35,18 +36,18 @@ class SkillHookDiscovery(unittest.TestCase):
             {"event": "PreToolUse", "command": "./hooks/g.py"}]})
         rows = discover(self.repo)
         self.assertEqual(len(rows), 1)
-        event, token, cmd, prior = rows[0]
+        event, token, cmd, legacy = rows[0]
         self.assertEqual(event, "PreToolUse")
         self.assertEqual(token, "g.py")
-        # The runner still has to be the one the suffix selects; it just no longer
+        q = shlex.quote(str(self.repo.resolve() / "skills/demo/hooks/g.py"))
+        # The runner is resolved at EVENT time by the launcher's policy (SUTANDO_PY, else the
+        # bundled interpreter when one sits beside the engine, else PATH python3); it no longer
         # leads the command, because an existence guard runs first.
-        self.assertIn("exec python3 ", cmd)
-        self.assertIn("skills/demo/hooks/g.py", cmd)
-        # The unguarded form an earlier installer wrote, so the sweep can match and
-        # replace it without re-deriving it from `cmd`.
-        self.assertTrue(cmd.endswith(prior), f"{cmd!r} does not end with {prior!r}")
-        self.assertEqual(cmd, f"[ -f {shlex.quote(str(self.repo.resolve() / 'skills/demo/hooks/g.py'))} ]"
-                              f" || exit 0; exec {prior}")
+        self.assertEqual(cmd, f'[ -f {q} ] || exit 0; exec "${{SUTANDO_PY:-python3}}" {q}')
+        # Every shape an earlier installer wrote, so the sweep can match and replace them
+        # without re-deriving them from `cmd`.
+        self.assertEqual(legacy.split(LEGACY_SEP),
+                         [f"python3 {q}", f"[ -f {q} ] || exit 0; exec python3 {q}"])
 
     def test_prior_command_survives_a_repo_path_containing_exec_and_pipe(self):
         """`${CMD#*exec }` splits at the first `exec ` — inside the path, not the
@@ -57,13 +58,55 @@ class SkillHookDiscovery(unittest.TestCase):
         self.repo = Path(self._td.name)
         self._skill("demo", {"name": "demo", "hooks": [
             {"event": "PreToolUse", "command": "./hooks/g.py"}]})
-        _event, _token, cmd, prior = discover(self.repo)[0]
-
+        _event, _token, cmd, legacy = discover(self.repo)[0]
+        prior = legacy.split(LEGACY_SEP)[0]
         self.assertEqual(prior, f"python3 {shlex.quote(str(self.repo.resolve() / 'skills/demo/hooks/g.py'))}")
-        self.assertTrue(cmd.endswith(prior))
         # What the installer used to compute. It is wrong here, and that is the bug.
         self.assertNotEqual(cmd.split("exec ", 1)[1], prior,
                             "fixture must actually exercise the bad derivation")
+
+    def test_the_hook_runs_under_the_configured_interpreter_not_the_PATH_one(self):
+        """The finding: a registered command that execs bare `python3` fails at every event on a
+        host whose PATH python is broken while SUTANDO_PY is configured. Fire the exact stored
+        command in that environment."""
+        self._skill("demo", {"name": "demo", "hooks": [
+            {"event": "PreToolUse", "command": "./hooks/g.py"}]},
+            hook_body="import sys; print('HOOK_EXECUTED'); sys.exit(0)")
+        cmd = discover(self.repo)[0][2]
+        stub_dir = self.repo / "bin"; stub_dir.mkdir()
+        log = self.repo / "stub.log"
+        (stub_dir / "python3").write_text(f"#!/bin/bash\necho invoked >> '{log}'\nexit 79\n")
+        (stub_dir / "python3").chmod(0o755)
+        env = dict(os.environ, PATH=f"{stub_dir}:{os.environ.get('PATH', '')}", SUTANDO_PY=sys.executable)
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, env=env)
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, "HOOK_EXECUTED"), r.stderr)
+        self.assertFalse(log.exists(), "the broken PATH python was invoked")
+        # Control: the same command with no SUTANDO_PY and no bundled interpreter falls to PATH,
+        # where the stub is — which is what the finding measured at the previous head.
+        env.pop("SUTANDO_PY")
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, env=env)
+        self.assertEqual(r.returncode, 79)
+        self.assertTrue(log.exists())
+
+    def test_a_bundled_interpreter_beside_the_engine_is_the_default_runner(self):
+        """Second rung of the policy: with no SUTANDO_PY the command execs the bundled python,
+        fixed at discovery time, never PATH."""
+        bundled = self.repo.parent / "runtime" / "python" / "bin"
+        bundled.mkdir(parents=True, exist_ok=True)
+        (bundled / "python3").unlink(missing_ok=True)
+        os.symlink(sys.executable, bundled / "python3")
+        self.addCleanup(lambda: (bundled / "python3").unlink(missing_ok=True))
+        self.assertIn(str(bundled / "python3"), python_runner(self.repo))
+        self._skill("demo", {"name": "demo", "hooks": [
+            {"event": "PreToolUse", "command": "./hooks/g.py"}]},
+            hook_body="print('HOOK_EXECUTED')")
+        cmd = discover(self.repo)[0][2]
+        stub_dir = self.repo / "bin"; stub_dir.mkdir()
+        (stub_dir / "python3").write_text("#!/bin/bash\nexit 79\n"); (stub_dir / "python3").chmod(0o755)
+        env = {k: v for k, v in os.environ.items() if k != "SUTANDO_PY"}
+        env["PATH"] = f"{stub_dir}:{env.get('PATH', '')}"
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, env=env)
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, "HOOK_EXECUTED"), r.stderr)
 
     def test_a_vanished_script_allows_the_tool_instead_of_blocking_it(self):
         """The registration outlives the file, and a hook that cannot start blocks

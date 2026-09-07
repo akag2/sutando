@@ -456,7 +456,7 @@ cp "$INSTALLER" "$PREPO/src/install-claude-hooks.sh"
 cp "$HERE/../scripts/python-binary.sh" "$PREPO/scripts/python-binary.sh"
 cp "$HERE/../src/skill_hooks.py" "$PREPO/src/skill_hooks.py"
 printf '#!/bin/bash\nexit 0\n' > "$PREPO/src/session-handoff.sh"; printf '#!/bin/bash\nexit 0\n' > "$PREPO/src/check-pending-tasks.sh"
-printf '#!/usr/bin/env python3\n' > "$PREPO/skills/demo/hooks/demo-hook.py"
+printf 'print("HOOK_EXECUTED")\n' > "$PREPO/skills/demo/hooks/demo-hook.py"
 echo '{"name":"demo","hooks":[{"event":"PreToolUse","command":"./hooks/demo-hook.py"}]}' > "$PREPO/skills/demo/manifest.json"
 REAL_PY="$(command -v python3)"
 # A PATH python3 that records every invocation and fails.
@@ -469,6 +469,29 @@ ok "configured SUTANDO_PY + broken PATH python3: the skill hook IS registered" \
    "$([ "$(skill_hooks_in "$PREPO/.claude/settings.json")" = 1 ] && echo 0 || echo 1)"
 ok "configured SUTANDO_PY + broken PATH python3: the PATH stub was never invoked" \
    "$([ ! -f "$PROOT/stub.log" ] && echo 0 || echo 1)"
+# EXECUTION, not registration: fire the exact stored command in the same environment.
+P_CMD="$(jq -r '(.hooks // {})["PreToolUse"] // [] | map(.hooks // []) | flatten | map(.command) | .[]' "$PREPO/.claude/settings.json" | grep demo-hook.py)"
+P_RUN="$(PATH="$PROOT/bin:$PATH" SUTANDO_PY="$REAL_PY" bash -c "$P_CMD" 2>&1)"; P_RUN_RC=$?
+ok "configured SUTANDO_PY + broken PATH python3: the registered hook EXECUTES (rc 0, HOOK_EXECUTED)" \
+   "$([ $P_RUN_RC = 0 ] && [ "$P_RUN" = "HOOK_EXECUTED" ] && echo 0 || echo 1)"
+[ "$P_RUN" = "HOOK_EXECUTED" ] || echo "     got rc=$P_RUN_RC: $P_RUN"
+ok "configured SUTANDO_PY + broken PATH python3: executing it never touched the PATH stub" \
+   "$([ ! -f "$PROOT/stub.log" ] && echo 0 || echo 1)"
+# Migration: the shape the previous revision registered (exec bare python3) is swept, not kept beside.
+python3 - "$PREPO/.claude/settings.json" "$PREPO" <<'PY'
+import json, pathlib, shlex, sys
+p, repo = sys.argv[1], sys.argv[2]
+d = json.load(open(p)); q = shlex.quote(str(pathlib.Path(repo).resolve() / "skills/demo/hooks/demo-hook.py"))
+d["hooks"]["PreToolUse"][0]["hooks"].append({"type": "command", "command": f"[ -f {q} ] || exit 0; exec python3 {q}"})
+json.dump(d, open(p, "w"), indent=2)
+PY
+ok "old guarded-bare-python3 form present before re-run (fixture sanity)" \
+   "$([ "$(skill_hooks_in "$PREPO/.claude/settings.json")" = 2 ] && echo 0 || echo 1)"
+PATH="$PROOT/bin:$PATH" SUTANDO_PY="$REAL_PY" bash "$PREPO/src/install-claude-hooks.sh" >/dev/null 2>&1
+ok "old guarded-bare-python3 form is SWEPT on re-run (exactly one skill hook)" \
+   "$([ "$(skill_hooks_in "$PREPO/.claude/settings.json")" = 1 ] && echo 0 || echo 1)"
+ok "the survivor is the one that execs the configured interpreter" \
+   "$(jq -r '.hooks.PreToolUse[].hooks[].command' "$PREPO/.claude/settings.json" | grep -q 'exec "${SUTANDO_PY:-' && echo 0 || echo 1)"
 echo '{}' > "$PREPO/.claude/settings.json"
 P_OUT2="$(env -u SUTANDO_PY PATH="$PROOT/bin:$PATH" bash "$PREPO/src/install-claude-hooks.sh" 2>&1)"; P_RC2=$?
 ok "broken PATH python3 only: installer exits NON-zero" "$([ $P_RC2 != 0 ] && echo 0 || echo 1)"
@@ -478,6 +501,21 @@ ok "broken PATH python3 only: the static hooks are still installed" \
    "$(jq -r '(.hooks // {})["Stop"] // [] | map(.hooks // []) | flatten | map(.command) | .[]' "$PREPO/.claude/settings.json" | grep -q check-pending-tasks && echo 0 || echo 1)"
 ok "broken PATH python3 only: the skill hook is absent (reported, not silent)" \
    "$([ "$(skill_hooks_in "$PREPO/.claude/settings.json")" = 0 ] && echo 0 || echo 1)"
+# Second rung: a bundled interpreter beside the engine (repo/../runtime/python/bin/python3) is
+# found by discovery AND becomes the command's default runner, so no SUTANDO_PY and a broken PATH
+# still registers and still EXECUTES the hook.
+mkdir -p "$PROOT/runtime/python/bin"; ln -s "$REAL_PY" "$PROOT/runtime/python/bin/python3"
+echo '{}' > "$PREPO/.claude/settings.json"; rm -f "$PROOT/stub.log"
+B_OUT="$(env -u SUTANDO_PY PATH="$PROOT/bin:$PATH" bash "$PREPO/src/install-claude-hooks.sh" 2>&1)"; B_RC=$?
+ok "bundled python, no SUTANDO_PY, broken PATH: installer exits 0 and registers the skill hook" \
+   "$([ $B_RC = 0 ] && [ "$(skill_hooks_in "$PREPO/.claude/settings.json")" = 1 ] && echo 0 || echo 1)"
+B_CMD="$(jq -r '.hooks.PreToolUse[].hooks[].command' "$PREPO/.claude/settings.json" | grep demo-hook.py)"
+ok "bundled python: the stored command's default runner is the bundled path" \
+   "$(echo "$B_CMD" | grep -qF "runtime/python/bin/python3" && echo 0 || echo 1)"
+B_RUN="$(env -u SUTANDO_PY PATH="$PROOT/bin:$PATH" bash -c "$B_CMD" 2>&1)"; B_RUN_RC=$?
+ok "bundled python: the registered hook EXECUTES with no SUTANDO_PY and a broken PATH" \
+   "$([ $B_RUN_RC = 0 ] && [ "$B_RUN" = "HOOK_EXECUTED" ] && [ ! -f "$PROOT/stub.log" ] && echo 0 || echo 1)"
+[ "$B_RUN" = "HOOK_EXECUTED" ] || echo "     got rc=$B_RUN_RC: $B_RUN"
 rm -rf "$PROOT"
 
 # --- 9. the override contract is ONE policy on both sides (installer + probe): absolute or ~/ only ----

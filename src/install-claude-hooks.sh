@@ -291,8 +291,15 @@ for i in "${!HOOKS[@]}"; do
 
   # SHAPE cannot match the runner-first entry (its first word is `[`), so match the
   # prior command exactly, taken from the emitter — `${CMD#*exec }` splits on a path.
+  # Several legacy shapes per hook, joined by the record separator skill_hooks.py emits.
   LEGACY_SHAPE=""
-  [ -n "${HOOK_PRIOR[$i]:-}" ] && LEGACY_SHAPE="^$(re_escape "${HOOK_PRIOR[$i]}")\$"
+  if [ -n "${HOOK_PRIOR[$i]:-}" ]; then
+    _alts=""
+    while IFS= read -r -d $'\x1e' _p || [ -n "$_p" ]; do
+      [ -n "$_p" ] && _alts="${_alts:+$_alts|}$(re_escape "$_p")"
+    done < <(printf '%s' "${HOOK_PRIOR[$i]}")
+    LEGACY_SHAPE="^($_alts)\$"
+  fi
 
   if ! jq -e --arg event "$EVENT" --arg marker "$MARKER" --arg cmd "$CMD" \
            --arg shape "$SHAPE" --arg legacy "$LEGACY_SHAPE" \
