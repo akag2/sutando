@@ -75,9 +75,8 @@ def _scalar_snowflakes(value) -> list:
             stack.extend(v)
         elif isinstance(v, str) or (isinstance(v, int)
                                     and not isinstance(v, bool)):
-            # An int's decimal rendering introduces no escape syntax, and a
-            # numeric id is still EVIDENCE opposing a slot even though it is
-            # never an authoritative id itself.
+            # An int renders without escape syntax, and a numeric id still
+            # OPPOSES a slot even though it is never authoritative itself.
             for sf in _snowflakes(v if isinstance(v, str) else str(v)):
                 if sf not in out:
                     out.append(sf)

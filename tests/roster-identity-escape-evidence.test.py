@@ -48,12 +48,8 @@ class EscapesAreNotEvidence(unittest.TestCase):
         self.assertEqual(m._scalar_snowflakes({"flag": True}), [])
 
 
-# NO PRODUCTION ARM, and the absence is deliberate. Restoring
-# `json.dumps` at the call site produced BYTE-IDENTICAL output on every fixture
-# I could construct (rc 5, empty unresolved, no shape record), so any end-to-end
-# assertion here would pass in both states and pin nothing. The unit arms above
-# DO discriminate the function; the call-site substitution is covered by code
-# review, not by this suite. Stated rather than papered over with a green test.
+# NO PRODUCTION ARM, deliberately: restoring `json.dumps` at the call site gave
+# byte-identical output on every fixture, so one would pass in both states.
 
 
 if __name__ == "__main__":
