@@ -234,29 +234,37 @@ def _is_idle_ready(pane: str) -> bool:
 
 
 def refused_turn(pane: str):
-    """(kind, line) when the pane sits at the idle footer and the nearest completed turn
-    above it was refused: a short turn (≤1s or no duration) whose `⎿` result carries a
-    _REFUSAL line. Else None — a long turn that merely mentions the words, a refusal in
-    scrollback under a later real turn, or a pane not at the footer all stay as they were."""
+    """(kind, line) when the pane sits at the idle footer and the turn that ended there —
+    the last completed one, with nothing newer below it — was refused: a short turn (≤1s
+    or no duration) whose only content is a `⎿` result carrying a _REFUSAL line. Else
+    None — a long turn that merely mentions the words, a turn that ran (any `●`/`⏺`
+    line, so a tool result that quoted a refusal stays the tool's), a completion with a
+    newer prompt or active turn below it, or a pane not at the footer all stay as they were."""
     if not _is_idle_ready(pane):
         return None
     lines = [ln for ln in pane.splitlines() if ln.strip()][-_TURN_WINDOW:]
     done = next((i for i in range(len(lines) - 1, -1, -1) if _TURN_DONE.match(lines[i])), None)
     if done is None:
         return None
+    # Only the footer may follow the completion: a typed prompt, a spinner or any turn
+    # glyph below it means a newer turn owns the pane and the old refusal is history.
+    for ln in lines[done + 1:]:
+        core = ln.strip()
+        if core[:1] in "●⏺⎿✻" or (_PROMPT_LINE.match(ln) and core.lstrip("❯").strip()):
+            return None
     dur = _TURN_DONE.match(lines[done]).group("dur")
     if dur and not _TURN_SHORT.fullmatch(dur):
         return None
     start = next((i for i in range(done - 1, -1, -1) if _PROMPT_LINE.match(lines[i])), -1)
+    turn = [ln.strip() for ln in lines[start + 1:done]]
+    # A refused turn prints nothing but its `⎿` result. Agent output (`●`) or a tool call
+    # (`⏺`) means the turn ran, and any `⎿` in it is that tool's result, not the CLI's.
+    if any(core[:1] in "●⏺" for core in turn):
+        return None
     in_result = False
-    for ln in lines[start + 1:done]:
-        core = ln.strip()
-        # Only the CLI's `⎿` result (and its wrapped continuation) counts; agent output
-        # (`●`) or a tool call (`⏺`) means the turn ran, whatever words it printed.
+    for core in turn:
         if core.startswith("⎿"):
             in_result = True
-        elif core[:1] in "●⏺":
-            in_result = False
         if in_result and _REFUSAL.search(core):
             return "turn-rejected", core.lstrip("⎿").strip()
     return None

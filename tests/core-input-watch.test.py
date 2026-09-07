@@ -382,6 +382,49 @@ class TestRefusedTurn(unittest.TestCase):
         st, *_ = compose_state(pane, "idle", True)
         self.assertEqual(st, "idle-ready")
 
+    def test_a_tool_result_carrying_the_words_is_not_a_refusal(self):
+        # `⎿` is also the tool-result marker. A short turn whose tool READ a refusal line
+        # (and whose agent then answered) ran: the result belongs to the tool, not the CLI.
+        pane = ("❯ check credits\n"
+                "⏺ Bash(cat diagnostic.txt)\n"
+                f"  ⎿  {_REFUSAL_LINE}\n"
+                "● The diagnostic was read successfully.\n"
+                "✻ Worked for 1s\n" + _IDLE_FOOTER)
+        for base in ("idle", "unknown"):
+            st, _d, prompt, kind = compose_state(pane, base, True)
+            self.assertEqual((st, kind), ("idle-ready", None), (base, prompt))
+
+    def test_a_tool_result_alone_in_a_short_turn_is_not_a_refusal(self):
+        # Same ownership, no trailing agent line: the `⏺` header already says the turn ran.
+        pane = ("❯ check credits\n⏺ Bash(cat diagnostic.txt)\n"
+                f"  ⎿  {_REFUSAL_LINE}\n✻ Worked for 0s\n" + _IDLE_FOOTER)
+        st, *_ = compose_state(pane, "idle", True)
+        self.assertEqual(st, "idle-ready")
+
+    def test_a_refused_turn_under_a_newer_active_turn_stays_running(self):
+        # History plus an active turn: the refusal completed, then a newer prompt started
+        # and is still spinning. The old completion must not be reused.
+        pane = (_REFUSED_TURNS
+                + "❯ try again\n"
+                + "● Checking the connection.\n"
+                + "✻ Perambulating… (1m 46s · ↓ 5.9k tokens)\n" + _IDLE_FOOTER)
+        st, _d, prompt, kind = compose_state(pane, "working", True)
+        self.assertEqual((st, kind), ("running", None), prompt)
+
+    def test_a_refused_turn_under_a_newer_typed_prompt_is_not_reused(self):
+        # The owner has typed the next prompt but not sent it: the refusal is history.
+        pane = _REFUSED_TURNS + _IDLE_FOOTER.replace("❯ \n", "❯ try again\n", 1)
+        self.assertIn("❯ try again", pane)
+        st, _d, prompt, kind = compose_state(pane, "idle", True)
+        self.assertEqual((st, kind), ("idle-ready", None), prompt)
+
+    def test_a_short_result_without_the_words_is_not_a_refusal(self):
+        # The CLI's own `⎿` result, ended in 0s, but not one of the refusal lines.
+        pane = ("❯ /nosuch\n  ⎿  Unknown slash command: /nosuch\n"
+                "✻ Worked for 0s\n" + _IDLE_FOOTER)
+        st, *_ = compose_state(pane, "idle", True)
+        self.assertEqual(st, "idle-ready")
+
     def test_the_spinner_is_not_a_completed_turn(self):
         pane = (f"❯ /startup\n  ⎿  {_REFUSAL_LINE}\n"
                 "✻ Perambulating… (1m 46s · ↓ 5.9k tokens)\n" + _IDLE_FOOTER)
