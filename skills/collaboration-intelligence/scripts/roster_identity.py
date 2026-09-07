@@ -257,10 +257,12 @@ def entry_is_coherent(entry: dict) -> bool:
         if not isinstance(extras, (list, tuple)):
             return False
         for extra in extras:
-            # MEMBER tolerance is documented and stays: a non-snowflake member
-            # is dropped, not fatal. Only the CONTAINER shape fails closed.
+            # Validated like the canonical scalars: the same id spelled `int` or
+            # padded skipped the collision test below and read as a non-match.
             eid = extra.get("id") if isinstance(extra, dict) else extra
-            if _is_snowflake_str(eid) and eid == human:
+            if not _is_snowflake_str(eid):
+                return False
+            if eid == human:
                 return False
     return True
 

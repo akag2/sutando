@@ -2137,8 +2137,8 @@ class ThePluralStandAccessorValidatesItsContainer(unittest.TestCase):
     def test_a_non_container_does_not_raise(self):
         self.assertEqual(self._ids(12), [])
 
-    def test_a_non_snowflake_member_is_dropped(self):
-        self.assertEqual(self._ids(["nope", 12, {"id": 12}, self.X]), [self.X])
+    def test_a_non_snowflake_member_fails_the_container_closed(self):
+        self.assertEqual(self._ids(["nope", 12, {"id": 12}, self.X]), [])
 
 
 class _InProcessCli:
@@ -2524,11 +2524,23 @@ class AMalformedSecondaryContainerFailsClosed(unittest.TestCase):
                 self.assertTrue(ri.entry_is_coherent(e), label)
                 self.assertEqual(ri.human_discord_id(e), self.H, label)
 
-    def test_a_non_snowflake_MEMBER_is_still_only_dropped(self):
-        # Member tolerance is documented; only the CONTAINER shape is fatal.
+    def test_ONE_referent_is_refused_in_every_member_spelling(self):
+        """`int`, padded and bare spellings are the same id as the `str` one, so
+        a collision must be refused in all of them or in none."""
+        for extras, label in (([{"id": self.H}], "str, already refused"),
+                              ([{"id": int(self.H)}], "int"),
+                              ([{"id": " " + self.H}], "padded"),
+                              ([int(self.H)], "bare int")):
+            with self.subTest(spelling=label):
+                e = self._entry(extras)
+                self.assertFalse(ri.entry_is_coherent(e), label)
+                self.assertIsNone(ri.human_discord_id(e), label)
+                self.assertEqual(ri.stand_discord_ids(e), [], label)
+
+    def test_an_unresolvable_MEMBER_fails_the_entry_closed(self):
         e = self._entry([12, "nope", {"id": "1600000000000000001"}])
-        self.assertTrue(ri.entry_is_coherent(e))
-        self.assertIn("1600000000000000001", ri.stand_discord_ids(e))
+        self.assertFalse(ri.entry_is_coherent(e))
+        self.assertEqual(ri.stand_discord_ids(e), [])
 
 
 class AnUnresolvedContainerSuppliesNoPrincipalEvidence(_InProcessCli, unittest.TestCase):
