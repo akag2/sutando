@@ -58,6 +58,16 @@ services:
   #   env_file: [users/alice.env]
   #   environment: { SUTANDO_WORKER_ID: cloud-alice, SUTANDO_WORKER_LOCATION: cloud, AG2ASSISTANT_ACP_URL: ws://assistant-alice:8802 }
   #   volumes: [worker-alice:/workspace]
+  #   networks: [alice]
+  #   depends_on: [assistant-alice]
+  #   restart: unless-stopped
+  # assistant-alice:
+  #   image: ${SUTANDO_ASSISTANT_IMAGE:-ghcr.io/ag2ai/ag2-assistant:latest}
+  #   container_name: sutando-assistant-alice
+  #   environment: { GEMINI_API_KEY: "${GEMINI_API_KEY:-}", AG2ASSISTANT_ACP_TOKEN: "${AG2ASSISTANT_ACP_TOKEN_ALICE:-}", TZ: "${TZ:-UTC}" }
+  #   entrypoint: ["sh", "/bootstrap.sh"]
+  #   volumes: [./assistant-bootstrap.sh:/bootstrap.sh:ro, assistant-alice-data:/data, assistant-alice-workspace:/workspace]
+  #   networks: [alice]
   #   restart: unless-stopped
 
 # One network PER USER PAIR. Without this every service joins the project
@@ -71,3 +81,5 @@ volumes:
   assistant-example-data:
   assistant-example-workspace:
   # worker-alice:
+  # assistant-alice-data:
+  # assistant-alice-workspace:
