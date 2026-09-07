@@ -138,11 +138,21 @@ class TestHookRegistration(unittest.TestCase):
         self.assertIn("never run", out["detail"])
 
     def test_an_unresolvable_override_falls_back_to_the_repo(self):
-        """An override the OS cannot resolve (a symlink loop, a dead mount) must not abort the
-        probe: it reads the repo's file, the same target the installer would have fallen to."""
+        """An override the OS cannot resolve must not abort the probe: it reads the repo's file,
+        the same target the installer falls to. Two real shapes: a symlink LOOP — which Path.resolve
+        raises as RuntimeError before 3.13, not OSError, so the first guard let it propagate — and
+        a component the OS refuses (OSError)."""
         self._settings(self._all_registered())
-        with mock.patch.dict(os.environ, {"SUTANDO_CLAUDE_WORKING_DIR": str(self.repo / "loop")}), \
-             mock.patch.object(Path, "resolve", side_effect=OSError("ELOOP")):
+        loop = self.repo / "loop"
+        os.symlink("loop", loop)  # points at itself
+        with self.assertRaises((OSError, RuntimeError)):
+            loop.resolve()  # the fixture really does raise; a silent resolve would test nothing
+        with mock.patch.dict(os.environ, {"SUTANDO_CLAUDE_WORKING_DIR": str(loop)}):
+            self.assertEqual(self.hc._hook_settings_target(self.repo), self.repo)
+            out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
+        self.assertEqual(out["status"], "ok", out["detail"])
+        with mock.patch.dict(os.environ, {"SUTANDO_CLAUDE_WORKING_DIR": str(self.repo / "denied")}), \
+             mock.patch.object(Path, "resolve", side_effect=OSError("EACCES")):
             self.assertEqual(self.hc._hook_settings_target(self.repo), self.repo)
             out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
         self.assertEqual(out["status"], "ok", out["detail"])

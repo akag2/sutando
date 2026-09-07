@@ -10766,9 +10766,11 @@ def _hook_settings_target(repo: Path) -> Path:
     override = os.environ.get("SUTANDO_CLAUDE_WORKING_DIR", "").strip()
     if not override:
         return repo
+    # resolve() is non-strict, so a missing path returns; a symlink loop raises RuntimeError
+    # (OSError only from 3.13), a denied component OSError — both fall back to the repo.
     try:
         return Path(os.path.expanduser(override)).resolve()
-    except OSError:
+    except (OSError, RuntimeError):
         return repo
 
 
