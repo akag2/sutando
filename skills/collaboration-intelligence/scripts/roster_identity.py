@@ -64,7 +64,9 @@ def _is_snowflake_str(v) -> bool:
     """A snowflake is a STRING of digits. A JSON number is not one, and
     `str(v)` at a call site turns that check into a formatting step."""
     import re as _re
-    return isinstance(v, str) and bool(_re.fullmatch(r"\d{17,20}", v))
+    # `[0-9]`, not `\d`: `\d` matches every Unicode decimal digit, so a
+    # 19-char Arabic-Indic string satisfied this and travelled as an id.
+    return isinstance(v, str) and bool(_re.fullmatch(r"[0-9]{17,20}", v))
 
 
 def _snowflake_list(value) -> list:
@@ -74,7 +76,7 @@ def _snowflake_list(value) -> list:
         return []
     import re as _re
     return [v for v in value
-            if isinstance(v, str) and _re.fullmatch(r"\d{17,20}", v)]
+            if isinstance(v, str) and _re.fullmatch(r"[0-9]{17,20}", v)]
 
 
 def canonical_shape_failure(rec) -> "dict | None":
