@@ -555,9 +555,8 @@ def _still_unresolved(entry, rec: dict, fresh_paths: set) -> bool:
         # Our own rewrite is not a repair: only re-migrating a repaired
         # SOURCE can clear a writer-owned finding.
         return True
-    # A LIST DOES NOT CONSUME A SEGMENT, the same rule the collector's `walk`
-    # applies — a dict-only descent made every documented `identities[]` path
-    # permanently "unreachable", so a real repair there could never clear.
+    # A list does not consume a segment: a dict-only descent made every
+    # documented `identities[]` path permanently unreachable.
     segs = str(path).split(".")
     nodes = _nodes_at(entry, segs, 0, None)
     if not nodes:
@@ -566,12 +565,9 @@ def _still_unresolved(entry, rec: dict, fresh_paths: set) -> bool:
             if not (n is None or (isinstance(n, str) and not n.strip()))]
     if not live:
         return True                         # destroyed by the writer
-    # Ask the COLLECTOR, not a second parser: `_mines` is the same
-    # path/provider-aware primitive `_collect_ids` reads with, so a value the
-    # collector would never read cannot clear a refusal, and one it does read
-    # clears it whatever shape it has. The PROVIDER must be carried down with
-    # the node — detached from the dict that declares it, an identity leaf
-    # stops being Discord and every repair reads as still-broken.
+
+    # The collector's own primitive; the provider travels with the node, or a
+    # detached identity leaf stops being Discord.
     return not all(_mines(n, segs, pr) for n, pr in live)
 
 
@@ -1013,10 +1009,8 @@ def main() -> int:
         return 2
 
     dest = a.out or a.roster.with_suffix(".v2.json")
-    # EVERY supplied input, not just the roster: --triage-config X --out X
-    # returned 0, replaced `people` with the v2 map, and printed "input
-    # untouched". samefile too — a hardlink has a different resolved NAME and
-    # the same inode, so a name check alone destroys the rollback copy.
+    # Every supplied input, not just the roster; samefile too, because a
+    # hardlink has a different resolved name and the same inode.
     for flag, src in (("--roster", a.roster), ("--triage-config", a.triage_config),
                       ("--peers", a.peers), ("--discord-config", a.discord_config)):
         if src is None:
