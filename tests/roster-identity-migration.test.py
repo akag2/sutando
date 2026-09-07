@@ -2289,10 +2289,10 @@ class AnAccessorValidatesWhatItReturns(unittest.TestCase):
                          (None, None, []))
 
     def test_an_unresolved_id_answers_no_lookup(self):
-        """ONE condition per fixture. This one previously also made V both the
-        human and the Stand, so the unresolved filter hid the missing
-        role-disjointness check -- the reviewer's point, and why the entry-level
-        collision now has its own isolated control."""
+        """ONE condition per fixture: V is unresolved and nothing else. Making
+        V both the human and the Stand here would let the unresolved filter
+        answer, hiding whether role-disjointness is checked at all; that
+        condition has its own isolated control."""
         entry = {"human_discord_id": self.V, "stand_discord_id": self.S,
                  "unresolved_discord_ids": [{"id": self.V}]}
         self.assertEqual(self._all(entry), (None, self.S, [self.S]))
@@ -2490,10 +2490,10 @@ class AnInterveningObjectCannotBeDiscarded(_InProcessCli, unittest.TestCase):
 
 
 class AMalformedSecondaryContainerFailsClosed(unittest.TestCase):
-    """The same two reviews: `entry_is_coherent` inspected
-    `other_stand_discord_ids` only when it was ALREADY a list, so removing the
-    brackets turned a refused human/Stand collision into an accepted entry —
-    the malformed shape was safer than the correct one."""
+    """`entry_is_coherent` inspected `other_stand_discord_ids` only when it was
+    ALREADY a list, so removing the brackets turned a refused human/Stand
+    collision into an accepted entry — the malformed shape was safer than the
+    correct one."""
 
     H = "1400000000000000001"
     S = "1500000000000000001"
