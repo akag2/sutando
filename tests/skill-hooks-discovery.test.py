@@ -160,6 +160,24 @@ class SkillHookDiscovery(unittest.TestCase):
         (d / "hooks" / "g.py").unlink()
         self.assertEqual(subprocess.run(cmd, shell=True).returncode, 0, "absent guard must fail OPEN")
 
+    def test_a_shell_hook_execs_bash_directly_and_carries_its_legacy_shapes(self):
+        """A `.sh` hook needs no interpreter policy: it runs under bash, guarded like a .py hook,
+        and its legacy shapes are the runner-first and guarded-bare forms only."""
+        d = self.repo / "skills" / "demo"
+        (d / "hooks").mkdir(parents=True)
+        (d / "manifest.json").write_text(json.dumps({"name": "demo", "hooks": [
+            {"event": "Stop", "command": "./hooks/g.sh"}]}))
+        (d / "hooks" / "g.sh").write_text("#!/bin/bash\necho SH_HOOK_EXECUTED\n")
+        _event, token, cmd, legacy = discover(self.repo)[0]
+        q = shlex.quote(str(self.repo.resolve() / "skills/demo/hooks/g.sh"))
+        self.assertEqual(token, "g.sh")
+        self.assertEqual(cmd, f"[ -f {q} ] || exit 0; exec bash {q}")
+        self.assertEqual(legacy.split(LEGACY_SEP), [f"bash {q}", f"[ -f {q} ] || exit 0; exec bash {q}"])
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, "SH_HOOK_EXECUTED"), r.stderr)
+        (d / "hooks" / "g.sh").unlink()
+        self.assertEqual(subprocess.run(cmd, shell=True).returncode, 0, "absent guard must fail OPEN")
+
     def test_discovery_refuses_a_command_outside_the_declaring_skill(self):
         """A manifest must not be able to point core at a host executable."""
         for cmd in ("/bin/sh", "../../../bin/sh"):
