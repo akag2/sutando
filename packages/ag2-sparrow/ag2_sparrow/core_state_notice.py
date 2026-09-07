@@ -24,9 +24,10 @@ This module closes that gap without touching delivery semantics:
 Fail-quiet by design: no supervisor file (standalone ag2-sparrow installs), a
 malformed file, a stale file (watcher dead — its verdict is no longer
 evidence), or an unrecognized state each mean "do nothing", never a guess.
-Known bound: a flapping watcher state can produce a notice/recovery pair per
-flap; the per-(room, reason) cooldown bounds the degraded side and the
-transition requirement bounds the recovery side.
+Flap-bounded: cooldown history survives recovery (see _load_ledger), so no
+sequence of state changes — degraded reasons alternating, or degraded/healthy
+flapping — can exceed one notice per (room, reason) plus one recovery per
+delivered notice per cooldown window.
 """
 from __future__ import annotations
 
@@ -143,30 +144,56 @@ def _enabled() -> bool:
 
 
 def _load_ledger(state_dir: Path) -> dict:
+    """Two separated concerns (review 2026-09-07, should-fix #1):
+
+    ``active``    room → reason: a degraded notice was DELIVERED and its
+                  recovery line is still owed. Cleared per room by recovery.
+    ``last_sent`` room → {reason → ts}: cooldown history. NEVER cleared by
+                  recovery — only aged out past the cooldown window.
+
+    The v1 schema kept one {reason, ts} per room doing both jobs, which broke
+    both bounds: alternating reasons (usage-limit ↔ logged-out) overwrote each
+    other's cooldown and re-sent on every alternation, and a degraded/healthy
+    flap cleared the cooldown with the recovery, re-noticing immediately. A v1
+    (or corrupt) file resets to empty: worst case one duplicate notice."""
     try:
         data = json.loads((Path(state_dir) / LEDGER_FILE).read_text())
-        noticed = data.get("noticed") if isinstance(data, dict) else None
-        if isinstance(noticed, dict):
-            return {"noticed": {
-                str(room): {"reason": str(rec.get("reason") or ""),
-                            "ts": float(rec.get("ts") or 0)}
-                for room, rec in noticed.items() if isinstance(rec, dict)
-            }}
+        if isinstance(data, dict) and data.get("schema_version") == 2:
+            active = data.get("active")
+            last_sent = data.get("last_sent")
+            if isinstance(active, dict) and isinstance(last_sent, dict):
+                return {
+                    "active": {str(r): str(v) for r, v in active.items()
+                               if isinstance(v, str)},
+                    "last_sent": {
+                        str(r): {str(k): float(ts) for k, ts in v.items()
+                                 if isinstance(ts, (int, float))}
+                        for r, v in last_sent.items() if isinstance(v, dict)
+                    },
+                }
     except FileNotFoundError:
         pass
     except Exception:  # noqa: BLE001 — a corrupt ledger resets, never wedges
         pass
-    return {"noticed": {}}
+    return {"active": {}, "last_sent": {}}
 
 
-def _save_ledger(state_dir: Path, ledger: dict) -> None:
+def _save_ledger(state_dir: Path, ledger: dict, now: float) -> None:
     """Atomic, best-effort. A lost ledger's worst case is one duplicate notice
-    per room after a restart — strictly better than a lost notice."""
+    per room after a restart — strictly better than a lost notice. Cooldown
+    history past its window is dead weight — prune it here so the file stays
+    bounded by the set of currently-chatty rooms."""
+    cooldown = _cooldown_s()
+    ledger["last_sent"] = {
+        room: kept for room, per_reason in ledger["last_sent"].items()
+        if (kept := {k: ts for k, ts in per_reason.items()
+                     if now - ts < cooldown})
+    }
     path = Path(state_dir) / LEDGER_FILE
     tmp = path.with_suffix(f".json.{os.getpid()}.tmp")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp.write_text(json.dumps({"schema_version": 1, **ledger}))
+        tmp.write_text(json.dumps({"schema_version": 2, **ledger}))
         os.replace(tmp, path)
     except OSError:
         tmp.unlink(missing_ok=True)
@@ -182,6 +209,12 @@ def sweep_core_state_notices(state_dir: Path, rooms, send, log=None,
     written and the next sweep retries — a failed send must never burn the
     room's one notice. Exceptions from ``send`` propagate (the caller owns
     auth/transport policy).
+
+    Spam bound: per room, at most one degraded notice per reason per cooldown
+    window, and at most one recovery per DELIVERED notice — so no sequence of
+    state changes (including flapping between degraded reasons, or between
+    degraded and healthy) can exceed notices ≤ |reasons| + recoveries per
+    window per room.
     """
     if not _enabled():
         return
@@ -192,29 +225,29 @@ def sweep_core_state_notices(state_dir: Path, rooms, send, log=None,
     state, kind = verdict
     reason = degraded_reason(state, kind)
     ledger = _load_ledger(state_dir)
-    noticed = ledger["noticed"]
     if reason is not None:
         cooldown = _cooldown_s()
         dirty = False
         for room in sorted(set(rooms)):
-            prev = noticed.get(room)
-            if prev and prev["reason"] == reason and now - prev["ts"] < cooldown:
+            last = ledger["last_sent"].get(room, {}).get(reason)
+            if last is not None and now - last < cooldown:
                 continue  # this room already knows about this failure mode
             if send(room, _degraded_body(reason)):
-                noticed[room] = {"reason": reason, "ts": now}
+                ledger["last_sent"].setdefault(room, {})[reason] = now
+                ledger["active"][room] = reason
                 dirty = True
                 if log:
                     log(f"core-state notice ({reason}) sent to {room}")
         if dirty:
-            _save_ledger(state_dir, ledger)
+            _save_ledger(state_dir, ledger, now)
         return
     if state not in _HEALTHY_STATES:
         return  # unrecognized state — not proof of recovery
-    if not noticed:
+    if not ledger["active"]:
         return
-    for room in sorted(noticed):
+    for room in sorted(ledger["active"]):
         if send(room, _recovery_body()):
-            del noticed[room]
+            del ledger["active"][room]
             if log:
                 log(f"core-state recovery notice sent to {room}")
-    _save_ledger(state_dir, ledger)
+    _save_ledger(state_dir, ledger, now)

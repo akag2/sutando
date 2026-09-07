@@ -68,6 +68,35 @@ class RoomSelection(unittest.TestCase):
         self.assertEqual(self._rooms_for({}, []), set())
 
 
+class RoomSidecarOrdering(unittest.TestCase):
+    def test_room_recorded_before_task_publish(self):
+        # Review should-fix #2: the room sidecar must commit BEFORE the task
+        # publishes — a crash between the two left a queued task the notice
+        # sweep could not route, which is exactly the message-during-outage
+        # case this feature exists for.
+        order = []
+        saved = {n: getattr(gw, n) for n in
+                 ("_record_task_room", "_publish_staged", "_record_task_media",
+                  "_write_owner_activity", "_task_pending")}
+        gw._record_task_room = lambda tid, room: order.append("room")
+        gw._publish_staged = lambda tmp, dest: (order.append("publish"), True)[1]
+        gw._record_task_media = lambda tid, task: True
+        gw._write_owner_activity = lambda *a, **k: None
+        gw._task_pending = lambda tid: False
+        try:
+            out = gw._write_task({"id": "task-order-1", "task": "hi",
+                                  "user_id": "@u:s", "channel_id": "!a:server",
+                                  "access_tier": "guest",
+                                  "timestamp": "2026-09-07T00:00:00Z"})
+        finally:
+            for n, fn in saved.items():
+                setattr(gw, n, fn)
+            for f in gw.TASKS_DIR.glob("task-order-1*"):
+                f.unlink()
+        self.assertEqual(out, ("task-order-1", True))
+        self.assertEqual(order, ["room", "publish"])
+
+
 class ExceptionContract(unittest.TestCase):
     def test_sweep_errors_are_swallowed(self):
         saved = gw.sweep_core_state_notices

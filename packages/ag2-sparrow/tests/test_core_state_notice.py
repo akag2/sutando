@@ -96,7 +96,7 @@ def test_reason_change_renotices_inside_cooldown():
         assert "usage limit" in s.sent[0][1] and "not running" in s.sent[1][1]
 
 
-def test_recovery_announced_once_and_ledger_clears():
+def test_recovery_announced_once_and_flap_stays_bounded():
     with tempfile.TemporaryDirectory() as d:
         tmp = pathlib.Path(d)
         _write_state(tmp, "blocked-human", kind="session-limit")
@@ -108,12 +108,54 @@ def test_recovery_announced_once_and_ledger_clears():
         # (rooms arg empty) — the sender was told "I'm down", so tell them back
         csn.sweep_core_state_notices(tmp, set(), s, now=now + 5)
         assert len(s.sent) == 2 and "back online" in s.sent[1][1]
-        # healthy again → nothing more; and the next outage starts clean
+        # healthy again → nothing more
         csn.sweep_core_state_notices(tmp, set(), s, now=now + 6)
         assert len(s.sent) == 2
+        # degraded/healthy FLAP (review should-fix #1): recovery must NOT
+        # clear the cooldown — the same reason inside the window stays silent,
+        # and with no notice delivered, no second recovery is owed either
         _write_state(tmp, "blocked-human", kind="session-limit")
         csn.sweep_core_state_notices(tmp, {"!a:s"}, s, now=now + 7)
+        _write_state(tmp, "idle-ready")
+        csn.sweep_core_state_notices(tmp, set(), s, now=now + 8)
+        assert len(s.sent) == 2
+        # past the cooldown a genuine new outage notices again
+        later = now + csn._cooldown_s() + 1
+        _write_state(tmp, "blocked-human", kind="session-limit", mtime=later)
+        csn.sweep_core_state_notices(tmp, {"!a:s"}, s, now=later)
         assert len(s.sent) == 3
+
+
+def test_alternating_reasons_bounded_per_reason():
+    # Review should-fix #1: usage-limit ↔ logged-out must not re-send on every
+    # alternation — each reason keeps ITS OWN cooldown for the room.
+    with tempfile.TemporaryDirectory() as d:
+        tmp = pathlib.Path(d)
+        s = _Sender()
+        now = time.time()
+        seq = [("blocked-human", "session-limit"), ("logged-out", None),
+               ("blocked-human", "session-limit"), ("logged-out", None),
+               ("blocked-human", "session-limit")]
+        for i, (state, kind) in enumerate(seq):
+            _write_state(tmp, state, kind=kind)
+            csn.sweep_core_state_notices(tmp, {"!a:s"}, s, now=now + i)
+        assert len(s.sent) == 2  # one per reason, not one per alternation
+        assert "usage limit" in s.sent[0][1] and "logged out" in s.sent[1][1]
+
+
+def test_v1_ledger_resets_cleanly():
+    with tempfile.TemporaryDirectory() as d:
+        tmp = pathlib.Path(d)
+        (tmp / csn.LEDGER_FILE).write_text(json.dumps({
+            "schema_version": 1,
+            "noticed": {"!a:s": {"reason": "usage-limit", "ts": time.time()}}}))
+        _write_state(tmp, "blocked-human", kind="session-limit")
+        s = _Sender()
+        csn.sweep_core_state_notices(tmp, {"!a:s"}, s)
+        # v1 state is unreadable under v2 → reset: one (duplicate) notice
+        # beats wedging, and the file is rewritten as v2
+        assert len(s.sent) == 1
+        assert json.loads((tmp / csn.LEDGER_FILE).read_text())["schema_version"] == 2
 
 
 def test_no_verdict_inputs_do_nothing():
@@ -196,7 +238,9 @@ if __name__ == "__main__":
     test_degraded_notices_once_per_room_with_cooldown()
     test_failed_send_burns_nothing_and_retries()
     test_reason_change_renotices_inside_cooldown()
-    test_recovery_announced_once_and_ledger_clears()
+    test_recovery_announced_once_and_flap_stays_bounded()
+    test_alternating_reasons_bounded_per_reason()
+    test_v1_ledger_resets_cleanly()
     test_no_verdict_inputs_do_nothing()
     test_unrecognized_state_does_not_fake_recovery()
     test_kill_switch_env_disables_everything()

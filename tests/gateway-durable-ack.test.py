@@ -152,10 +152,13 @@ class DurableAck(unittest.TestCase):
              patch.object(mod.os, "replace", spy_replace):
             self.assertEqual(mod._write_task(self._task("task-seq")), ("task-seq", True))
         at = trace.index("rename:remote-task-media.json")
-        # Both files are staged and fsync'd first; the sidecar then commits, and
+        # Both files are staged and fsync'd first; the sidecars then commit
+        # (media durable, then the best-effort room map — recorded pre-publish
+        # so a crash can't queue a task the notice sweep cannot route), and
         # only after that does the task become visible to the watcher.
         self.assertEqual(trace[:at].count("file"), 2)
-        self.assertEqual(trace[at:at + 4], ["rename:remote-task-media.json", "dir",
+        self.assertEqual(trace[at:at + 5], ["rename:remote-task-media.json", "dir",
+                                            "rename:remote-task-rooms.json",
                                             "rename:task-seq.txt", "dir"])
 
     # -- 2. a pre-durability task redelivered after the upgrade -------------- #

@@ -2741,6 +2741,15 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
         tmp.unlink(missing_ok=True)
         _log(f"media sidecar FAILED for {tid} — not queued, not acked")
         return None
+    # Room sidecar BEFORE publish too (review 2026-09-07, should-fix #2): the
+    # core-state notice sweep resolves a queued task's room through this map,
+    # and its target case is a task queued moments before/during a core
+    # outage — recording after publish left a crash window where exactly that
+    # task queued room-less and lost its notice. Still best-effort (unlike
+    # media): the map only feeds advisory paths, so a failed write must not
+    # veto the queue/ack of a deliverable task. A dangling entry from a
+    # publish that then fails is inert — sweeps key off in-flight ids.
+    _record_task_room(tid, str(task.get("channel_id") or ""))
     if not _publish_staged(tmp, dest):  # atomic publish: never a partial file
         tmp.unlink(missing_ok=True)
         return None
@@ -2752,7 +2761,6 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
         task_processed(bucket_source(_one_line(task.get("source") or PROVIDER), "remote"))
     except Exception:
         pass
-    _record_task_room(tid, str(task.get("channel_id") or ""))
     # Bridges-as-siblings: feed the proactive-loop's active-engagement gate — but
     # only for owner-tier senders (same resolved tier as the task above).
     _write_owner_activity(task, sender_tier)
