@@ -12,6 +12,7 @@ import os
 import pathlib
 import subprocess
 import sys
+import shutil
 import tempfile
 import time
 import types
@@ -790,8 +791,16 @@ class TypedIdentityMembership(unittest.TestCase):
         same text -- so it certifies nothing about the park.
         """
         nr = _nr()
+        # record_asks() writes through SUTANDO_REVIEW_ASKS_LEDGER (notify_reviewers.py:498).
+        # Setting any other name leaves the real ledger live and this test appends to it.
         td = tempfile.mkdtemp()
-        os.environ["SUTANDO_SCI_LEDGER"] = os.path.join(td, "ledger.jsonl")
+        self.addCleanup(shutil.rmtree, td, True)
+        prev = os.environ.get("SUTANDO_REVIEW_ASKS_LEDGER")
+        os.environ["SUTANDO_REVIEW_ASKS_LEDGER"] = os.path.join(td, "ledger.jsonl")
+        self.addCleanup(
+            lambda: os.environ.__setitem__("SUTANDO_REVIEW_ASKS_LEDGER", prev)
+            if prev is not None
+            else os.environ.pop("SUTANDO_REVIEW_ASKS_LEDGER", None))
         canon = nr.component_resolver(self.COLLIDING)
         ep = lambda n: nr.durable_endpoint(self.COLLIDING[n])
         nr.record_asks(MSG, "bob", "unknown", actor="bob", endpoint=ep("bob"),
