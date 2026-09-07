@@ -12,9 +12,11 @@ Run: python3 tests/health-check-claude-hook-registration.test.py
 from __future__ import annotations
 import importlib.util
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -40,6 +42,12 @@ HOOKS=(
 class TestHookRegistration(unittest.TestCase):
     def setUp(self):
         self.hc = _load()
+        # The core session exports the launch-dir override; the probe honours it, so an
+        # inherited value would point every fixture probe at the live tree.
+        self._env = mock.patch.dict(os.environ, {}, clear=False)
+        self._env.start()
+        os.environ.pop("SUTANDO_CLAUDE_WORKING_DIR", None)
+        self.addCleanup(self._env.stop)
         self._tmp = tempfile.TemporaryDirectory()
         self.repo = Path(self._tmp.name)
         (self.repo / "src").mkdir(parents=True)
@@ -106,6 +114,26 @@ class TestHookRegistration(unittest.TestCase):
 
     def test_missing_settings_file_warns(self):
         out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
+        self.assertEqual(out["status"], "warn")
+        self.assertIn("never run", out["detail"])
+
+    def test_launch_dir_override_is_where_the_probe_reads(self):
+        """The installer targets SUTANDO_CLAUDE_WORKING_DIR when set; a probe still reading the
+        engine tree would report the wrong file — 'never run' with every hook registered."""
+        (self.repo / "src" / "install-claude-hooks.sh").write_text(
+            INSTALLER.replace('SETTINGS="$REPO_DIR/.claude/settings.json"',
+                              'SETTINGS="$TARGET_DIR/.claude/settings.json"'))
+        cwd = self.repo / "core cwd"
+        (cwd / ".claude").mkdir(parents=True)
+        (cwd / ".claude" / "settings.json").write_text(json.dumps({"hooks": self._all_registered()}))
+        with mock.patch.dict(os.environ, {"SUTANDO_CLAUDE_WORKING_DIR": str(cwd)}):
+            out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
+        self.assertEqual(out["status"], "ok", out["detail"])
+        # Without the override the same installer template resolves $TARGET_DIR to the repo,
+        # where nothing is registered.
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SUTANDO_CLAUDE_WORKING_DIR", None)
+            out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
         self.assertEqual(out["status"], "warn")
         self.assertIn("never run", out["detail"])
 

@@ -53,7 +53,15 @@
 set -u
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-SETTINGS="$REPO_DIR/.claude/settings.json"
+# Claude Code reads project settings from the directory the core LAUNCHES from, which
+# start-cli.sh lets SUTANDO_CLAUDE_WORKING_DIR move; the scripts stay anchored at REPO_DIR.
+TARGET_DIR="$REPO_DIR"
+if [ -n "${SUTANDO_CLAUDE_WORKING_DIR:-}" ]; then
+  _cwd_exp="${SUTANDO_CLAUDE_WORKING_DIR/#\~/$HOME}"
+  mkdir -p "$_cwd_exp" || { echo "error: can't create core working dir: $_cwd_exp" >&2; exit 1; }
+  TARGET_DIR="$(cd "$_cwd_exp" && pwd -P)"
+fi
+SETTINGS="$TARGET_DIR/.claude/settings.json"
 
 # Hook specs: each line is "<event>|<command>".  Order = install order.
 # $REPO_DIR is expanded HERE, at install time, so the command written into
@@ -118,13 +126,38 @@ HOOK_PRIOR=()
 for _i in "${!HOOKS[@]}"; do HOOK_PRIOR+=(""); done
 
 # Skill-declared hooks via src/skill_hooks.py (the same discovery the health probe reads).
+# The interpreter is the launcher's (SUTANDO_PY > bundled > a PATH python3 that is not
+# Apple's stub); a bare `python3` here reaches the stub on a Mac without the CLT.
+PY=""
+if [ -r "$REPO_DIR/scripts/python-binary.sh" ]; then
+  . "$REPO_DIR/scripts/python-binary.sh"
+  PY="$(resolve_python "$REPO_DIR")"
+else
+  PY="$(command -v python3 || true)"
+fi
+DISCOVERY_RC=0
+DISCOVERED="$(mktemp "${TMPDIR:-/tmp}/skill-hooks.XXXXXX")"
+if [ ! -f "$REPO_DIR/src/skill_hooks.py" ]; then
+  echo "install-claude-hooks: no src/skill_hooks.py in this tree — static hooks only" >&2
+elif [ -z "$PY" ]; then
+  echo "install-claude-hooks: no runnable python3 — skill-declared hooks NOT registered" >&2
+  DISCOVERY_RC=1
+else
+  # `$?` inside an `if ! cmd` branch is the NEGATED status; capture the real one.
+  "$PY" "$REPO_DIR/src/skill_hooks.py" "$REPO_DIR" > "$DISCOVERED" 2>/dev/null || DISCOVERY_RC=$?
+  if [ "$DISCOVERY_RC" != 0 ]; then
+    echo "install-claude-hooks: skill-hook discovery failed (rc=$DISCOVERY_RC via $PY) — skill-declared hooks NOT registered" >&2
+    : > "$DISCOVERED"
+  fi
+fi
 # NUL-framed (-d '') because two of the four fields embed the repo path.
 while IFS= read -r -d '' _ev && IFS= read -r -d '' _tok \
    && IFS= read -r -d '' _cmd && IFS= read -r -d '' _prior; do
   [ -n "${_ev:-}" ] || continue
   HOOKS+=("$_ev|$_tok|$_cmd")
   HOOK_PRIOR+=("$_prior")
-done < <(python3 "$REPO_DIR/src/skill_hooks.py" "$REPO_DIR" 2>/dev/null)
+done < "$DISCOVERED"
+rm -f "$DISCOVERED"
 
 # Deprecated hooks to uninstall on re-run.  Each line: "<event>|<substring>".
 # Matching uses `.command | contains(substring)` so we don't need to track
@@ -143,7 +176,7 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 2
 fi
 
-mkdir -p "$REPO_DIR/.claude"
+mkdir -p "$TARGET_DIR/.claude"
 # The PreCompact archive hook is a bare `cp`, which cannot create its own
 # destination; without this the archiver fails on every compaction, silently.
 mkdir -p "$HOME/Desktop/sutando-conversations"
@@ -347,6 +380,9 @@ for entry in "${DEPRECATED_HOOKS[@]}"; do
 done
 
 echo "install-claude-hooks: added=$ADDED skipped=$SKIPPED removed=$REMOVED → $SETTINGS"
+# A failed discovery leaves the static hooks installed and exits non-zero: the
+# launcher prints its warning and the claude-hooks probe names the missing ones.
+[ "$DISCOVERY_RC" = 0 ] || exit 1
 
 # Register hooks in the sutando-hook-manifest so migration-notice can identify
 # them without relying on the hardcoded substring list. (#1502)

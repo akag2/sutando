@@ -10761,6 +10761,17 @@ def check_vault_manifest_integrity(
     }
 
 
+def _hook_settings_target(repo: Path) -> Path:
+    """Where install-claude-hooks.sh writes: the core's launch dir when overridden, else the repo."""
+    override = os.environ.get("SUTANDO_CLAUDE_WORKING_DIR", "").strip()
+    if not override:
+        return repo
+    try:
+        return Path(os.path.expanduser(override)).resolve()
+    except OSError:
+        return repo
+
+
 def check_claude_hook_registration(
     repo_dir: Optional[Path] = None,
 ) -> dict:
@@ -10832,7 +10843,11 @@ def check_claude_hook_registration(
                           f"cannot verify skill-declared hooks"}
 
     sm = re.search(r'^SETTINGS="([^"]+)"', src, re.M)
-    settings = Path(sm.group(1).replace("$REPO_DIR", str(repo))) if sm else repo / ".claude" / "settings.json"
+    # The installer targets the directory the core launches from (SUTANDO_CLAUDE_WORKING_DIR,
+    # else the repo); the probe must read the same file or it reports the wrong tree.
+    target = _hook_settings_target(repo)
+    settings = (Path(sm.group(1).replace("$TARGET_DIR", str(target)).replace("$REPO_DIR", str(repo)))
+                if sm else target / ".claude" / "settings.json")
     if not settings.is_file():
         return {"name": name, "status": "warn",
                 "detail": f"{settings} missing — install-claude-hooks.sh has never run here; "

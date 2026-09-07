@@ -84,10 +84,11 @@ class _Fixture(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def run_launcher(self) -> subprocess.CompletedProcess:
+    def run_launcher(self, extra_env: dict | None = None) -> subprocess.CompletedProcess:
         env = {k: v for k, v in os.environ.items()
-               if k not in ("SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE",)}
+               if k not in ("SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE", "SUTANDO_CLAUDE_WORKING_DIR")}
         env["HOME"] = str(self.home)
+        env.update(extra_env or {})
         return subprocess.run(
             ["/bin/bash", str(self.root / "src/agent/claude/cli/start-cli.sh")],
             capture_output=True, text=True, timeout=60, env=env,
@@ -186,6 +187,22 @@ class StartCliRestoresOwnedHooksAfterUpdate(_Fixture):
         self.assertEqual(result2.returncode, 0, result2.stderr)
         self.assertIn("added=0", result2.stdout)
         self.assertEqual(self._commands(), after)
+
+    def test_override_launch_dir_receives_the_hooks(self):
+        """SUTANDO_CLAUDE_WORKING_DIR moves where the core launches from, and Claude Code reads
+        project settings THERE: the engine tree's file must stay as the update left it."""
+        cwd = Path(self.tmp.name) / "core cwd"
+        engine_before = self.settings.read_text()
+        result = self.run_launcher({"SUTANDO_CLAUDE_WORKING_DIR": str(cwd)})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.settings.read_text(), engine_before)
+        conf = json.loads((cwd / ".claude" / "settings.json").read_text())
+        cmds = {e: [h["command"] for g in v for h in g["hooks"]] for e, v in conf["hooks"].items()}
+        self.assertTrue(any("src/session-handoff.sh" in c for c in cmds.get("SessionEnd", [])), cmds)
+        self.assertTrue(any("src/check-pending-tasks.sh" in c for c in cmds.get("Stop", [])), cmds)
+        self.assertTrue(any("demo-skill/hooks/demo-hook.py" in c for c in cmds.get("PreToolUse", [])), cmds)
+        # The scripts stay anchored at the engine, not the launch dir.
+        self.assertTrue(all(str(self.root) in c for c in cmds["SessionEnd"]), cmds)
 
 
 class RuntimeScopingTest(unittest.TestCase):
