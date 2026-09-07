@@ -30,6 +30,23 @@ class CarriedRevalidation(unittest.TestCase):
         self.assertTrue(m._still_unresolved({"stand_status": {"note": T}},
                                             rec("stand_status"), set()))
 
+    def test_a_FLAT_dotted_key_clears(self):
+        """The reviewer's discriminator. `discord.human.user_id` is ONE key, not
+        three levels; a path re-parsed with `split(".")` looked for nested dicts
+        and found nothing, so a real repair could never clear. The collector
+        reads the flat key, so revalidation must ask the collector."""
+        e = {"discord.human.user_id": H}
+        self.assertEqual(m._collect_ids(e), [H])
+        self.assertFalse(m._still_unresolved(e, rec("discord.human.user_id"), set()))
+
+    def test_revalidation_consumes_the_collectors_own_path_map(self):
+        """Delegation, not agreement: every path the check can answer about is a
+        path `mined_paths` reports, so a fourth spelling cannot diverge."""
+        e = {"human": {"provider": "discord", "identities": [{"user_id": H}]}}
+        self.assertIn("human.identities.user_id", m.mined_paths(e))
+        self.assertEqual(m.mined_paths(e)["human.identities.user_id"], [H])
+        self.assertFalse(hasattr(m, "_nodes_at"))
+
     def test_a_repair_on_a_LIST_path_clears(self):
         """A list does not consume a path segment — the rule the collector
         applies. A dict-only descent made this path permanently unreachable,

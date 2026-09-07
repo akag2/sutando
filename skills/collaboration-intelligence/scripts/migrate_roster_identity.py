@@ -439,6 +439,8 @@ def walk(obj, path, provider, sink, shapes):
             walk(v, path, provider, sink, shapes)
     elif isinstance(obj, str) and path and ri.BASIS_FIELD not in path \
             and _discord_source(path[:-1], path[-1], provider):
+        if _VISITED is not None:
+            _VISITED.setdefault(".".join(path), []).extend(_snowflakes(obj))
         for sf in _snowflakes(obj):
             if sf not in sink:
                 sink.append(sf)
@@ -457,6 +459,22 @@ def _mines(member, path, provider) -> list:
     scratch = []
     walk(member, path, provider, scratch, None)
     return scratch
+
+
+#: Set for one traversal by `mined_paths()` — the collector's own record of
+#: which paths it read and what it got, so nothing re-parses a path string.
+_VISITED = None
+
+
+def mined_paths(entry: dict) -> dict:
+    """`{path the collector read: [ids mined there]}` for one entry."""
+    global _VISITED
+    _VISITED = {}
+    try:
+        _collect_ids(entry)
+        return _VISITED
+    finally:
+        _VISITED = None
 
 
 def _collect_ids(entry: dict, shapes: "list | None" = None) -> list:
@@ -581,41 +599,12 @@ def _still_unresolved(entry, rec: dict, fresh_paths: set) -> bool:
         # Our own rewrite is not a repair: only re-migrating a repaired
         # SOURCE can clear a writer-owned finding.
         return True
-    # A list does not consume a segment: a dict-only descent made every
-    # documented `identities[]` path permanently unreachable.
-    segs = str(path).split(".")
-    nodes = _nodes_at(entry, segs, 0, None)
-    if not nodes:
-        return True                         # unreachable: cannot re-check
-    live = [(n, pr) for n, pr in nodes
-            if not (n is None or (isinstance(n, str) and not n.strip()))]
-    if not live:
-        return True                         # destroyed by the writer
-
-    # The collector's own primitive; the provider travels with the node, or a
-    # detached identity leaf stops being Discord.
-    return not all(_mines(n, segs, pr) for n, pr in live)
-
-
-def _nodes_at(node, segs, i, provider) -> list:
-    """(node, provider) reachable at this path.
-
-    A LIST DOES NOT CONSUME A SEGMENT and a dict may DECLARE the provider —
-    both rules copied from the collector's `walk`, which is the only reason
-    this can answer the same question it would.
-    """
-    if isinstance(node, list):
-        out = []
-        for v in node:
-            out.extend(_nodes_at(v, segs, i, provider))
-        return out
-    if isinstance(node, dict):
-        provider = _declared_provider(node) or provider
-    if i == len(segs):
-        return [(node, provider)]
-    if not isinstance(node, dict) or segs[i] not in node:
-        return []
-    return _nodes_at(node[segs[i]], segs, i + 1, provider)
+    # THE COLLECTOR'S OWN VIEW, never a second parse of the path string: a flat
+    # dotted key, a nested mapping and a list descent all reach `walk` alike.
+    mined = mined_paths(entry)
+    if path not in mined:
+        return True                         # the collector does not read it
+    return not mined[path]                  # read, but yields no id
 
 
 #: The backticked path inside a generated basis reason ("cited in `a.b`").
