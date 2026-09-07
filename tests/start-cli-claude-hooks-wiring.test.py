@@ -30,11 +30,14 @@ and asserts the owned hooks are present after the launcher prefix runs — the
 before/after evidence for the PR, checkable here rather than on a live host.
 """
 
+from __future__ import annotations  # `dict | None` must not be evaluated on Python 3.9
+
 import json
 import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -222,6 +225,25 @@ class StartCliRestoresOwnedHooksAfterUpdate(_Fixture):
         self.assertEqual(result.returncode, 0, result.stderr)
         conf = json.loads((self.home / "core home" / ".claude" / "settings.json").read_text())
         self.assertIn("SessionEnd", conf["hooks"])
+
+
+class LauncherForwardsTheValidatedInterpreter(unittest.TestCase):
+    """A tmux window spawned on an EXISTING server inherits the server's environment, which may
+    predate SUTANDO_PY; the launcher must carry the interpreter it validated into every spawn and
+    heal path. `--print-core-env` prints the real CORE_ENV_ARGS without launching anything."""
+
+    def test_print_core_env_carries_an_executable_SUTANDO_PY(self):
+        with tempfile.TemporaryDirectory() as td:
+            env = {k: v for k, v in os.environ.items() if k not in ("SUTANDO_CLAUDE_WORKING_DIR",)}
+            env["HOME"] = td
+            env["SUTANDO_PY"] = sys.executable  # the resolver's first rung, so the value is known
+            r = subprocess.run(["/bin/bash", str(LAUNCHER), "--print-core-env"],
+                               capture_output=True, text=True, timeout=120, env=env, cwd=str(REPO))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        lines = r.stdout.splitlines()
+        idx = [i for i, ln in enumerate(lines) if ln == "SUTANDO_PY=" + sys.executable]
+        self.assertEqual(len(idx), 1, lines)
+        self.assertEqual(lines[idx[0] - 1], "-e", lines)
 
 
 class RuntimeScopingTest(unittest.TestCase):

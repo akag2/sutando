@@ -490,8 +490,8 @@ ok "old guarded-bare-python3 form present before re-run (fixture sanity)" \
 PATH="$PROOT/bin:$PATH" SUTANDO_PY="$REAL_PY" bash "$PREPO/src/install-claude-hooks.sh" >/dev/null 2>&1
 ok "old guarded-bare-python3 form is SWEPT on re-run (exactly one skill hook)" \
    "$([ "$(skill_hooks_in "$PREPO/.claude/settings.json")" = 1 ] && echo 0 || echo 1)"
-ok "the survivor is the one that execs the configured interpreter" \
-   "$(jq -r '.hooks.PreToolUse[].hooks[].command' "$PREPO/.claude/settings.json" | grep -q 'exec "${SUTANDO_PY:-' && echo 0 || echo 1)"
+ok "the survivor is the one that resolves its interpreter through scripts/python-binary.sh" \
+   "$(jq -r '.hooks.PreToolUse[].hooks[].command' "$PREPO/.claude/settings.json" | grep -q 'resolve_python' && echo 0 || echo 1)"
 echo '{}' > "$PREPO/.claude/settings.json"
 P_OUT2="$(env -u SUTANDO_PY PATH="$PROOT/bin:$PATH" bash "$PREPO/src/install-claude-hooks.sh" 2>&1)"; P_RC2=$?
 ok "broken PATH python3 only: installer exits NON-zero" "$([ $P_RC2 != 0 ] && echo 0 || echo 1)"
@@ -510,12 +510,20 @@ B_OUT="$(env -u SUTANDO_PY PATH="$PROOT/bin:$PATH" bash "$PREPO/src/install-clau
 ok "bundled python, no SUTANDO_PY, broken PATH: installer exits 0 and registers the skill hook" \
    "$([ $B_RC = 0 ] && [ "$(skill_hooks_in "$PREPO/.claude/settings.json")" = 1 ] && echo 0 || echo 1)"
 B_CMD="$(jq -r '.hooks.PreToolUse[].hooks[].command' "$PREPO/.claude/settings.json" | grep demo-hook.py)"
-ok "bundled python: the stored command's default runner is the bundled path" \
-   "$(echo "$B_CMD" | grep -qF "runtime/python/bin/python3" && echo 0 || echo 1)"
+ok "bundled python: the stored command names no interpreter itself (the resolver picks it at event time)" \
+   "$(echo "$B_CMD" | grep -q 'resolve_python' && ! echo "$B_CMD" | grep -qF "runtime/python/bin/python3" && echo 0 || echo 1)"
 B_RUN="$(env -u SUTANDO_PY PATH="$PROOT/bin:$PATH" bash -c "$B_CMD" 2>&1)"; B_RUN_RC=$?
 ok "bundled python: the registered hook EXECUTES with no SUTANDO_PY and a broken PATH" \
    "$([ $B_RUN_RC = 0 ] && [ "$B_RUN" = "HOOK_EXECUTED" ] && [ ! -f "$PROOT/stub.log" ] && echo 0 || echo 1)"
 [ "$B_RUN" = "HOOK_EXECUTED" ] || echo "     got rc=$B_RUN_RC: $B_RUN"
+# A STALE override (nonexistent SUTANDO_PY) must not be exec'd (rc 126): the resolver validates
+# executability at event time and falls to the bundled interpreter.
+S_RUN="$(SUTANDO_PY="$PROOT/no/such/python3" PATH="$PROOT/bin:$PATH" bash -c "$B_CMD" 2>&1)"; S_RUN_RC=$?
+ok "stale SUTANDO_PY + bundled python: the hook EXECUTES via the bundled interpreter (not rc 126)" \
+   "$([ $S_RUN_RC = 0 ] && [ "$S_RUN" = "HOOK_EXECUTED" ] && echo 0 || echo 1)"
+[ "$S_RUN" = "HOOK_EXECUTED" ] || echo "     got rc=$S_RUN_RC: $S_RUN"
+ok "the stored command resolves through scripts/python-binary.sh (one interpreter policy)" \
+   "$(echo "$B_CMD" | grep -q "scripts/python-binary.sh" && echo "$B_CMD" | grep -q "resolve_python" && echo 0 || echo 1)"
 rm -rf "$PROOT"
 
 # --- 9. the override contract is ONE policy on both sides (installer + probe): absolute or ~/ only ----

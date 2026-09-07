@@ -7,7 +7,6 @@ verifies exactly that, so a drifted second copy cannot make them disagree.
 from __future__ import annotations
 
 import json
-import os
 import shlex
 from pathlib import Path
 
@@ -16,23 +15,17 @@ from pathlib import Path
 LEGACY_SEP = "\x1e"
 
 
-def _dq(path: str) -> str:
-    """Escape for the inside of a double-quoted shell word (no word-splitting there)."""
-    return path.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$").replace("`", "\\`")
-
-
-def python_runner(repo_dir: Path) -> str:
-    """The interpreter a .py hook execs, resolved at EVENT time by the launcher's policy:
-    SUTANDO_PY from the core's environment, else the bundled interpreter beside the engine
-    (fixed at install time when present), else PATH python3. A bare `python3` reached the
-    broken PATH — or Apple's CLT stub — on exactly the hosts the resolver exists for."""
-    bundled = Path(repo_dir).resolve().parent / "runtime" / "python" / "bin" / "python3"
-    fallback = _dq(str(bundled)) if os.access(bundled, os.X_OK) else "python3"
-    return '"${SUTANDO_PY:-' + fallback + '}"'
-
-
-def runner_for(target: Path, repo_dir: Path) -> str:
-    return python_runner(repo_dir) if target.suffix == ".py" else "bash"
+def python_runner_prefix(repo_dir: Path) -> str:
+    """Shell that resolves the interpreter at EVENT time through the one owner of that policy,
+    scripts/python-binary.sh (SUTANDO_PY only if executable, else the bundled interpreter beside
+    the engine, else a PATH python3 that is not Apple's stub). A stale SUTANDO_PY or a tmux window
+    spawned without one therefore cannot reach a broken PATH python. No runnable interpreter fails
+    OPEN (exit 0), like the existence guard: a hook that cannot start must not block the tool."""
+    repo = Path(repo_dir).resolve()
+    q_resolver = shlex.quote(str(repo / "scripts" / "python-binary.sh"))
+    q_repo = shlex.quote(str(repo))
+    return (f". {q_resolver} 2>/dev/null || exit 0; "
+            f"_py=\"$(resolve_python {q_repo})\"; [ -n \"$_py\" ] || exit 0; ")
 
 
 def resolve_hook_command(skill_dir: Path, command: str) -> Path | None:
@@ -72,14 +65,22 @@ def discover(repo_dir: Path) -> list[tuple[str, str, str, str]]:
             target = resolve_hook_command(manifest.parent, command)
             if target is None or not target.is_file():
                 continue
-            runner = runner_for(target, repo_dir)
             q = shlex.quote(str(target))
             # The path is in the working tree, so a checkout can delete it while the
             # registration survives; a hook that cannot start blocks the tool it gates.
-            cmd = f"[ -f {q} ] || exit 0; exec {runner} {q}"
-            bare = "python3" if target.suffix == ".py" else "bash"
-            legacy = LEGACY_SEP.join((f"{bare} {q}", f"[ -f {q} ] || exit 0; exec {bare} {q}"))
-            out.append((event, target.name, cmd, legacy))
+            if target.suffix == ".py":
+                cmd = f"[ -f {q} ] || exit 0; {python_runner_prefix(repo_dir)}exec \"$_py\" {q}"
+                bare = "python3"
+            else:
+                cmd = f"[ -f {q} ] || exit 0; exec bash {q}"
+                bare = "bash"
+            legacy = [f"{bare} {q}", f"[ -f {q} ] || exit 0; exec {bare} {q}"]
+            if bare == "python3":
+                # The one-revision shape that expanded SUTANDO_PY unvalidated (never released).
+                bundled = Path(repo_dir).resolve().parent / "runtime" / "python" / "bin" / "python3"
+                for fb in ("python3", str(bundled)):
+                    legacy.append(f'[ -f {q} ] || exit 0; exec "${{SUTANDO_PY:-{fb}}}" {q}')
+            out.append((event, target.name, cmd, LEGACY_SEP.join(legacy)))
     return out
 
 

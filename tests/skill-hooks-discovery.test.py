@@ -13,7 +13,7 @@ from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-from skill_hooks import discover, python_runner, LEGACY_SEP
+from skill_hooks import discover, python_runner_prefix, LEGACY_SEP
 import os
 
 
@@ -40,14 +40,16 @@ class SkillHookDiscovery(unittest.TestCase):
         self.assertEqual(event, "PreToolUse")
         self.assertEqual(token, "g.py")
         q = shlex.quote(str(self.repo.resolve() / "skills/demo/hooks/g.py"))
-        # The runner is resolved at EVENT time by the launcher's policy (SUTANDO_PY, else the
-        # bundled interpreter when one sits beside the engine, else PATH python3); it no longer
-        # leads the command, because an existence guard runs first.
-        self.assertEqual(cmd, f'[ -f {q} ] || exit 0; exec "${{SUTANDO_PY:-python3}}" {q}')
+        # The interpreter is resolved at EVENT time by the one owner of that policy,
+        # scripts/python-binary.sh; nothing in the command names an interpreter itself.
+        self.assertEqual(cmd, f'[ -f {q} ] || exit 0; {python_runner_prefix(self.repo)}exec "$_py" {q}')
+        self.assertIn("scripts/python-binary.sh", cmd)
+        self.assertIn("resolve_python", cmd)
         # Every shape an earlier installer wrote, so the sweep can match and replace them
         # without re-deriving them from `cmd`.
-        self.assertEqual(legacy.split(LEGACY_SEP),
-                         [f"python3 {q}", f"[ -f {q} ] || exit 0; exec python3 {q}"])
+        shapes = legacy.split(LEGACY_SEP)
+        self.assertEqual(shapes[:2], [f"python3 {q}", f"[ -f {q} ] || exit 0; exec python3 {q}"])
+        self.assertTrue(all('"${SUTANDO_PY:-' in x for x in shapes[2:]), shapes)
 
     def test_prior_command_survives_a_repo_path_containing_exec_and_pipe(self):
         """`${CMD#*exec }` splits at the first `exec ` — inside the path, not the
@@ -65,7 +67,46 @@ class SkillHookDiscovery(unittest.TestCase):
         self.assertNotEqual(cmd.split("exec ", 1)[1], prior,
                             "fixture must actually exercise the bad derivation")
 
+    def _resolver_beside(self):
+        """The command sources <repo>/scripts/python-binary.sh; the fixture needs the real one."""
+        (self.repo / "scripts").mkdir(exist_ok=True)
+        shutil.copy2(Path(__file__).resolve().parent.parent / "scripts/python-binary.sh",
+                     self.repo / "scripts/python-binary.sh")
+
+    def test_a_stale_SUTANDO_PY_falls_to_the_bundled_interpreter_not_rc_126(self):
+        """The unvalidated `${SUTANDO_PY:-…}` expansion exec'd a nonexistent override (126). The
+        resolver checks executability, so a stale override falls through to the bundled python."""
+        self._resolver_beside()
+        bundled = self.repo.parent / "runtime" / "python" / "bin"
+        bundled.mkdir(parents=True, exist_ok=True)
+        (bundled / "python3").unlink(missing_ok=True)
+        os.symlink(sys.executable, bundled / "python3")
+        self.addCleanup(lambda: (bundled / "python3").unlink(missing_ok=True))
+        self._skill("demo", {"name": "demo", "hooks": [
+            {"event": "PreToolUse", "command": "./hooks/g.py"}]}, hook_body="print('HOOK_EXECUTED')")
+        cmd = discover(self.repo)[0][2]
+        stub_dir = self.repo / "bin"; stub_dir.mkdir()
+        (stub_dir / "python3").write_text("#!/bin/bash\nexit 79\n"); (stub_dir / "python3").chmod(0o755)
+        env = dict(os.environ, PATH=f"{stub_dir}:{os.environ.get('PATH', '')}",
+                   SUTANDO_PY=str(self.repo / "no" / "such" / "python3"))
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, env=env)
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, "HOOK_EXECUTED"), r.stderr)
+
+    def test_no_runnable_interpreter_fails_open_like_the_existence_guard(self):
+        """No SUTANDO_PY, no bundled python, and the resolver refusing PATH: the hook must exit 0
+        (the tool is not blocked) rather than exec an empty string."""
+        self._resolver_beside()
+        self._skill("demo", {"name": "demo", "hooks": [
+            {"event": "PreToolUse", "command": "./hooks/g.py"}]}, hook_body="print('HOOK_EXECUTED')")
+        cmd = discover(self.repo)[0][2]
+        env = {k: v for k, v in os.environ.items() if k != "SUTANDO_PY"}
+        env["PATH"] = str(self.repo / "empty-bin")  # no python3 anywhere
+        (self.repo / "empty-bin").mkdir()
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, env=env)
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, ""), r.stderr)
+
     def test_the_hook_runs_under_the_configured_interpreter_not_the_PATH_one(self):
+        self._resolver_beside()
         """The finding: a registered command that execs bare `python3` fails at every event on a
         host whose PATH python is broken while SUTANDO_PY is configured. Fire the exact stored
         command in that environment."""
@@ -89,14 +130,14 @@ class SkillHookDiscovery(unittest.TestCase):
         self.assertTrue(log.exists())
 
     def test_a_bundled_interpreter_beside_the_engine_is_the_default_runner(self):
-        """Second rung of the policy: with no SUTANDO_PY the command execs the bundled python,
-        fixed at discovery time, never PATH."""
+        """Second rung of the policy: with no SUTANDO_PY (a tmux window spawned on a server that
+        never had one) the command runs the bundled python, never PATH."""
+        self._resolver_beside()
         bundled = self.repo.parent / "runtime" / "python" / "bin"
         bundled.mkdir(parents=True, exist_ok=True)
         (bundled / "python3").unlink(missing_ok=True)
         os.symlink(sys.executable, bundled / "python3")
         self.addCleanup(lambda: (bundled / "python3").unlink(missing_ok=True))
-        self.assertIn(str(bundled / "python3"), python_runner(self.repo))
         self._skill("demo", {"name": "demo", "hooks": [
             {"event": "PreToolUse", "command": "./hooks/g.py"}]},
             hook_body="print('HOOK_EXECUTED')")
@@ -111,6 +152,7 @@ class SkillHookDiscovery(unittest.TestCase):
     def test_a_vanished_script_allows_the_tool_instead_of_blocking_it(self):
         """The registration outlives the file, and a hook that cannot start blocks
         the tool it gates, so an absent script must exit 0."""
+        self._resolver_beside()
         d = self._skill("demo", {"name": "demo", "hooks": [
             {"event": "PreToolUse", "command": "./hooks/g.py"}]}, hook_body="import sys; sys.exit(2)")
         cmd = discover(self.repo)[0][2]
