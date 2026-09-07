@@ -41,8 +41,18 @@ class Unit(unittest.TestCase):
         ordinary row and make the pass useless."""
         self.assertEqual(m.cross_role_collisions(rows(("alice", H, H))), [])
 
-    def test_two_KEYS_for_one_login_are_an_alias_not_a_clash(self):
+    def test_two_KEYS_for_one_login_still_COLLIDE_across_roles(self):
+        """Alias equivalence may suppress duplicates within a role; it must not
+        exempt opposite referents. Two keys canonicalising to one login used to
+        take the same-login exemption and publish H as human AND stand."""
         r = rows(("alice", None, H), ("alice", H, None))
+        r[1]["key"] = "alice-alt"
+        self.assertEqual(len(m.cross_role_collisions(r)), 1)
+
+    def test_an_alias_repeating_ONE_role_is_still_not_a_clash(self):
+        """The other half: two keys, one login, same role — a duplicate
+        observation, not a collision, and it must stay silent."""
+        r = rows(("alice", None, H), ("alice", None, H))
         r[1]["key"] = "alice-alt"
         self.assertEqual(m.cross_role_collisions(r), [])
 
@@ -58,7 +68,7 @@ class Unit(unittest.TestCase):
 
 
 class Production(unittest.TestCase):
-    """keweichen's control, through main(): rc must be nonzero and no file written."""
+    """Through production `main()`: rc must be nonzero and no file written."""
 
     def test_main_refuses_and_writes_NOTHING(self):
         d = pathlib.Path(tempfile.mkdtemp())

@@ -919,16 +919,19 @@ def cross_role_collisions(rows):
                                      *r.get("after_other_stands", [])])):
             for i in ids:
                 if i:
-                    seen.setdefault(str(i), {}).setdefault(role, set()).add(login)
+                    seen.setdefault(str(i), {}).setdefault(role, set()).add(
+                        (login, r["key"]))
     out = []
     for ident, roles in sorted(seen.items()):
         if len(roles) < 2:
             continue
-        logins = set().union(*roles.values())
-        if len(logins) == 1:
-            continue          # one person, both referents: entry-local owns it
-        out.append({"id": ident, "human": sorted(roles.get("human", ())),
-                    "stand": sorted(roles.get("stand", ()))})
+        # Only ONE ROW holding both referents is entry-local's business. Alias
+        # equivalence may suppress duplicates within a role, never across them.
+        if len({k for v in roles.values() for _, k in v}) == 1:
+            continue
+        out.append({"id": ident,
+                    "human": sorted({lg for lg, _ in roles.get("human", ())}),
+                    "stand": sorted({lg for lg, _ in roles.get("stand", ())})})
     return out
 
 
