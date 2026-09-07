@@ -396,6 +396,43 @@ def _slot_failures(value, slot: str, path: list, shapes: list, mines) -> None:
         _bad_shape(v)
 
 
+def walk(obj, path, provider, sink, shapes):
+    if isinstance(obj, dict):
+        prov = _declared_provider(obj) or provider
+        for k, v in obj.items():
+            sub = path + [str(k)]
+            slot = _id_slot(k)
+            # Inside the basis map the key IS the slot and the value prose.
+            if slot and shapes is not None and ri.BASIS_FIELD not in path \
+                    and _discord_source(path, str(k), prov):
+                _slot_failures(v, slot, sub, shapes,
+                               lambda m, _p=sub, _pr=prov: _mines(m, _p, _pr))
+            walk(v, sub, prov, sink, shapes)
+    elif isinstance(obj, list):
+        for v in obj:
+            walk(v, path, provider, sink, shapes)
+    elif isinstance(obj, str) and path and ri.BASIS_FIELD not in path \
+            and _discord_source(path[:-1], path[-1], provider):
+        for sf in _snowflakes(obj):
+            if sf not in sink:
+                sink.append(sf)
+    elif obj is not None and not isinstance(obj, str) and path \
+            and _discord_source(path[:-1], path[-1], provider) \
+            and shapes is not None and not _id_slot(path[-1]):
+        # A declared slot is reported by _slot_failures; without this guard
+        # a non-string there is reported twice.
+        shapes.append({"path": ".".join(path), "kind": type(obj).__name__,
+                       "reason": "typed field holds a non-string value, so "
+                                 "its id is unreadable rather than absent"})
+
+def _mines(member, path, provider) -> list:
+    """The ids the collector reads from ONE member — the list, not a bool,
+    so cardinality is counted from collection rather than re-derived."""
+    scratch = []
+    walk(member, path, provider, scratch, None)
+    return scratch
+
+
 def _collect_ids(entry: dict, shapes: "list | None" = None) -> list:
     """Every discord-shaped id in the entry, in stable order.
 
@@ -403,43 +440,6 @@ def _collect_ids(entry: dict, shapes: "list | None" = None) -> list:
     never silently skipped — whatever type it holds.
     """
     found = []
-
-    def walk(obj, path, provider, sink, shapes):
-        if isinstance(obj, dict):
-            prov = _declared_provider(obj) or provider
-            for k, v in obj.items():
-                sub = path + [str(k)]
-                slot = _id_slot(k)
-                # Inside the basis map the key IS the slot and the value prose.
-                if slot and shapes is not None and ri.BASIS_FIELD not in path \
-                        and _discord_source(path, str(k), prov):
-                    _slot_failures(v, slot, sub, shapes,
-                                   lambda m, _p=sub, _pr=prov: _mines(m, _p, _pr))
-                walk(v, sub, prov, sink, shapes)
-        elif isinstance(obj, list):
-            for v in obj:
-                walk(v, path, provider, sink, shapes)
-        elif isinstance(obj, str) and path and ri.BASIS_FIELD not in path \
-                and _discord_source(path[:-1], path[-1], provider):
-            for sf in _snowflakes(obj):
-                if sf not in sink:
-                    sink.append(sf)
-        elif obj is not None and not isinstance(obj, str) and path \
-                and _discord_source(path[:-1], path[-1], provider) \
-                and shapes is not None and not _id_slot(path[-1]):
-            # A declared slot is reported by _slot_failures; without this guard
-            # a non-string there is reported twice.
-            shapes.append({"path": ".".join(path), "kind": type(obj).__name__,
-                           "reason": "typed field holds a non-string value, so "
-                                     "its id is unreadable rather than absent"})
-
-    def _mines(member, path, provider) -> list:
-        """The ids the collector reads from ONE member — the list, not a bool,
-        so cardinality is counted from collection rather than re-derived."""
-        scratch = []
-        walk(member, path, provider, scratch, None)
-        return scratch
-
     walk(entry, [], None, found, shapes)
     return found
 
@@ -555,32 +555,45 @@ def _still_unresolved(entry, rec: dict, fresh_paths: set) -> bool:
         # Our own rewrite is not a repair: only re-migrating a repaired
         # SOURCE can clear a writer-owned finding.
         return True
-    node = entry
-    for seg in str(path).split("."):
-        if not isinstance(node, dict) or seg not in node:
-            return True                     # unreachable: cannot re-check
-        node = node[seg]
-    if node is None or (isinstance(node, str) and not node.strip()):
+    # A LIST DOES NOT CONSUME A SEGMENT, the same rule the collector's `walk`
+    # applies — a dict-only descent made every documented `identities[]` path
+    # permanently "unreachable", so a real repair there could never clear.
+    segs = str(path).split(".")
+    nodes = _nodes_at(entry, segs, 0, None)
+    if not nodes:
+        return True                         # unreachable: cannot re-check
+    live = [(n, pr) for n, pr in nodes
+            if not (n is None or (isinstance(n, str) and not n.strip()))]
+    if not live:
         return True                         # destroyed by the writer
-    return not _mineable_now(node)
+    # Ask the COLLECTOR, not a second parser: `_mines` is the same
+    # path/provider-aware primitive `_collect_ids` reads with, so a value the
+    # collector would never read cannot clear a refusal, and one it does read
+    # clears it whatever shape it has. The PROVIDER must be carried down with
+    # the node — detached from the dict that declares it, an identity leaf
+    # stops being Discord and every repair reads as still-broken.
+    return not all(_mines(n, segs, pr) for n, pr in live)
 
 
-def _mineable_now(value) -> bool:
-    """True when every present member of this value yields an id — the same
-    readability the collector applies, asked of one corrected value."""
-    vals = [value]
-    while vals:
-        v = vals.pop()
-        if isinstance(v, (list, tuple)):
-            if not v:
-                return False
-            vals.extend(v); continue
-        if isinstance(v, str) and _snowflakes(v):
-            continue
-        if isinstance(v, dict) and _snowflakes(json.dumps(v, default=str)):
-            continue
-        return False
-    return True
+def _nodes_at(node, segs, i, provider) -> list:
+    """(node, provider) reachable at this path.
+
+    A LIST DOES NOT CONSUME A SEGMENT and a dict may DECLARE the provider —
+    both rules copied from the collector's `walk`, which is the only reason
+    this can answer the same question it would.
+    """
+    if isinstance(node, list):
+        out = []
+        for v in node:
+            out.extend(_nodes_at(v, segs, i, provider))
+        return out
+    if isinstance(node, dict):
+        provider = _declared_provider(node) or provider
+    if i == len(segs):
+        return [(node, provider)]
+    if not isinstance(node, dict) or segs[i] not in node:
+        return []
+    return _nodes_at(node[segs[i]], segs, i + 1, provider)
 
 
 #: The backticked path inside a generated basis reason ("cited in `a.b`").
