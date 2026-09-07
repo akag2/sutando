@@ -49,9 +49,9 @@ HUMAN, STAND = "human", "stand"
 # The writer overwrites the malformed slot; this key carries the finding on.
 SHAPE_FIELD = ri.SHAPE_FIELD    # owned by the schema module
 
-# Core `[0-9]`, boundaries `\d`: a run touching ANY Unicode digit is
-# rejected whole rather than yielding its ASCII tail as an authoritative id.
-_SNOWFLAKE = re.compile(r"(?<!\d)[0-9]{17,20}(?!\d)")
+# The extractor adds only its token boundaries around ri.SNOWFLAKE_CORE, so the
+# grammar has ONE owner; `\d` boundaries reject a mixed-script run whole.
+_SNOWFLAKE = re.compile(r"(?<!\d)" + ri.SNOWFLAKE_CORE + r"(?!\d)")
 
 
 # A Matrix id is `@localpart:server`; a numeric localpart is not a snowflake.
