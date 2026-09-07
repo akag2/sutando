@@ -6,8 +6,11 @@ answered into `results/task-<id>.txt` — but the answer comes from an AG2
 Assistant sidecar over ACP (JSON-RPC over WebSocket, `acp-serve`): one session
 per task, the task body as the prompt, the agent's message text as the result,
 signed `— <worker id> (ag2-assistant)`. Every turn is bounded by
-SUTANDO_ACP_TURN_TIMEOUT_S; a timeout or a transport failure still writes a
-short failure result, so a task is never silently swallowed.
+SUTANDO_ACP_TURN_TIMEOUT_S. A timeout or a transport failure writes NOTHING:
+the gateway closes the server lease on any delivered result, so a failure text
+would be the user's terminal answer and no other seat could be re-fronted. The
+task stays pending, this seat retries it under backoff, and an unrecovered seat
+lets the lease expire into the stack's documented failover.
 
 The WebSocket transport is the ACP SDK's own (`acp.ws.client`, the package
 ag2-assistant imports); the JSON-RPC turn is driven here over its Transport
@@ -34,6 +37,9 @@ ACP_URL = os.environ.get("AG2ASSISTANT_ACP_URL") or "ws://assistant:8802"
 ACP_TOKEN = os.environ.get("AG2ASSISTANT_ACP_TOKEN") or ""
 TURN_TIMEOUT_S = float(os.environ.get("SUTANDO_ACP_TURN_TIMEOUT_S") or "300")
 SCAN_S = float(os.environ.get("SUTANDO_STUB_SCAN_S") or "1.0")
+# A failed turn leaves the task pending, so the scan would re-attempt it every
+# SCAN_S. Back off per task instead: 2**attempt seconds, capped.
+RETRY_MAX_S = float(os.environ.get("SUTANDO_ACP_RETRY_MAX_S") or "60")
 SIGNATURE = f"— {WORKER} (ag2-assistant)"
 PROTOCOL_VERSION = 1
 _STOP = False
@@ -128,8 +134,12 @@ async def _connect(transport_factory, deadline: float):
             delay = min(delay * 2, 15.0)
 
 
-async def turn(prompt: str, transport_factory, timeout_s: float) -> str:
-    """The agent's answer, or a short failure text — never an exception."""
+async def turn(prompt: str, transport_factory, timeout_s: float) -> str | None:
+    """The agent's answer, or None when the turn failed — never an exception.
+
+    None is not "empty answer": it means nothing may be written to results/,
+    because a written result closes the lease and forecloses failover.
+    """
     transport = None
     try:
         async def _run():
@@ -140,9 +150,13 @@ async def turn(prompt: str, transport_factory, timeout_s: float) -> str:
         text, stop = await asyncio.wait_for(_run(), timeout_s)
         return text or f"(ag2-assistant returned no text; stop reason: {stop or 'unknown'})"
     except asyncio.TimeoutError:
-        return f"ag2-assistant seat: no answer within {timeout_s:.0f}s — the task is not done."
-    except Exception as exc:  # noqa: BLE001 — every failure becomes a visible result
-        return f"ag2-assistant seat: turn failed ({type(exc).__name__}: {exc}) — the task is not done."
+        print(f"seat-ag2-assistant: no answer within {timeout_s:.0f}s — leaving the task pending",
+              file=sys.stderr, flush=True)
+        return None
+    except Exception as exc:  # noqa: BLE001 — a failure must not become an answer
+        print(f"seat-ag2-assistant: turn failed ({type(exc).__name__}: {exc}) — leaving the task pending",
+              file=sys.stderr, flush=True)
+        return None
     finally:
         if transport is not None:
             try:
@@ -157,6 +171,8 @@ def answer(task: Path, results: Path, transport_factory=ws_transport,
     if out.exists():
         return None
     text = asyncio.run(turn(prompt_of(task.read_text(encoding="utf-8")), transport_factory, timeout_s))
+    if text is None:
+        return None            # failed turn: no result file, so the lease can expire
     body = f"{text.rstrip()}\n\n{SIGNATURE}\n"
     tmp = out.with_name(out.name + f".{os.getpid()}.tmp")
     tmp.write_text(body, encoding="utf-8")
@@ -170,18 +186,33 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
     done: set[str] = set()
+    # `done` records ANSWERED tasks, never attempted ones: marking on attempt
+    # strands a task whose sidecar was briefly down.
+    attempts: dict[str, int] = {}
+    retry_at: dict[str, float] = {}
     print(f"seat-ag2-assistant: worker={WORKER} acp={ACP_URL} timeout={TURN_TIMEOUT_S:.0f}s "
           f"watching {tasks}", flush=True)
     while not _STOP:
         for task in sorted(tasks.glob("task-*.txt")) if tasks.is_dir() else []:
             if not is_pending_task_file(task.name) or task.name in done:
                 continue
-            done.add(task.name)
+            if time.time() < retry_at.get(task.name, 0.0):
+                continue
             t0 = time.time()
             body = answer(task, results)
-            if body is not None:
-                print(f"seat-ag2-assistant: answered {task.stem} in {time.time() - t0:.1f}s "
-                      f"({len(body)} chars)", flush=True)
+            if body is not None or (results / task.name).exists():
+                done.add(task.name)
+                attempts.pop(task.name, None)
+                retry_at.pop(task.name, None)
+                if body is not None:
+                    print(f"seat-ag2-assistant: answered {task.stem} in {time.time() - t0:.1f}s "
+                          f"({len(body)} chars)", flush=True)
+            else:
+                n = attempts[task.name] = attempts.get(task.name, 0) + 1
+                delay = min(2.0 ** n, RETRY_MAX_S)
+                retry_at[task.name] = time.time() + delay
+                print(f"seat-ag2-assistant: {task.stem} still pending after attempt {n}; "
+                      f"retrying in {delay:.0f}s", file=sys.stderr, flush=True)
         time.sleep(SCAN_S)
     return 0
 

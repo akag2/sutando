@@ -227,12 +227,21 @@ check(m.answer(ws / "tasks" / "task-A1.txt", ws / "results", f1, 5) is None, "an
 
 async def f2(): return SilentTransport()
 body = m.answer(ws / "tasks" / "task-A2.txt", ws / "results", f2, 0.5)
-check("no answer within 0s" in body or "no answer within 1s" in body, f"a silent agent → timeout failure result: {body.splitlines()[0]!r}")
-check(body.rstrip().endswith("— cloud-t (ag2-assistant)"), "the failure result is signed too")
+# A delivered result closes the server lease, so a failure text would be the
+# user's terminal answer and no other seat could be re-fronted. Write nothing.
+check(body is None, f"a silent agent → no body returned, not failure prose: {body!r}")
+check(not (ws / "results" / "task-A2.txt").exists(), "a timed-out turn leaves NO results/ file, so the lease can expire")
 
 async def f3(): raise ConnectionRefusedError("sidecar down")
 body = m.turn("x", f3, 2); body = asyncio.run(body) if asyncio.iscoroutine(body) else body
-check(body.startswith("ag2-assistant seat: turn failed (ConnectionRefusedError"), f"a transport failure → short failure text: {body[:60]!r}")
+check(body is None, f"a transport failure → None, not a deliverable answer: {body!r}")
+
+# The recovery half: a task that failed must still be answerable, which is what
+# `done`-on-attempt broke — the seat marked it done before the turn was tried.
+async def f4(): return FakeTransport()   # a FRESH transport: the sidecar is back
+body = m.answer(ws / "tasks" / "task-A2.txt", ws / "results", f4, 5)
+check(body is not None and (ws / "results" / "task-A2.txt").exists(),
+      "after a failed turn the SAME task is answered once the sidecar returns")
 check(m.prompt_of("id: x\nsource: s\ntask: hello\nworld\n") == "hello\nworld" and m.prompt_of("no headers") == "no headers", "prompt_of: task: is the last header; headerless text passes through")
 sys.exit(1 if fails else 0)
 PY
