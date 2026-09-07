@@ -137,6 +137,21 @@ class TestHookRegistration(unittest.TestCase):
         self.assertEqual(out["status"], "warn")
         self.assertIn("never run", out["detail"])
 
+    def test_override_contract_matches_the_installer(self):
+        """Absolute or `~/…` only, on both sides: the installer refuses a `~user` form (its shell
+        expansion would mangle it), so the probe reads it as no override instead of resolving it
+        to a directory nothing wrote."""
+        home = self.repo / "home"
+        home.mkdir()
+        with mock.patch.dict(os.environ, {"HOME": str(home), "SUTANDO_CLAUDE_WORKING_DIR": "~/core home"}):
+            self.assertEqual(self.hc._hook_settings_target(self.repo), (home / "core home").resolve())
+        with mock.patch.dict(os.environ, {"HOME": str(home), "SUTANDO_CLAUDE_WORKING_DIR": "~root/core"}):
+            self.assertEqual(self.hc._hook_settings_target(self.repo), self.repo)
+        with mock.patch.dict(os.environ, {"SUTANDO_CLAUDE_WORKING_DIR": "relative/dir"}):
+            self.assertEqual(self.hc._hook_settings_target(self.repo), self.repo)
+        with mock.patch.dict(os.environ, {"SUTANDO_CLAUDE_WORKING_DIR": str(self.repo / "abs")}):
+            self.assertEqual(self.hc._hook_settings_target(self.repo), (self.repo / "abs").resolve())
+
     def test_an_unresolvable_override_falls_back_to_the_repo(self):
         """An override the OS cannot resolve must not abort the probe: it reads the repo's file,
         the same target the installer falls to. Two real shapes: a symlink LOOP — which Path.resolve

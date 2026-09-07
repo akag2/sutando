@@ -10766,10 +10766,16 @@ def _hook_settings_target(repo: Path) -> Path:
     override = os.environ.get("SUTANDO_CLAUDE_WORKING_DIR", "").strip()
     if not override:
         return repo
+    # One contract with install-claude-hooks.sh: absolute or `~/…`; a `~user` form is refused there,
+    # so it is read as "no override" here rather than resolved to a directory nothing wrote.
+    if override.startswith("~/"):
+        override = os.path.join(os.path.expanduser("~"), override[2:])
+    elif not override.startswith("/"):
+        return repo
     # resolve() is non-strict, so a missing path returns; a symlink loop raises RuntimeError
     # (OSError only from 3.13), a denied component OSError — both fall back to the repo.
     try:
-        return Path(os.path.expanduser(override)).resolve()
+        return Path(override).resolve()
     except (OSError, RuntimeError):
         return repo
 

@@ -479,6 +479,21 @@ ok "broken PATH python3 only: the skill hook is absent (reported, not silent)" \
    "$([ "$(skill_hooks_in "$PREPO/.claude/settings.json")" = 0 ] && echo 0 || echo 1)"
 rm -rf "$PROOT"
 
+# --- 9. the override contract is ONE policy on both sides (installer + probe): absolute or ~/ only ----
+TROOT="$(mktemp -d "${TMPDIR:-/tmp}/sutando hooks tilde.XXXXXX")"
+TREPO="$TROOT/repo"; mkdir -p "$TREPO/src" "$TREPO/.claude"; export HOME="$TROOT/home"; mkdir -p "$HOME"
+cp "$INSTALLER" "$TREPO/src/install-claude-hooks.sh"
+printf '#!/bin/bash\nexit 0\n' > "$TREPO/src/session-handoff.sh"; printf '#!/bin/bash\nexit 0\n' > "$TREPO/src/check-pending-tasks.sh"
+T_OUT="$(SUTANDO_CLAUDE_WORKING_DIR="~/core home" bash "$TREPO/src/install-claude-hooks.sh" 2>&1)"; T_RC=$?
+ok "tilde: ~/… resolves under HOME" "$([ $T_RC = 0 ] && [ -f "$HOME/core home/.claude/settings.json" ] && echo 0 || echo 1)"
+U_OUT="$(SUTANDO_CLAUDE_WORKING_DIR="~someoneelse/core" bash "$TREPO/src/install-claude-hooks.sh" 2>&1)"; U_RC=$?
+ok "tilde: ~user/… is REFUSED (rc 1), not mangled into HOME + user" "$([ $U_RC = 1 ] && echo 0 || echo 1)"
+ok "tilde: the refusal names the contract" "$(echo "$U_OUT" | grep -q "absolute path or start with ~/" && echo 0 || echo 1)"
+ok "tilde: nothing was created for the refused form" "$([ ! -e "$HOME/someoneelse" ] && [ ! -e "$HOME/core" ] && [ ! -e "$HOME"someoneelse ] && echo 0 || echo 1)"
+R_OUT="$(SUTANDO_CLAUDE_WORKING_DIR="relative/dir" bash "$TREPO/src/install-claude-hooks.sh" 2>&1)"; R_RC=$?
+ok "tilde: a relative path is refused too" "$([ $R_RC = 1 ] && echo 0 || echo 1)"
+rm -rf "$TROOT"
+
 rm -rf "$ROOT"
 echo "---"
 if [ "$fail" -gt 0 ]; then
