@@ -816,10 +816,11 @@ def _first_ask(led: Path, canonical=None) -> dict:
     return _fold(_streams(led), per_stream, earliest, canonical=canonical)
 
 
-def retry_clause(kind: str) -> str:
+def retry_clause(kind: str, parked: bool = True) -> str:
     """What an unsafe send may truthfully promise about repeating itself.
-    Only an ask claims a park, so only an ask has protection to report."""
-    if kind == "ask":
+    Only a PARKED ask has protection: an unkeyable one reserved nothing, so it
+    reports the same unprotected repeat a notice does."""
+    if kind == "ask" and parked:
         return ("the park holds, so a repeat is refused — check the channel "
                 "before clearing one")
     return ("NO retry record was written (a notice does not park). Re-running "
@@ -1512,6 +1513,9 @@ def main() -> int:
     # Retry admission keys the PERSON, not a spelling: an outcome-unknown park
     # must block every alias and endpoint in that person's component.
     person_of = component_resolver(roster)
+    # A property of the message, not of a target: the Matrix path sends an ask
+    # with no PR URL, and nothing keyed can be reserved or recorded for it.
+    keyable = bool(_PR_URL.search(a.message))
     for t in targets:
         if t["transport"] == "discord":
             # No room-relocation branch: a Discord mention is channel-scoped and
@@ -1598,7 +1602,7 @@ def main() -> int:
                 _settle("unknown", "child reported an unknown outcome")
                 unknowns += 1
                 print(f"{t['name']}: OUTCOME UNKNOWN on channel {t['channel']} — "
-                      f"the post may have landed; {retry_clause(a.kind)}. "
+                      f"the post may have landed; {retry_clause(a.kind, keyable)}. "
                       f"{(p.stderr or '').strip() or 'no stderr'}",
                       file=sys.stderr)
             elif p.returncode in _PROVEN_NOT_DELIVERED:
@@ -1614,7 +1618,7 @@ def main() -> int:
                 _settle("unknown", f"ambiguous child exit rc={p.returncode}")
                 unknowns += 1
                 print(f"{t['name']}: AMBIGUOUS EXIT rc={p.returncode} — the post may "
-                      f"have landed; {retry_clause(a.kind)}. "
+                      f"have landed; {retry_clause(a.kind, keyable)}. "
                       f"{(p.stderr or '').strip() or 'no stderr'}",
                       file=sys.stderr)
             continue
@@ -1667,7 +1671,6 @@ def main() -> int:
         who = actors.get(t["name"], t["name"])
         # Same reservation as the Discord path: an alias on this transport must
         # not walk past a park an ask on the other one is still holding.
-        keyable = bool(_PR_URL.search(a.message))
         proceed, bucket, note = reserve_ask(a, t, who, person_of, roster,
                                             require_ref=False)
         if not proceed:
@@ -1687,7 +1690,7 @@ def main() -> int:
             # the Discord path has always done this; this one used to not.
             _settle("unknown", "timeout: TimeoutExpired")
             print(f"{t['name']}: UNKNOWN outcome (room_ops exceeded the 60s timeout)"
-                  f" — the post may have landed; {retry_clause(a.kind)}",
+                  f" — the post may have landed; {retry_clause(a.kind, keyable)}",
                   file=sys.stderr)
             unknowns += 1
             continue
@@ -1719,7 +1722,7 @@ def main() -> int:
             detail = reason or ("posted without an event id" if ok else fallback)
             _settle("unknown", f"room_ops {state or 'unconfirmed'}: {detail[:80]}")
             print(f"{t['name']}: UNKNOWN outcome ({detail[:80]}) — the post may have "
-                  f"landed; {retry_clause(a.kind)}", file=sys.stderr)
+                  f"landed; {retry_clause(a.kind, keyable)}", file=sys.stderr)
             unknowns += 1
             continue
         # room_ops reports refusals in-band: rc 0, empty stderr, ok:false + reason.
@@ -1767,7 +1770,7 @@ def main() -> int:
               file=sys.stderr)
     if unknowns:
         print(f"{unknowns} send(s) are UNSAFE to repeat — each landed or may have; "
-              f"{retry_clause(a.kind)}.", file=sys.stderr)
+              f"{retry_clause(a.kind, keyable)}.", file=sys.stderr)
     # Unknown outranks a definite failure in a mixed batch: a failure is safe to
     # retry and an unknown is not, so collapsing to 1 invites the duplicate.
     if unknowns:
