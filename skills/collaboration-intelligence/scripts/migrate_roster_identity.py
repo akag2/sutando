@@ -58,6 +58,32 @@ _SNOWFLAKE = re.compile(r"(?<!\d)" + ri.SNOWFLAKE_CORE + r"(?!\d)")
 _MXID = re.compile(r"@[^\s:@]+:[^\s]+")
 
 
+def _scalar_snowflakes(value) -> list:
+    """Snowflakes in the RAW scalar leaves of a value, never in its rendering.
+
+    `json.dumps` escapes a non-ASCII digit to `\\uXXXX`, and those hex digits
+    join whatever follows: `"１" + "1"*15` serialises to a run that extracts as
+    an id present nowhere in the source.
+    """
+    out = []
+    stack = [value]
+    while stack:
+        v = stack.pop()
+        if isinstance(v, dict):
+            stack.extend(v.keys()); stack.extend(v.values())
+        elif isinstance(v, (list, tuple, set)):
+            stack.extend(v)
+        elif isinstance(v, str) or (isinstance(v, int)
+                                    and not isinstance(v, bool)):
+            # An int's decimal rendering introduces no escape syntax, and a
+            # numeric id is still EVIDENCE opposing a slot even though it is
+            # never an authoritative id itself.
+            for sf in _snowflakes(v if isinstance(v, str) else str(v)):
+                if sf not in out:
+                    out.append(sf)
+    return out
+
+
 def _snowflakes(text: str) -> list:
     """Every whole snowflake in a string, never a prefix of a longer one."""
     return _SNOWFLAKE.findall(_MXID.sub(" ", str(text)))
@@ -141,7 +167,7 @@ def _bad(entries: list, value, states, reason: str, shapes: list) -> None:
     `str(container)` attaches the disagreement to a repr no reader can match,
     so the id it actually opposes keeps its slot.
     """
-    found = _snowflakes(json.dumps(value, default=str))
+    found = _scalar_snowflakes(value)
     if not found:
         # `str(value)` here would publish a container repr into a field the
         # schema documents as ids only; record it as a shape failure instead.
@@ -679,7 +705,7 @@ def classify(key: str, entry: dict, triage_people: dict, peer_ids: dict,
         # The collision is between two IDENTITY AXES, so it exists whether or
         # not the colliding row happens to carry an id to hang it on.
         collisions.append({"key": key, "join": join, "reason": _why})
-        for sf in _snowflakes(json.dumps((_hit[1] if _hit else {}) or {})):
+        for sf in _scalar_snowflakes((_hit[1] if _hit else {}) or {}):
             bad.append({"id": sf, "states": None, "collision": True,
                         "reason": _why})
     # A typed field states the referent but not that the VALUE is an id. An
