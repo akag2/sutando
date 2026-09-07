@@ -375,6 +375,12 @@ class TestAgainstTheRealInstaller(unittest.TestCase):
 
     def setUp(self):
         self.hc = _load()
+        # Same guard as TestHookRegistration: the probe honours the launch-dir override, so
+        # an inherited value points these fixture probes at another tree's settings.json.
+        self._env = mock.patch.dict(os.environ, {}, clear=False)
+        self._env.start()
+        os.environ.pop("SUTANDO_CLAUDE_WORKING_DIR", None)
+        self.addCleanup(self._env.stop)
         self.installer_src = (REPO / "src" / "install-claude-hooks.sh").read_text()
         self._tmp = tempfile.TemporaryDirectory()
 
@@ -398,13 +404,25 @@ class TestAgainstTheRealInstaller(unittest.TestCase):
         }}))
         return r
 
+    def _assert_probe_read_the_fixture(self, r: Path):
+        # An `ok` names no path, so pin the one the probe read: its target must be the
+        # fixture, and removing the fixture's file must be what turns the verdict.
+        settings = r / ".claude" / "settings.json"
+        self.assertEqual(self.hc._hook_settings_target(r), r)
+        settings.unlink()
+        out = self.hc.check_claude_hook_registration(repo_dir=r)
+        self.assertEqual(out["status"], "warn", out["detail"])
+        self.assertIn(str(settings), out["detail"])
+
     def test_the_installers_real_shq_command_reads_as_registered(self):
         # Over-trigger control, and the one that matters most: failing closed is only
         # correct if the genuine production shape still passes. If this breaks, the
         # probe warns on every healthy host.
-        out = self.hc.check_claude_hook_registration(repo_dir=self._repo("bash {p}"))
+        r = self._repo("bash {p}")
+        out = self.hc.check_claude_hook_registration(repo_dir=r)
         self.assertEqual(out["status"], "ok", out["detail"])
         self.assertIn("4", out["detail"])
+        self._assert_probe_read_the_fixture(r)
 
     def test_decoys_are_rejected_on_the_REAL_installer_shape(self):
         for label, cmd in {
@@ -486,8 +504,10 @@ class TestAgainstTheRealInstaller(unittest.TestCase):
     def test_the_genuine_archive_cp_still_registers(self):
         # Over-trigger control. The real command interpolates $HOME and $(date …),
         # so this must not become a shape-pinning test that warns on healthy hosts.
-        out = self.hc.check_claude_hook_registration(repo_dir=self._repo("bash {p}"))
+        r = self._repo("bash {p}")
+        out = self.hc.check_claude_hook_registration(repo_dir=r)
         self.assertEqual(out["status"], "ok", out["detail"])
+        self._assert_probe_read_the_fixture(r)
 
     def test_an_unreducible_template_fails_CLOSED(self):
         # The fallback used to accept the path anywhere in the first two tokens. A
