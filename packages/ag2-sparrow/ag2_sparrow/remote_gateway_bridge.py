@@ -290,6 +290,7 @@ socket.getaddrinfo = _getaddrinfo_prefer_v4
 # the path (no repo-walking; the old triple-parent form predated the move into
 from ._dirs import task_dir as _task_dir, result_dir as _result_dir, state_dir as _state_dir
 from .chat_secret_filter import filter_chat_secrets, secret_handling_instruction
+from .core_state_notice import sweep_core_state_notices
 from .task_archive import find_task_file
 from .local_task_protocol import find_archived_task
 from . import local_task_protocol
@@ -3263,6 +3264,55 @@ def _post_proactive() -> None:
         _log(f"delivered proactive {f.name} to {dest_room}")
 
 
+def _core_notice_send(room: str, body: str) -> bool:
+    """One best-effort room message for a core-state notice. True = the POST
+    reached the gateway (2xx); a notice is informational, so unlike results it
+    takes no confirmation/outbox machinery — a False here just means the sweep
+    retries on a later pass. 401/403 propagate: the poll loop owns auth."""
+    try:
+        _req("POST", "/v1/room",
+             {"op": "message", "room_id": room, "body": body}, timeout=15)
+        return True
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            raise
+        _log(f"core-state notice to {room} failed: HTTP {e.code}")
+        return False
+    except (urllib.error.URLError, TimeoutError) as e:
+        _log(f"core-state notice to {room} network error: {e}")
+        return False
+
+
+def _maybe_core_state_notices(inflight: set[str]) -> None:
+    """Tell rooms with queued-but-unanswered tasks WHY the core is silent
+    (usage limit / logged out / crashed / wedged), and announce recovery.
+
+    Detection + dedup + ledger live in core_state_notice.sweep_core_state_notices;
+    this binder only picks the rooms: every in-flight task without a ready
+    result, mapped through the task→room sidecar, filtered to real Matrix room
+    ids (an empty/foreign channel id has no gateway room op to send to).
+    Runs every poll pass, so a message that arrives DURING an outage is
+    noticed on the same pass that queued it — and a core that dies mid-task
+    is noticed on the next one. Never breaks the loop: only the send's own
+    401/403 escape (the loop's auth-recovery path must see those)."""
+    try:
+        task_rooms = _load_task_rooms()
+        rooms = set()
+        for tid in inflight:
+            if not _valid_local_tid(tid):
+                continue  # defense-in-depth: never derive a path from an unsafe id
+            if (RESULTS_DIR / f"{tid}.txt").exists():
+                continue  # answer already produced — silence ends on its own
+            room = task_rooms.get(tid, "")
+            if room and _MATRIX_ROOM_RE.match(room):
+                rooms.add(room)
+        sweep_core_state_notices(_STATE, rooms, _core_notice_send, log=_log)
+    except urllib.error.HTTPError:
+        raise
+    except Exception as e:  # noqa: BLE001 — a notice must never stall delivery
+        _log(f"core-state notice sweep failed: {e}")
+
+
 def _load_inflight() -> set[str]:
     """Restore the in-flight set from disk (fail-open to empty).
     A failed restore also sets _INFLIGHT_DEGRADED: the empty set it returns then
@@ -4055,6 +4105,7 @@ def main() -> None:
                 wake_outbound()          # a fresh task often precedes its ack round-trip
             abandoned_suspects = _reconcile_abandoned(inflight, abandoned_suspects)
             _reconcile_orphan_results(inflight)
+            _maybe_core_state_notices(inflight)
             _post_heartbeat(inflight)
             backoff = 1  # healthy round-trip → reset backoff
             _emit_gateway_status(True)
