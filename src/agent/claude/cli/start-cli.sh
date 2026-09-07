@@ -239,11 +239,12 @@ core_claude_running() {
 # hang at the trust prompt. Expand a leading ~, create the dir (fail loud with a
 # scoped message if we can't — better than chdir'ing into the wrong place under
 # set -e's raw error), then resolve via `cd … && pwd -P`.
+# The resolver is shared with the settings installers (scripts/core-working-dir.sh), so the
+# dir the core launches from is the dir the hooks were written to — or the launch refuses.
 CWD_ARGS=()
 if [ -n "${SUTANDO_CLAUDE_WORKING_DIR:-}" ]; then
-  _cwd_exp="${SUTANDO_CLAUDE_WORKING_DIR/#\~/$HOME}"
-  mkdir -p "$_cwd_exp" || { echo "  ✗ can't create core working dir: $_cwd_exp" >&2; exit 1; }
-  SUTANDO_CLAUDE_WORKING_DIR="$(cd "$_cwd_exp" && pwd -P)"
+  . "$REPO/scripts/core-working-dir.sh"
+  SUTANDO_CLAUDE_WORKING_DIR="$(sutando_core_working_dir "$REPO")" || { echo "  ✗ SUTANDO_CLAUDE_WORKING_DIR rejected — not launching the core there" >&2; exit 1; }
   export SUTANDO_CLAUDE_WORKING_DIR
   CWD_ARGS=(-c "$SUTANDO_CLAUDE_WORKING_DIR")
   echo "  ✓ core working dir: $SUTANDO_CLAUDE_WORKING_DIR"

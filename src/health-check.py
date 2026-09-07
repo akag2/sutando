@@ -10766,8 +10766,8 @@ def _hook_settings_target(repo: Path) -> Path:
     override = os.environ.get("SUTANDO_CLAUDE_WORKING_DIR", "").strip()
     if not override:
         return repo
-    # One contract with install-claude-hooks.sh: absolute or `~/…`; a `~user` form is refused there,
-    # so it is read as "no override" here rather than resolved to a directory nothing wrote.
+    # Mirrors scripts/core-working-dir.sh (the launcher and every installer source it): absolute
+    # or `~/…`; anything else is refused there, so it reads as "no override" here.
     if override.startswith("~/"):
         override = os.path.join(os.path.expanduser("~"), override[2:])
     elif not override.startswith("/"):

@@ -55,17 +55,11 @@ set -u
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 # Claude Code reads project settings from the directory the core LAUNCHES from, which
 # start-cli.sh lets SUTANDO_CLAUDE_WORKING_DIR move; the scripts stay anchored at REPO_DIR.
-# Contract shared with health-check's _hook_settings_target: absolute, or `~/…` (this user's
-# home). A `~user` form is refused, not mangled — `${v/#\~/$HOME}` would write $HOME + "user/…".
+# One resolver for every site (scripts/core-working-dir.sh); only needed when the override is set.
 TARGET_DIR="$REPO_DIR"
 if [ -n "${SUTANDO_CLAUDE_WORKING_DIR:-}" ]; then
-  case "$SUTANDO_CLAUDE_WORKING_DIR" in
-    /*)  _cwd_exp="$SUTANDO_CLAUDE_WORKING_DIR" ;;
-    "~/"*) _cwd_exp="$HOME/${SUTANDO_CLAUDE_WORKING_DIR#\~/}" ;;
-    *) echo "error: SUTANDO_CLAUDE_WORKING_DIR must be an absolute path or start with ~/ (got: $SUTANDO_CLAUDE_WORKING_DIR)" >&2; exit 1 ;;
-  esac
-  mkdir -p "$_cwd_exp" || { echo "error: can't create core working dir: $_cwd_exp" >&2; exit 1; }
-  TARGET_DIR="$(cd "$_cwd_exp" && pwd -P)"
+  . "$REPO_DIR/scripts/core-working-dir.sh" || { echo "error: scripts/core-working-dir.sh missing — cannot resolve SUTANDO_CLAUDE_WORKING_DIR" >&2; exit 1; }
+  TARGET_DIR="$(sutando_core_working_dir "$REPO_DIR")" || { echo "error: SUTANDO_CLAUDE_WORKING_DIR rejected — hooks NOT installed" >&2; exit 1; }
 fi
 SETTINGS="$TARGET_DIR/.claude/settings.json"
 

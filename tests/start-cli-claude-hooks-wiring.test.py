@@ -72,6 +72,7 @@ class _Fixture(unittest.TestCase):
         launcher.write_text(_truncated_launcher())
         launcher.chmod(0o755)
         shutil.copy2(REPO / "scripts/python-binary.sh", self.root / "scripts/python-binary.sh")
+        shutil.copy2(REPO / "scripts/core-working-dir.sh", self.root / "scripts/core-working-dir.sh")
         shutil.copy2(REPO / "src/agent/restart-guard.sh", self.root / "src/agent/restart-guard.sh")
         # The personal-claude installer precedes the call under test; stub it to a no-op.
         personal = self.root / "scripts/install-personal-claude-hook.sh"
@@ -203,6 +204,24 @@ class StartCliRestoresOwnedHooksAfterUpdate(_Fixture):
         self.assertTrue(any("demo-skill/hooks/demo-hook.py" in c for c in cmds.get("PreToolUse", [])), cmds)
         # The scripts stay anchored at the engine, not the launch dir.
         self.assertTrue(all(str(self.root) in c for c in cmds["SessionEnd"]), cmds)
+
+    def test_refused_override_forms_install_nowhere_and_do_not_abort_the_launch(self):
+        """`~user/…` and a relative path are refused by the shared resolver: the installer exits 1
+        (the launcher's warning line fires), nothing is created for the mangled form, and the
+        engine tree's file is untouched. `~/…` resolves under HOME."""
+        engine_before = self.settings.read_text()
+        for bad in ("~someoneelse/core", "relative/dir"):
+            result = self.run_launcher({"SUTANDO_CLAUDE_WORKING_DIR": bad})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("absolute path or start with ~/", result.stderr, bad)
+            self.assertIn("claude hooks install failed (rc=1)", result.stderr, bad)
+            self.assertEqual(self.settings.read_text(), engine_before, bad)
+        self.assertFalse((self.home / "someoneelse").exists())
+        self.assertFalse(Path(str(self.home) + "someoneelse").exists())
+        result = self.run_launcher({"SUTANDO_CLAUDE_WORKING_DIR": "~/core home"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        conf = json.loads((self.home / "core home" / ".claude" / "settings.json").read_text())
+        self.assertIn("SessionEnd", conf["hooks"])
 
 
 class RuntimeScopingTest(unittest.TestCase):

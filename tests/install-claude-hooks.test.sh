@@ -427,6 +427,7 @@ CREPO="$CROOT/engine repo"; CCWD="$CROOT/core cwd"
 mkdir -p "$CREPO/src" "$CREPO/scripts" "$CREPO/.claude"
 cp "$INSTALLER" "$CREPO/src/install-claude-hooks.sh"
 cp "$HERE/../scripts/python-binary.sh" "$CREPO/scripts/python-binary.sh"
+cp "$HERE/../scripts/core-working-dir.sh" "$CREPO/scripts/core-working-dir.sh"
 printf '#!/bin/bash\necho "HANDOFF-RAN"\n' > "$CREPO/src/session-handoff.sh"
 printf '#!/bin/bash\necho "PENDING-RAN"\n' > "$CREPO/src/check-pending-tasks.sh"
 chmod +x "$CREPO/src/"*.sh
@@ -481,8 +482,9 @@ rm -rf "$PROOT"
 
 # --- 9. the override contract is ONE policy on both sides (installer + probe): absolute or ~/ only ----
 TROOT="$(mktemp -d "${TMPDIR:-/tmp}/sutando hooks tilde.XXXXXX")"
-TREPO="$TROOT/repo"; mkdir -p "$TREPO/src" "$TREPO/.claude"; export HOME="$TROOT/home"; mkdir -p "$HOME"
+TREPO="$TROOT/repo"; mkdir -p "$TREPO/src" "$TREPO/scripts" "$TREPO/.claude"; export HOME="$TROOT/home"; mkdir -p "$HOME"
 cp "$INSTALLER" "$TREPO/src/install-claude-hooks.sh"
+cp "$HERE/../scripts/core-working-dir.sh" "$TREPO/scripts/core-working-dir.sh"
 printf '#!/bin/bash\nexit 0\n' > "$TREPO/src/session-handoff.sh"; printf '#!/bin/bash\nexit 0\n' > "$TREPO/src/check-pending-tasks.sh"
 T_OUT="$(SUTANDO_CLAUDE_WORKING_DIR="~/core home" bash "$TREPO/src/install-claude-hooks.sh" 2>&1)"; T_RC=$?
 ok "tilde: ~/… resolves under HOME" "$([ $T_RC = 0 ] && [ -f "$HOME/core home/.claude/settings.json" ] && echo 0 || echo 1)"
