@@ -878,6 +878,9 @@ def migrate(doc: dict, triage_people: dict, peer_ids: dict, owner_id: str,
         _src = canon.get(str(roster_login(entry)[0] or key).casefold(), (None, {}))[1]
         rows.append({
             "key": key,
+            # The canonical login, not the key: two keys for ONE person are an
+            # alias and must not read as two people sharing an id.
+            "login": str(roster_login(entry)[0] or key).casefold(),
             "before_discord_id": entry.get("discord_id"),
             "before_triage_human": (_src or {}).get("discord"),
             "before_triage_bots": (_src or {}).get("bots") or [],
@@ -890,6 +893,34 @@ def migrate(doc: dict, triage_people: dict, peer_ids: dict, owner_id: str,
             "basis": basis,
         })
     return out, rows
+
+
+def cross_role_collisions(rows):
+    """Ids that are a HUMAN in one row and a STAND in another, across the whole
+    document. `entry_is_coherent` validates one row at a time, so a provider id
+    could be authoritative as both referents in the same v2 map: roster
+    `alice.stand = H` alongside triage `people.bob.discord = H` both passed.
+
+    Two rows for the SAME canonical login are an alias, not a clash."""
+    seen = {}
+    for r in rows:
+        login = r.get("login") or r["key"]
+        for role, ids in (("human", [r.get("after_human")]),
+                          ("stand", [r.get("after_stand"),
+                                     *r.get("after_other_stands", [])])):
+            for i in ids:
+                if i:
+                    seen.setdefault(str(i), {}).setdefault(role, set()).add(login)
+    out = []
+    for ident, roles in sorted(seen.items()):
+        if len(roles) < 2:
+            continue
+        logins = set().union(*roles.values())
+        if len(logins) == 1:
+            continue          # one person, both referents: entry-local owns it
+        out.append({"id": ident, "human": sorted(roles.get("human", ())),
+                    "stand": sorted(roles.get("stand", ()))})
+    return out
 
 
 def _fmt(v):
@@ -958,6 +989,16 @@ def main() -> int:
     except ValueError as exc:
         print(f"refusing to migrate: {exc}", file=sys.stderr)
         return 2
+    # Before publishing: a cross-role reuse means the OUTPUT is wrong, which is
+    # refuse-and-write-nothing (2), not written-but-incomplete (5).
+    xrole = cross_role_collisions(rows)
+    if xrole:
+        for c in xrole:
+            print(f"refusing to migrate: id {c['id']} is a human for "
+                  f"{','.join(c['human'])} and a stand for {','.join(c['stand'])}",
+                  file=sys.stderr)
+        return 2
+
     dest = a.out or a.roster.with_suffix(".v2.json")
     # EVERY supplied input, not just the roster: --triage-config X --out X
     # returned 0, replaced `people` with the v2 map, and printed "input
