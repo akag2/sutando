@@ -53,7 +53,10 @@ Set by the entrypoint: `SUTANDO_WORKER_LOCATION=cloud` (always),
 `GATEWAY_INSTANCE` (default `cloud`; names the status file),
 `SUTANDO_SUPERVISED=1`.
 
-Optional: `SUTANDO_WORKER_RUNTIME` (`stub` default), `REMOTE_TASK_POLL_WAIT`,
+Required: `SUTANDO_WORKER_RUNTIME` — the entrypoint exits 2 when it is unset,
+and refuses `stub` unless `SUTANDO_ALLOW_STUB_SEAT=1` is also set.
+
+Optional: `REMOTE_TASK_POLL_WAIT`,
 `AGENT_MXID`, `CLAUDE_CONFIG_DIR` (claude runtime only), every other
 `REMOTE_*` knob the client documents in its docstring. Full list with
 comments: `.env.example`.
@@ -88,7 +91,7 @@ service blocks in `docker-compose.yml`.
 
 | `SUTANDO_WORKER_RUNTIME` | what runs | auth |
 |---|---|---|
-| `stub` (default) | `seat-stub.py` — answers `answered by <worker id>` | none; it is the test double |
+| `stub` (opt-in only: `SUTANDO_ALLOW_STUB_SEAT=1`) | `seat-stub.py` — answers `answered by <worker id>` | none; it is the test double, and it would post that string as a real result |
 | `claude` | the Claude Code CLI seat, `claude --dangerously-skip-permissions --add-dir /workspace -- /proactive-loop`, the way the pool's `pool-core-wrapper.sh` launches a follower (no tmux, the container is the session) | Claude subscription, one **OAuth login per container**, stored under `CLAUDE_CONFIG_DIR` on the volume |
 | `ag2-assistant` | `seat-ag2-assistant.py` — the **backup seat**: one ACP session per task against an [AG2 Assistant](https://github.com/ag2ai/ag2-assistant) sidecar (`ghcr.io/ag2ai/ag2-assistant`, `acp-serve` on 8802) | the sidecar's model key (`GEMINI_API_KEY`) + the shared `AG2ASSISTANT_ACP_TOKEN`; no login |
 | `adapter` | `bash /workspace/runtime.sh` if executable, else exit 4 | whatever the adapter needs — an Agent SDK or codex app-server seat takes an **API key** in env |
@@ -161,8 +164,11 @@ ag2-assistant itself imports; installed in our image as
 `— <worker id> (ag2-assistant)`. A permission request from the agent is
 answered `cancelled` (approvals are owner-side in ag2-assistant). Every turn
 is bounded by `SUTANDO_ACP_TURN_TIMEOUT_S` (300 s): the dial retries with
-backoff while the sidecar boots, and a timeout or transport failure still
-writes a short, signed failure result so the task is never swallowed.
+backoff while the sidecar boots, and a timeout or transport failure writes
+**nothing**: a delivered result closes the server lease, so failure prose would
+become the user's terminal answer and no other seat could be re-fronted. The
+task stays pending, this seat retries it under capped exponential backoff, and
+an unrecovered seat lets the lease expire into the documented failover.
 
 ```bash
 # alice.env: SUTANDO_WORKER_RUNTIME=ag2-assistant, AG2ASSISTANT_ACP_TOKEN=<random>, GEMINI_API_KEY=<ours>
@@ -229,6 +235,6 @@ required env var, writes the workspace config and marks the seat `cloud`,
 `provision.sh` refuses a missing env file and (under a fake `docker`) issues
 the right `run`/`start`/`build`/sidecar/network calls from a staged context of
 only the allowlisted paths, the ag2-assistant seat completes an ACP turn over
-an in-process transport (chunks → signed result; silent agent → signed
-timeout result; dead sidecar → signed failure), the compose file parses, and
+an in-process transport (chunks → signed result; silent agent → no body;
+dead sidecar → no body, task left pending), the compose file parses, and
 `healthcheck.sh` distinguishes fresh / stale / absent status files.
