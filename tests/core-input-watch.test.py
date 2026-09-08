@@ -394,6 +394,25 @@ class TestRefusedTurn(unittest.TestCase):
             st, _d, prompt, kind = compose_state(pane, base, True)
             self.assertEqual((st, kind), ("idle-ready", None), (base, prompt))
 
+    def test_not_logged_in_inside_ordinary_output_is_not_a_refusal(self):
+        # Three common words: a slash-command result that merely contains them (no ⏺, ≤1s)
+        # must not escalate. Only the CLI's own line-start form or /login adjacency counts.
+        for line in ("gh: not logged in to github.com",
+                     "src/auth.py:42: raise RuntimeError('not logged in')",
+                     "shown to a visitor who is not logged in",
+                     "ok test_errors_when_not_logged_in"):
+            pane = f"❯ /somecommand\n  ⎿  {line}\n✻ Worked for 1s\n" + _IDLE_FOOTER
+            st, _d, prompt, kind = compose_state(pane, "idle", True)
+            self.assertEqual((st, kind), ("idle-ready", None), (line, prompt))
+
+    def test_the_clis_own_not_logged_in_line_is_a_refusal(self):
+        for line in ("Not logged in · Please run /login", "You are not logged in. Run /login",
+                     "not logged in", "Run /login first: not logged in"):
+            pane = f"❯ /startup\n  ⎿  {line}\n✻ Worked for 0s\n" + _IDLE_FOOTER
+            st, _d, prompt, kind = compose_state(pane, "idle", True)
+            self.assertEqual((st, kind), ("blocked-human", "turn-rejected"), line)
+            self.assertEqual(prompt, line)
+
     def test_a_tool_result_alone_in_a_short_turn_is_not_a_refusal(self):
         # Same ownership, no trailing agent line: the `⏺` header already says the turn ran.
         pane = ("❯ check credits\n⏺ Bash(cat diagnostic.txt)\n"

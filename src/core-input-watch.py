@@ -143,7 +143,11 @@ _IDLE = re.compile(r"⏵⏵\s*bypass permissions on|for agents\b", re.I)
 # pane returns to the idle footer, so no gate is on screen. Explicit list, extended by hand.
 _REFUSAL = re.compile(
     r"out of usage credits|/usage-credits|hit your (?:session|usage|weekly) limit"
-    r"|Please run /login|OAuth access token has expired|not logged in", re.I)
+    r"|Please run /login|OAuth access token has expired"
+    # "not logged in" is three common words: only the CLI's own line-start form, or
+    # the phrase beside a /login token, is a refusal; a tool result quoting it is not.
+    r"|^⎿?\s*(?:you(?:'re| are) )?not logged in\b|not logged in\b.{0,60}/login\b|/login\b.{0,60}not logged in\b",
+    re.I)
 # The completed-turn line: "✻ Worked for 0s" / "✻ Cooked for 1s · done 12:32 PM". The spinner
 # reuses the glyph ("✻ Perambulating… (1m 46s · …)") and must not match.
 _TURN_DONE = re.compile(
