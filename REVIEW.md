@@ -496,10 +496,14 @@ and loads whichever repo it reviews.
     "Pins the boundary so widening `>` to `>=` cannot pass silently").
 
     That distinction is the practical warning, and it is why a harness matters more than a rule:
-    a loop that restores the pristine file between mutants never collides, because the pristine
-    size differs from every mutant's. A loop that goes mutant-to-mutant does collide, and only
-    for the same-size pairs. So the danger is not "mutation testing is unreliable" — it is
-    "consecutive same-size variants share a cache entry", which a per-mutant restore removes.
+    a loop that restores the pristine file between mutants **and runs it** never collides, because
+    that run is what makes CPython observe the pristine size and rewrite the entry. A restore that
+    is written but never imported does not: CPython never sees the intermediate file, so m2's entry
+    still matches m3's size and mtime and serves m2's bytes. Measured both ways at this head —
+    write m2, run, write pristine WITHOUT running, write m3, run reports SURVIVED; the same m3
+    against a cleared cache reports CAUGHT, as does the same sequence with the pristine restore
+    executed. So the danger is "consecutive same-size variants share a cache entry", and the
+    remedies are clearing the cache or a restore that executes. A restore alone is not one.
 
     **m2's SURVIVED is real and must not be swept up in this.** Against a cleared cache it still
     survives: the suite genuinely does not catch `staleness > -> >=`. A reader who blames the
