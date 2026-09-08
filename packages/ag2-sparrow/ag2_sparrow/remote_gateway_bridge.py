@@ -1178,6 +1178,68 @@ def _monorepo_src(marker: str) -> str:
         cur = parent
 
 
+# `project()` assigns retry cadence to its caller and the worker drives this
+# every ~1s. Skip-until-deadline, not sleep: other drains share this thread.
+_HITL_BACKOFF = {"until": 0.0, "delay": 0.0}
+_HITL_BACKOFF_MAX_S = 60.0
+
+
+def _hitl_backoff_bump(log=print) -> None:
+    d = min((_HITL_BACKOFF["delay"] or 0.5) * 2, _HITL_BACKOFF_MAX_S)
+    _HITL_BACKOFF["delay"] = d
+    _HITL_BACKOFF["until"] = time.monotonic() + d
+    log(f"hitl: projection refused — backing off {d:g}s")
+
+
+def _hitl_backoff_reset() -> None:
+    _HITL_BACKOFF["delay"] = 0.0
+    _HITL_BACKOFF["until"] = 0.0
+
+
+def _project_hitl(log=print) -> int:
+    """Push every un-projected HITL requirement out as a card, or 0 when
+    `src/hitl` is absent (standalone sparrow) — same optional tier as the
+    reply handler, and the outbound half of the same card.
+
+    The projector owns idempotency (a projection ledger per requirement), so
+    calling this every pulse re-sends nothing; it is the driver that was
+    missing, not the machinery.
+    """
+    if not PROACTIVE_ROOM:
+        return 0
+    if time.monotonic() < _HITL_BACKOFF["until"]:
+        return 0
+    try:
+        src = _monorepo_src(os.path.join("hitl", "projector.py"))
+        if not src:
+            return 0
+        if src not in sys.path:
+            sys.path.insert(0, src)
+        from hitl.manager import HitlManager, HitlStore, default_store
+        from hitl.projector import pending_ids, project
+    except Exception as e:  # noqa: BLE001 — an optional tier never breaks the pulse
+        log(f"hitl: projector unavailable ({e}); cards will not be delivered")
+        return 0
+    workspace = _STATE.parent
+    manager = HitlManager(HitlStore(default_store(workspace)))
+    if not pending_ids(manager):
+        _hitl_backoff_reset()  # idle is not failure; a new card must not wait out a backoff
+        return 0
+    try:
+        done = project(manager, lambda payload: _req("POST", "/v1/room", payload, timeout=20),
+                       PROACTIVE_ROOM)
+    except Exception:
+        _hitl_backoff_bump(log)  # a raising sender is a refusal too
+        raise
+    if not done:
+        _hitl_backoff_bump(log)
+        return 0
+    _hitl_backoff_reset()
+    for req_id, event_id in done:
+        log(f"hitl: projected {req_id} -> {event_id or 'no event id'}")
+    return len(done)
+
+
 def _hitl_reply_handler(owner_mxid: str, log=print):
     """Owner card-click handler for HITL cards, or None when `src/hitl` is not
     around (standalone sparrow) — the chain then simply lacks it, like the vault tier."""
@@ -1317,6 +1379,10 @@ def _outbound_worker(inflight: "set[str]") -> None:
             _post_proactive()
         except Exception as e:  # noqa: BLE001
             _log(f"outbound worker: proactive drain error (isolated): {e}")
+        try:
+            _project_hitl(log=_log)
+        except Exception as e:  # noqa: BLE001
+            _log(f"outbound worker: hitl projection error (isolated): {e}")
         try:
             _retry_pending_acks(inflight)
         except Exception as e:  # noqa: BLE001
@@ -1524,7 +1590,11 @@ def _auth_probe() -> bool:
 _heartbeat_disabled = False
 _last_heartbeat_at = 0.0
 
-_TASK_FIELDS = ("id", "timestamp", "session_scope", "task", "source", "channel_id",
+_TASK_FIELDS = ("id", "timestamp", "session_scope",
+                # Which worker the sender asked for. Ahead of "task" so it can never
+                # be read from under the untrusted body; copied verbatim, never derived.
+                "requested_worker",
+                "task", "source", "channel_id",
                 # Context enrichment (AG2 broker writer side): human room/sender
                 # names + reply reference. Serialized only when the gateway sends
                 "room_name", "sender_name", "reply_to_event", "reply_to_me", "reply_to_sender",
@@ -2546,15 +2616,12 @@ def _write_owner_activity(task: dict, sender_tier: str | None = None) -> None:
         _log(f"owner-activity write failed: {e}")
 
 
-def _repair_pending_task(tid: str, task: dict) -> bool:
-    """A task the gateway redelivered while it is still queued here: fsync the
-    queued file and its directory and (re)commit the media sidecar, so a task
-    written by a pre-durability client can still earn a `durable` ack."""
-    tfile = find_task_file(TASKS_DIR, tid)
-    if tfile is None:
-        return False
+def _fsync_in_place(tid: str, *targets: Path) -> bool:
+    """fsync files (and directories) already on disk. A pre-durability writer
+    left these bytes uncommitted, so nothing may be claimed durable until this
+    lands; False when it did not."""
     try:
-        for target in (tfile, TASKS_DIR):
+        for target in targets:
             fd = os.open(target, os.O_RDONLY)
             try:
                 os.fsync(fd)
@@ -2562,6 +2629,18 @@ def _repair_pending_task(tid: str, task: dict) -> bool:
                 os.close(fd)
     except OSError as exc:
         _log(f"durability repair failed for {tid} ({exc})")
+        return False
+    return True
+
+
+def _repair_pending_task(tid: str, task: dict) -> bool:
+    """A task the gateway redelivered while it is still queued here: fsync the
+    queued file and its directory and (re)commit the media sidecar, so a task
+    written by a pre-durability client can still earn a `durable` ack."""
+    tfile = find_task_file(TASKS_DIR, tid)
+    if tfile is None:
+        return False
+    if not _fsync_in_place(tid, tfile, TASKS_DIR):
         return False
     return _record_task_media(tid, task)
 
@@ -2598,8 +2677,11 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
     )
     if task_archived or _delivered_copy_exists(tid):
         rfile = RESULTS_DIR / f"{tid}.txt"
-        durable = True
-        if not rfile.exists():
+        if rfile.exists():
+            # A reply the local core wrote with a plain write_text: this process
+            # has committed nothing yet, so fsync before claiming durable.
+            durable = _fsync_in_place(tid, rfile, RESULTS_DIR)
+        else:
             durable = _durable_write(rfile, GATEWAY_REDELIVERY_RESULT)
             # Provenance the result BODY cannot carry: a Team runtime controls
             # the body and can emit these exact bytes, but not this process's set.
