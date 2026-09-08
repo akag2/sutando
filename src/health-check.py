@@ -18,6 +18,10 @@ Checks:
   - Critical files (CLAUDE.md, build_log.md, ACTIVITY.md)
   - Memory system (MEMORY.md index, key memory files)
   - Notes directory
+  - Extra per-host probes declared in
+    <workspace>/hosts/<host-label>/health-checks-extra.json (opt-in; see
+    check_user_defined). Each entry is {"name", "command"[, "timeout"]};
+    exit 0 reads ok, anything else warn, with the command's output as the detail.
 """
 
 import ast
@@ -28,6 +32,7 @@ import json
 import os
 import re
 import shlex
+import signal
 import stat
 import statistics
 import shutil
@@ -11521,6 +11526,140 @@ def menubar_app_state(dev_bin, app_bin, plist, is_macos: bool) -> str:
     return "expected-missing" if plist.exists() else "not-applicable"
 
 
+#: Per-host declaration of EXTRA, user-defined probes — same `hosts/<host>/` JSON
+#: convention as skills/proactive-loop/scripts/tool-suites-check.py's extras.
+USER_CHECKS_FILE = "health-checks-extra.json"
+#: Name prefix so an extra row is never mistaken for a built-in probe.
+USER_CHECK_PREFIX = "extra:"
+USER_CHECK_TIMEOUT_S = 30.0
+USER_CHECK_DETAIL_CAP = 300
+#: Only DETAIL_CAP characters survive normalization; reading the whole sink lets an
+#: opt-in command size this process's memory. 200x headroom over what is rendered.
+USER_CHECK_OUTPUT_READ_CAP = 65536
+
+
+def user_checks_path(workspace_dir: Optional[Path] = None,
+                     host: "str | None" = None) -> Path:
+    """Where this host declares its extra checks.
+
+    `hosts/<host>/` and not `state/`: the vault already carries the former, and
+    a `state/` path is re-ignored by the carve-out emitted after the includes.
+    """
+    ws = WORKSPACE_DIR if workspace_dir is None else Path(workspace_dir)
+    return ws / "hosts" / (host or _host_label()) / USER_CHECKS_FILE
+
+
+def load_user_checks(path: Path) -> list:
+    """Declared checks, or `[]` for absent / unreadable / malformed.
+
+    A hand-edited file must never take the health check down with it, so every
+    failure here degrades to "this host declares no extras".
+    """
+    try:
+        decl = json.loads(Path(path).read_text())
+    except Exception:
+        return []
+    entries = decl.get("checks") if isinstance(decl, dict) else None
+    out = []
+    for entry in _as_list(entries):
+        if not isinstance(entry, dict):
+            continue
+        name, command = entry.get("name"), entry.get("command")
+        if not (isinstance(name, str) and name.strip()):
+            continue
+        if not (isinstance(command, str) and command.strip()):
+            continue
+        out.append({
+            "name": name.strip(),
+            "command": command,
+            "timeout": _positive_seconds(entry.get("timeout")) or USER_CHECK_TIMEOUT_S,
+        })
+    return out
+
+
+def _reap_user_command_group(pgid: int) -> None:
+    """A shell can exit 0 while its background children keep running; the group
+    `start_new_session` created must be cleared on that path too, not only on timeout."""
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def _kill_user_command_tree(proc) -> None:
+    """SIGKILL the group `start_new_session` gave this command, not just the shell
+    — killing the shell alone leaves its children running past the timeout."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except OSError:
+        proc.kill()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def run_user_command(command: str, timeout_s: float, cwd: Path) -> "tuple[int, str]":
+    """Run one declared command bounded in time; return (exit code, output).
+
+    Output lands in a FILE, never a pipe: a command that leaves a background
+    grandchild holding the pipe open would block the drain past the timeout.
+    """
+    with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as sink:
+        try:
+            proc = subprocess.Popen(command, shell=True, cwd=str(cwd), stdin=subprocess.DEVNULL,
+                                    stdout=sink, stderr=subprocess.STDOUT, start_new_session=True)
+        except OSError as exc:
+            return 127, f"{type(exc).__name__}: {exc}"
+        # start_new_session makes the child its own group leader, so the group id is
+        # its pid — captured before the wait reaps it and the attribute is stale.
+        pgid = proc.pid
+        try:
+            code = proc.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            _kill_user_command_tree(proc)
+            code = 124
+        else:
+            _reap_user_command_group(pgid)
+        sink.seek(0)
+        return code, sink.read(USER_CHECK_OUTPUT_READ_CAP)
+
+
+def run_user_check(decl: dict, cwd: Optional[Path] = None) -> dict:
+    """One extra probe: exit 0 is `ok`, anything else `warn`, output as the detail.
+
+    `warn` on purpose — an extra check must not change the exit code or wake the
+    notifier surfaces, so a host's own probe can never mask or manufacture an alert.
+    """
+    name = f"{USER_CHECK_PREFIX}{decl['name']}"
+    # Suppression is a property of the CHECK, not of its status: --emit-task,
+    # --notify-on-fail and --notify-slack each read a bare warn as a failure.
+    quiet = {"name": name, "alerting": False}
+    try:
+        code, output = run_user_command(decl["command"], decl["timeout"],
+                                        cwd if cwd is not None else REPO_DIR)
+    except Exception as exc:
+        return {**quiet, "status": "warn",
+                "detail": f"could not run: {type(exc).__name__}: {exc}"[:USER_CHECK_DETAIL_CAP]}
+    detail = " ".join(output.split())[:USER_CHECK_DETAIL_CAP] or "(no output)"
+    if code == 124:
+        return {**quiet, "status": "warn",
+                "detail": f"TIMEOUT after {decl['timeout']:.0f}s (killed): {detail}"}
+    if code == 0:
+        return {**quiet, "status": "ok", "detail": detail}
+    return {**quiet, "status": "warn", "detail": f"exit {code}: {detail}"}
+
+
+def check_user_defined(workspace_dir: Optional[Path] = None,
+                       host: "str | None" = None) -> list:
+    """Every extra probe this host declares — `[]` when it declares none."""
+    try:
+        decls = load_user_checks(user_checks_path(workspace_dir, host))
+    except Exception:
+        return []
+    return [run_user_check(d) for d in decls]
+
+
 def run_all_checks() -> list[dict]:
     checks = []
 
@@ -12073,6 +12212,10 @@ def run_all_checks() -> list[dict]:
     checks.append(check_runtime_identity())
     checks.append(check_live_tree_drift())
     checks.append(check_disk_space())
+
+    # Last, and only when this host declares any: a user probe must never
+    # delay or displace a built-in one.
+    checks.extend(check_user_defined())
 
     return checks
 
