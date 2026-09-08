@@ -329,6 +329,11 @@ def stop_gate(workspace: Path | str | None = None) -> str | None:
     if since is None:
         mark_stop(ws)
         return None
+    # An explicit no-send is a decision ABOUT this turn, so its age cannot make it
+    # stale; only a message is judged on whether the turn ended on it.
+    if any(e.get("kind") == "no-send" for e in read_entries(ws) if float(e["ts"]) > since):
+        mark_stop(ws)
+        return None
     last = delivery_after(since, ws)
     if last is not None and (time.time() - float(last["ts"])) <= ENDED_ON_A_MESSAGE_S:
         mark_stop(ws)

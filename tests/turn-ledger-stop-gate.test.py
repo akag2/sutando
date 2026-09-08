@@ -406,6 +406,7 @@ def main() -> int:
         test_one_reminder_per_turn_not_a_standing_refusal,
         test_ended_on_a_message_versus_sent_then_went_quiet,
         test_a_delivered_result_archived_flat_is_still_a_message,
+        test_an_aged_no_send_still_ends_the_turn,
         test_a_concurrent_trim_does_not_swallow_an_append,
         test_the_reader_uses_the_writers_archive_calendar,
         test_turn_start_is_reachable_from_the_command_line,
@@ -702,6 +703,31 @@ def test_a_delivered_result_archived_flat_is_still_a_message() -> None:
         found = turn_ledger._result_after(since, ws)
         check("a flat-archived delivery is found",
               found is not None and "task-abc123" in found["target"], repr(found))
+
+
+def test_an_aged_no_send_still_ends_the_turn() -> None:
+    """A no-send is a decision about the turn, not a message that can go stale.
+
+    Recording one and then working past the elapsed-message window used to be
+    reminded anyway, which nags the turn that made the decision it asked for.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = _workspace(tmp)
+        # Both timestamps placed explicitly: the boundary must PREDATE the no-send,
+        # or it falls outside the turn and is correctly ignored for another reason.
+        now = time.time()
+        turn_ledger.write_status(turn_ledger.STOP_NAME, {"ts": now - 600}, ws)
+        turn_ledger.begin_turn(ws)
+        turn_ledger.record_no_send("checked, nothing to report", workspace=ws)
+        led = pathlib.Path(ws) / "state" / turn_ledger.LEDGER_NAME
+        rows = [json.loads(l) for l in led.read_text().splitlines() if l.strip()]
+        rows[-1]["ts"] = now - 300                    # inside the turn, past the window
+        led.write_text("".join(json.dumps(r) + "\n" for r in rows))
+        check("setup: the no-send is inside the turn but older than the window",
+              turn_ledger.last_stop_ts(ws) < rows[-1]["ts"] < now - turn_ledger.ENDED_ON_A_MESSAGE_S,
+              f"boundary={turn_ledger.last_stop_ts(ws)} no-send={rows[-1]['ts']}")
+        check("an aged no-send still ends the turn",
+              turn_ledger.stop_gate(ws) is None, "it was reminded despite an explicit no-send")
 
 
 def test_a_concurrent_trim_does_not_swallow_an_append() -> None:
