@@ -1221,5 +1221,19 @@ class TheNoStandInRuleIsQuantifiedOverTheSet(unittest.TestCase):
     def test_an_unbound_worker_is_what_is_refused_not_a_bound_peer(self):
         self.assertIn("no UNBOUND worker stands in", self._flat())
 
+    def test_the_four_contested_claims_are_named_as_OPEN_not_settled(self):
+        """The re-cut's whole point: prose near these topics must not read as proof."""
+        f = self._flat()
+        self.assertIn("open obligations", f)
+        self.assertIn("NOT established by this document", f)
+
+    def test_each_open_obligation_is_individually_named(self):
+        f = self._flat()
+        for claim in ("READ, not a claim fence",
+                      "two live task claims",
+                      "three clock sources",
+                      "two incompatible normative orders"):
+            self.assertIn(claim, f, f"open obligation not named: {claim}")
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

@@ -25,6 +25,30 @@ admission and group release are named as out of scope for v1 in the routing sect
 remain so; a v2 that wants Decision 3's guarantee back must build them, because nothing in
 v1 can express it. Every other decision in that record stands.
 
+## Four protocol claims are NOT established by this document — they are open obligations
+
+This PR carries the design and a model that can express the interleavings the real system has.
+It does NOT carry proofs for the four items below. They were raised as blocking review findings
+and remain open; a reader must not treat the surrounding prose as having settled them, and the
+implementing PR owes each one a schedule that fails before it passes.
+
+- **The request-or-directory gate is a READ, not a claim fence.** A worker can read "no request",
+  pause, let a kick publish, and still commit its ordinary batch. The split model can now express
+  that pause (`worker_read` / `worker_commit`); nothing here shows the protocol survives it.
+- **One allowance can yield two live task claims.** The A/B/C rollback schedule leaves a claim with
+  no admission record. `as_claimant()` can now hold a paused claimant beside its successor; whether
+  the allowance rules prevent the double claim is unproven.
+- **The probation window names three clock sources** — `probation.since`, the journal mtime, and the
+  `claimed/<task_id>` mtime. The model's `clock_start()` returns `token_at`, and changing it leaves
+  the suite green, so the suite does not choose a contract. Which clock is normative is undecided.
+- **Last-worker removal has two incompatible normative orders**: registry commit -> disarm -> stop,
+  against stop/fence -> bindings -> installer record last. Both appear; neither is marked primary.
+
+**Why they are named rather than fixed here.** Two of them were unwritable until this PR: the model
+fused the verdict read with the batch commit, and had one mutable claimant. A protocol fix landed on
+that model would have shipped a proof that could not fail, which is worse than no proof. The split
+comes first; the schedules come next.
+
 The words below are the ones the code uses from now on: **core** (the one
 session every install has), **worker** (an extra session the core created),
 **pin table** (the owner's room-to-worker bindings, a file), **pool** (core +
