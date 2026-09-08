@@ -1227,6 +1227,12 @@ class TheNoStandInRuleIsQuantifiedOverTheSet(unittest.TestCase):
         self.assertIn("open obligations", f)
         self.assertIn("NOT established by this document", f)
 
+    def test_every_contested_SITE_carries_a_local_disputed_marker(self):
+        """worker-2: the obligations section was the ONLY place in 1971 lines
+        carrying the caveat, so a reader landing mid-document never sees it."""
+        self.assertGreaterEqual(self._flat().count("DISPUTED — see"), 4,
+            "each contested site needs its own inline pointer, not just the index")
+
     def test_each_open_obligation_is_individually_named(self):
         f = self._flat()
         for claim in ("READ, not a claim fence",

@@ -623,6 +623,8 @@ it never takes it. No fallthrough to the core exists for a bound room.
 
 ### The reconciliation ticker
 
+> **DISPUTED — see [Four protocol claims are NOT established by this document](#four-protocol-claims-are-not-established-by-this-document--they-are-open-obligations).** The last-worker removal order below is one of the four: two incompatible normative orders appear and neither is marked primary.
+
 **It is a THIRD periodic mechanism, and it is gated on pool membership.** Two
 passages had to change for that to be true rather than merely intended: "Workers are
 task-only" named the heartbeat and the core's sweep as the only periodic things in a
@@ -1319,6 +1321,8 @@ not justify a timer of their own, so no `proactive-loop-pool` skill ships.
 
 ## Coordination contract (claim-only; the primitives are #3604's)
 
+> **DISPUTED — see [Four protocol claims are NOT established by this document](#four-protocol-claims-are-not-established-by-this-document--they-are-open-obligations).** The request-or-directory gate described here is a READ, not a claim fence — a worker can read "no request", pause, and still commit.
+
 1. **Claim:** exclusivity is the watcher's hard-link claim, keyed on the
    CANONICAL task id — `state/task-event-handler-claims/<task-id>`, resolved by
    `task_archive.task_id_for(path, accept=...)` (first link wins, a dead owner's
@@ -1480,7 +1484,9 @@ itself to a room whose worker might still come back.
    the CONJUNCTION of two sequential reads, and a conjunction that holds at no single instant is
    exactly what an interleaved worker produces.
 
-   **So the order is mandated: `stat(token)` FIRST, then `stat(spent)`.** The schedule that separates
+   **So the order is mandated: `stat(token)` FIRST, then `stat(spent)`.**
+> **DISPUTED — see [Four protocol claims are NOT established by this document](#four-protocol-claims-are-not-established-by-this-document--they-are-open-obligations).** One allowance can still yield two live task claims under the A/B/C rollback schedule; this ordering does not close that.
+ The schedule that separates
    the orders is a worker consuming between the two reads:
 
    ```
@@ -1604,7 +1610,9 @@ itself to a room whose worker might still come back.
    **Every probation state has a clock, and every clock ends in `eligible` or `wedged`.** The sweep
    ends probation by exactly one of: the admitted task's result exists (verdict → `eligible`,
    computed afresh; the allowance retired by the single rename below); or the window `stand_in_after_s` has
-   elapsed — measured from `probation.since` while the token is unconsumed (a worker that never
+   elapsed — measured from `probation.since` while the token is unconsumed
+> **DISPUTED — see [Four protocol claims are NOT established by this document](#four-protocol-claims-are-not-established-by-this-document--they-are-open-obligations).** This window names three clock sources and the model returns a fourth; which is normative is undecided.
+ (a worker that never
    reaches its gate), from the journal's mtime **while the journal stands, claimed or not**, and from
    the `claimed/<task_id>` record's mtime once the promotion has landed — in which case the verdict → `wedged`,
    the allowance is retired by the same single rename, and the request is NOT re-armed; a second kick
