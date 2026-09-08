@@ -47,12 +47,36 @@ MAX_NOTICES_PER_SWEEP = 8
 # A recovery target that keeps failing to deliver is purged after this many
 # attempts, so a room the bot lost access to can't be retried forever (#6).
 MAX_RECOVERY_ATTEMPTS = 5
+# Wall-clock ceiling for one sweep's sends, so notice IO on a bridge's main
+# path (gateway/telegram poll loop) can't hold it for the whole per-request
+# timeout budget on slow sends (review r4-followup #5). Rooms past the deadline
+# carry to the next sweep. Below any single per-request timeout so one slow send
+# doesn't blow it wildly, yet enough for a few quick notices.
+NOTICE_BUDGET_S = 12.0
 
 # Process-local ledger overlay, keyed by (state_dir, ledger_name). Holds
 # successful-send accounting that could NOT be persisted to disk (#3), so a
 # transient ledger-write failure doesn't make this process re-send every sweep.
 # Cleared for a key once a disk write for it succeeds (disk is then canonical).
 _MEM_LEDGERS: dict = {}
+
+# Round-robin cursors, keyed by (state_dir, ledger_name, kind). When more rooms
+# are eligible than MAX_NOTICES_PER_SWEEP, the window advances each pass so a
+# handful of always-failing rooms (which never earn a cooldown) can't occupy
+# every capped batch and starve a reachable room behind them (review r4-followup
+# #3). Process-local: fairness need not survive restart.
+_RR_CURSORS: dict = {}
+
+
+def _rotate_window(seq, key, size):
+    """The next `size` items of `seq`, rotating the start each call so repeated
+    over-capacity passes eventually cover every element."""
+    if len(seq) <= size:
+        return list(seq)
+    cur = _RR_CURSORS.get(key, 0) % len(seq)
+    _RR_CURSORS[key] = (cur + size) % len(seq)
+    doubled = list(seq) + list(seq)
+    return doubled[cur:cur + size]
 
 CORE_SUPERVISOR_FILE = "core-supervisor.json"
 # Written every tick by core-input-watch (str epoch seconds); its freshness is
@@ -291,19 +315,20 @@ def _load_ledger(state_dir: Path, ledger_name: str = LEDGER_FILE) -> dict:
 
 
 def _overlay_mem(state_dir: Path, ledger_name: str, disk: dict) -> dict:
-    """Merge the process-local overlay (unpersisted successful accounting) on top
-    of the disk ledger. Single writer per surface, so the overlay is never
-    staler than disk for keys it holds — it wins outright."""
+    """When an unpersisted snapshot exists, it — not disk — is authoritative.
+
+    The overlay holds the COMPLETE ledger this process last tried to write but
+    couldn't persist. Single writer per surface, so disk is never newer. A
+    union-merge (the first cut, review 2026-09-08 r4-followup #1) was wrong: it
+    could only ADD entries, so a recovery that cleared `active` in the snapshot
+    left the stale disk `active` in place and re-sent the recovery every pass.
+    Return a copy of the snapshot so DELETIONS (recovery, purge) are honored."""
     mem = _MEM_LEDGERS.get((str(state_dir), ledger_name))
     if not mem:
         return disk
-    disk["active"].update(mem.get("active", {}))
-    for room, per_reason in mem.get("last_sent", {}).items():
-        dst = disk["last_sent"].setdefault(room, {})
-        for reason, ts in per_reason.items():
-            dst[reason] = max(dst.get(reason, ts), ts)
-    disk["fail"].update(mem.get("fail", {}))
-    return disk
+    return {"active": dict(mem.get("active", {})),
+            "last_sent": {r: dict(v) for r, v in mem.get("last_sent", {}).items()},
+            "fail": dict(mem.get("fail", {}))}
 
 
 def _save_ledger(state_dir: Path, ledger: dict, now: float,
@@ -369,7 +394,14 @@ class NoticePlan:
         # forged destinations to DROP without sending (review 2026-09-08 r3).
         self._purge = set(purge)
 
-    def commit(self, sent_rooms) -> None:
+    def commit(self, sent_rooms, attempted_rooms=None) -> None:
+        """Persist the outcome. ``sent_rooms`` delivered; ``attempted_rooms`` is
+        the set for which a send was actually STARTED — a room the batch never
+        reached (health-abort, exception, cancellation, time budget) is NOT in
+        it and keeps its debt untouched. Defaults to every planned item for
+        callers that always run the whole batch (review 2026-09-08 r4-followup
+        #2: inferring "failed" from planned items charged never-attempted rooms
+        a failure and purged them without a single send)."""
         sent = set(sent_rooms)
         if self.kind == "degraded":
             if not sent:
@@ -378,8 +410,9 @@ class NoticePlan:
                 self._ledger["last_sent"].setdefault(room, {})[self.reason] = self._now
                 self._ledger["active"][room] = self.reason
         else:  # recovery: discharge delivered, purge invalid, bound retries
-            attempted = {room for room, _ in self.items}
-            failed = attempted - sent  # tried this pass but did not deliver
+            attempted = ({room for room, _ in self.items}
+                         if attempted_rooms is None else set(attempted_rooms))
+            failed = attempted - sent  # ATTEMPTED but did not deliver
             fail = self._ledger.setdefault("fail", {})
             purge = set(self._purge)
             for room in failed:
@@ -432,8 +465,11 @@ def plan_notices(state_dir, rooms, now=None, ledger_name: str = LEDGER_FILE,
                  for room in sorted(set(rooms))
                  if not (0 <= now - (ledger["last_sent"].get(room, {})
                                      .get(reason, -cooldown - 1)) < cooldown)]
-        # Cap per sweep (#1) — the overflow re-plans next pass (still no cooldown).
-        return NoticePlan("degraded", reason, items[:MAX_NOTICES_PER_SWEEP],
+        # Cap per sweep (#1), rotating the window so an always-failing prefix
+        # can't starve rooms behind it (#3); overflow re-plans next pass.
+        window = _rotate_window(items, (str(state_dir), ledger_name, "degraded"),
+                                MAX_NOTICES_PER_SWEEP)
+        return NoticePlan("degraded", reason, window,
                           ledger, now, state_dir, ledger_name)
     if state not in _HEALTHY_STATES:
         return None  # unrecognized state — not proof of recovery
@@ -447,9 +483,11 @@ def plan_notices(state_dir, rooms, now=None, ledger_name: str = LEDGER_FILE,
         purge = set()
     if not active and not purge:
         return None
-    # Cap sends per sweep (#1); overflow stays in `active` for the next pass.
-    # Purges are cheap (no network) so they all apply this pass.
-    items = [(room, _recovery_body(suffix)) for room in active[:MAX_NOTICES_PER_SWEEP]]
+    # Cap sends per sweep (#1) with the same rotation (#3); overflow stays in
+    # `active` for the next pass. Purges are cheap (no network) so all apply now.
+    window = _rotate_window(active, (str(state_dir), ledger_name, "recovery"),
+                            MAX_NOTICES_PER_SWEEP)
+    items = [(room, _recovery_body(suffix)) for room in window]
     return NoticePlan("recovery", None, items, ledger, now,
                       state_dir, ledger_name, purge=purge)
 
@@ -477,21 +515,34 @@ def sweep_core_state_notices(state_dir: Path, rooms, send, log=None,
     if the supervisor has flipped back to degraded mid-batch, remaining "back
     online" lines are obsolete, so the batch stops and only completed work is
     committed — the still-degraded rooms keep their recovery debt.
+
+    A wall-clock budget (NOTICE_BUDGET_S) bounds how long this can hold the
+    caller's thread on slow sends, so notice IO on the gateway/telegram main
+    path can't stall polling for the full per-request timeout budget (review
+    r4-followup #5). Rooms not reached (budget, health-abort, or a raised send)
+    are NOT charged a failure — only rooms actually attempted are (#2).
     """
     plan = plan_notices(state_dir, rooms, now, ledger_name, suffix,
                         recovery_target_ok)
     if plan is None:
         return
     verb = "notice" if plan.kind == "degraded" else "recovery notice"
-    sent = []
+    sent, attempted = [], []
+    deadline = time.monotonic() + NOTICE_BUDGET_S
     try:
         for room, body in plan.items:
+            if time.monotonic() >= deadline:
+                break  # bounded main-path time; the rest re-plan next sweep (#5)
             if plan.kind == "recovery" and not is_core_healthy(state_dir):
                 break  # core degraded again — stop sending stale recoveries (#5)
+            attempted.append(room)
             if send(room, body):
                 sent.append(room)
                 if log:
                     extra = f" ({plan.reason})" if plan.kind == "degraded" else ""
                     log(f"core-state {verb}{extra} sent to {room}")
     finally:
-        plan.commit(sent)  # record completed sends even if a later send raised (#2)
+        # Record completed sends even if a later send raised (#2); charge
+        # failures only to rooms we actually attempted, never the ones the
+        # budget/health-abort skipped (r4-followup #2).
+        plan.commit(sent, attempted_rooms=attempted)

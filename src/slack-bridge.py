@@ -1066,9 +1066,18 @@ def _core_notice_sweep(rooms) -> None:
 def _core_notice_loop() -> None:
     """The sole notice sender: every tick, notice pending-unanswered targets if
     the core is degraded, and announce recovery to owed targets once it's
-    healthy. Keeping every send here (not on intake) is the #1 stall fix."""
+    healthy. Keeping every send here (not on intake) is the #1 stall fix.
+
+    The WHOLE iteration — pending-room collection included — is inside the
+    try, because _core_notice_pending_rooms() does filesystem reads that can
+    raise (a transient EACCES on a result path): an uncaught raise here would
+    kill this one-and-only sender thread for the rest of the process
+    (review r4-followup #4)."""
     while True:
-        _core_notice_sweep(_core_notice_pending_rooms())
+        try:
+            _core_notice_sweep(_core_notice_pending_rooms())
+        except Exception as e:  # noqa: BLE001 — never let the sender thread die
+            print(f"  [core-notice] loop iteration failed: {e}", flush=True)
         time.sleep(_CORE_NOTICE_INTERVAL_S)
 
 

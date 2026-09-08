@@ -2783,8 +2783,10 @@ async def _core_notice_sweep(rooms) -> None:
     against itself (one asyncio.Lock, #2/#4) so concurrent intakes and the
     periodic loop can't double-send or race the ledger. Completed sends are
     always committed, even if a later send raises or the batch is cancelled
-    (#2); recovery revalidates health before each send (#5) and stops if the
-    core degraded again. Never raises into the caller."""
+    (#2); recovery revalidates health before each send — including AFTER the
+    channel-resolution await (r4-followup #6), since the core can fail during
+    that await — and stops if the core degraded again. A room the batch never
+    reached (health-abort) is not charged a failure (#2). Never raises."""
     try:
         async with _core_notice_lock:
             plan = _plan_core_notices(
@@ -2793,19 +2795,22 @@ async def _core_notice_sweep(rooms) -> None:
                 recovery_target_ok=_ascii_snowflake)
             if plan is None:
                 return
-            sent = []
+            sent, attempted = [], []
             try:
                 for room, body in plan.items:
                     if plan.kind == "recovery" and not _core_is_healthy(STATE_DIR):
                         break  # core degraded again mid-batch — stale recovery (#5)
                     ch = await _resolve_channel(room)
+                    if plan.kind == "recovery" and not _core_is_healthy(STATE_DIR):
+                        break  # core failed DURING the resolve await (#6)
+                    attempted.append(room)
                     if ch is not None and await _send_core_notice(ch, body):
                         sent.append(room)
                         print(f"  [core-notice] {plan.kind} sent to #{room}", flush=True)
-                    # ch None or send False → NOT counted delivered; the shared
-                    # commit bumps its failure counter and purges after a bound.
+                    # ch None or send False → attempted but not delivered; the
+                    # shared commit bumps its failure counter, purges after a bound.
             finally:
-                plan.commit(sent)
+                plan.commit(sent, attempted_rooms=attempted)
     except Exception as e:  # noqa: BLE001 — a notice must never break delivery
         print(f"  [core-notice] sweep failed: {e}", flush=True)
 

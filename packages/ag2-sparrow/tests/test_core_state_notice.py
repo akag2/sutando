@@ -108,17 +108,19 @@ def test_recovery_validates_and_purges_targets():
 
 
 def test_partial_success_committed_before_exception():
-    # Review r4 #2: room A succeeds, room B raises → A's cooldown must be
-    # recorded (committed in finally) so it isn't re-noticed next sweep.
+    # Review r4 #2 + r4-followup nit #7: room A succeeds, room B raises → A is
+    # noticed EXACTLY ONCE (count the sends, not just the final ledger).
     with tempfile.TemporaryDirectory() as d:
         tmp = pathlib.Path(d)
         now = time.time()
         _write_state(tmp, "crashed")
         _write_heartbeat(tmp, now)
+        a_sends = [0]
 
         def send(room, body):
             if room == "!b:s":
                 raise RuntimeError("boom on B")
+            a_sends[0] += 1
             return True
 
         for tick in range(3):
@@ -127,9 +129,89 @@ def test_partial_success_committed_before_exception():
                                              now=now + tick)
             except RuntimeError:
                 pass
-        # A must have been noticed exactly once despite B raising every tick.
-        active = json.loads((tmp / csn.LEDGER_FILE).read_text())["active"]
-        assert active.get("!a:s") == "crashed"
+        assert a_sends[0] == 1, f"A sent {a_sends[0]}x, expected once"
+        assert json.loads((tmp / csn.LEDGER_FILE).read_text())["active"].get("!a:s") == "crashed"
+
+
+def test_recovery_persistence_failure_does_not_resurrect():
+    # r4-followup #1: degraded persists (disk active has A); recovery send
+    # succeeds but its persist fails → the memory snapshot (active empty) is
+    # authoritative, so the next pass must NOT re-send recovery.
+    import unittest.mock as mock
+    csn._MEM_LEDGERS.clear()
+    with tempfile.TemporaryDirectory() as d:
+        tmp = pathlib.Path(d)
+        now = time.time()
+        _write_heartbeat(tmp, now)
+        _write_state(tmp, "crashed")
+        s = _Sender()
+        csn.sweep_core_state_notices(tmp, {"!a:s"}, s, now=now)  # persists active={A}
+        assert json.loads((tmp / csn.LEDGER_FILE).read_text())["active"] == {"!a:s": "crashed"}
+        _write_state(tmp, "idle-ready")
+        rec = _Sender()
+        with mock.patch.object(csn.os, "replace", side_effect=OSError("ro")):
+            for tick in range(3):
+                csn.sweep_core_state_notices(tmp, set(), rec, now=now + 1 + tick)
+        assert len(rec.sent) == 1, f"recovery re-sent {len(rec.sent)}x — resurrection bug"
+    csn._MEM_LEDGERS.clear()
+
+
+def test_unattempted_rooms_not_charged_a_failure():
+    # r4-followup #2: recovery for A,B; A raises before B's turn. B was never
+    # attempted, so it must NOT accrue failures / get purged.
+    csn._MEM_LEDGERS.clear()
+    with tempfile.TemporaryDirectory() as d:
+        tmp = pathlib.Path(d)
+        now = time.time()
+        _write_heartbeat(tmp, now)
+        # seed active for A and B via a degraded pass
+        _write_state(tmp, "crashed")
+        csn.sweep_core_state_notices(tmp, {"!a:s", "!b:s"}, _Sender(), now=now)
+        _write_state(tmp, "idle-ready")
+
+        def raising_send(room, body):
+            if room == "!a:s":  # sorts first; aborts the batch before B's turn
+                raise RuntimeError("A raises, aborting before B")
+            return True
+
+        # Fewer passes than MAX so A keeps blocking (not yet purged): across all
+        # of them B is never reached, so it must accrue ZERO failures and keep
+        # its recovery debt — the bug charged B a failure per aborted pass.
+        for tick in range(csn.MAX_RECOVERY_ATTEMPTS - 1):
+            try:
+                csn.sweep_core_state_notices(tmp, set(), raising_send, now=now + 1 + tick)
+            except RuntimeError:
+                pass
+        led = json.loads((tmp / csn.LEDGER_FILE).read_text())
+        assert "!b:s" in led["active"], "B was never attempted; must not be purged"
+        assert led.get("fail", {}).get("!b:s", 0) == 0, "B must not accrue failures"
+        assert led.get("fail", {}).get("!a:s", 0) >= 1, "A (actually attempted) is charged"
+    csn._MEM_LEDGERS.clear()
+
+
+def test_batch_cap_rotation_reaches_all_rooms():
+    # r4-followup #3: 9 degraded rooms, the first 8 (sorted) always fail; the
+    # reachable 9th must eventually get an attempt across rotated passes.
+    csn._MEM_LEDGERS.clear()
+    csn._RR_CURSORS.clear()
+    with tempfile.TemporaryDirectory() as d:
+        tmp = pathlib.Path(d)
+        now = time.time()
+        _write_heartbeat(tmp, now)
+        _write_state(tmp, "crashed")
+        rooms = {f"!r{i:02d}:s" for i in range(9)}
+        ninth = "!r08:s"  # sorts last
+        attempts = {r: 0 for r in rooms}
+
+        def send(room, body):
+            attempts[room] += 1
+            return room == ninth  # only the 9th would succeed if attempted
+
+        for tick in range(4):  # a few rotated passes
+            csn.sweep_core_state_notices(tmp, rooms, send, now=now + tick)
+        assert attempts[ninth] >= 1, "rotation never reached the reachable 9th room"
+    csn._MEM_LEDGERS.clear()
+    csn._RR_CURSORS.clear()
 
 
 def test_persistence_failure_keeps_process_local_cooldown():
@@ -431,6 +513,9 @@ if __name__ == "__main__":
     test_invalid_heartbeat_is_no_verdict()
     test_recovery_validates_and_purges_targets()
     test_partial_success_committed_before_exception()
+    test_recovery_persistence_failure_does_not_resurrect()
+    test_unattempted_rooms_not_charged_a_failure()
+    test_batch_cap_rotation_reaches_all_rooms()
     test_persistence_failure_keeps_process_local_cooldown()
     test_numeric_guards()
     test_no_supervisor_file_does_nothing()
