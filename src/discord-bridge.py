@@ -1355,7 +1355,8 @@ async def _run_codex_subprocess(prompt, model, timeout_s):
     except Exception:
         return ""
     try:
-        argv = ["codex", "exec", "--sandbox", "read-only", "--skip-git-repo-check", "-o", out_path]
+        argv = ["codex", "exec", "--sandbox", "read-only", "--disable=apps",
+                "--skip-git-repo-check", "-o", out_path]
         if model:
             argv.extend(["-m", model])
         argv.extend(["--", prompt])
