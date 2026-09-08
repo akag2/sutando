@@ -1221,5 +1221,18 @@ class TheNoStandInRuleIsQuantifiedOverTheSet(unittest.TestCase):
     def test_an_unbound_worker_is_what_is_refused_not_a_bound_peer(self):
         self.assertIn("no UNBOUND worker stands in", self._flat())
 
+    def test_the_duplicate_result_is_not_called_harmless(self):
+        # The done flag fences the EFFECT; it does not pick the authoritative
+        # writer, and find_result reads the live path before the archive.
+        self.assertNotIn("it is made harmless", self._flat())
+
+    def test_the_result_selector_is_named_as_an_open_obligation(self):
+        f = self._flat()
+        self.assertIn("unresolved implementation obligation", f)
+        self.assertIn("durable selector", f)
+
+    def test_a_first_writer_only_primitive_is_called_insufficient(self):
+        self.assertIn("NOT solved by a first-writer-only primitive", self._flat())
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)
