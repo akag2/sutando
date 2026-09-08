@@ -28,11 +28,17 @@ for f in "$TASKS_DIR"/*.txt; do
   BASENAME=$(basename "$f")
   # Skip if result already exists
   [ -f "$RESULTS_DIR/$BASENAME" ] && continue
-  UNPROCESSED+="--- $BASENAME ---\n$(cat "$f")\n\n"
+  UNPROCESSED+="--- $BASENAME ---
+$(cat "$f")
+
+"
 done
 
 if [ -n "$UNPROCESSED" ]; then
-  printf '{"decision":"block","reason":"Unprocessed tasks in tasks/","additionalContext":"UNPROCESSED TASKS — process these NOW:\n%s"}' "$(echo -e "$UNPROCESSED" | sed 's/"/\\"/g' | tr '\n' ' ')"
+  # Encode with a real JSON encoder. Hand-rolled escaping emitted this format
+  # string's own \n as a raw newline inside a JSON string value, which is
+  # illegal, so every block decision was unparseable and the guard never fired.
+  SUTANDO_HOOK_BODY="$UNPROCESSED" python3 -c 'import json,os,sys; sys.stdout.write(json.dumps({"decision":"block","reason":"Unprocessed tasks in tasks/","additionalContext":"UNPROCESSED TASKS — process these NOW:\n"+os.environ.get("SUTANDO_HOOK_BODY","")}))'
 else
   echo '{}'
 fi
