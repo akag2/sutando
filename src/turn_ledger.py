@@ -55,7 +55,6 @@ if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
 from delivery.readiness import read_ready_result  # noqa: E402
-from task_archive import archive_month  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path, write_status  # noqa: E402
 
 __all__ = [
@@ -215,8 +214,9 @@ def _result_dirs(results: Path, ts: float) -> list:
     # The archive holds month partitions AND a flat top level; a freshly
     # delivered result lands flat, so scanning only the partitions misses it.
     dirs = [results, archive]
-    # Same calendar as the writer, by calling the writer's own helper: computing
-    # it here in UTC missed the local-month partition around a month boundary.
+    # Same calendar as the writer, by its own helper: computing months here in
+    # UTC missed the local-month partition either side of a boundary.
+    from task_archive import archive_month
     months = {archive_month(t) for t in (ts, time.time())}
     dirs.extend(archive / m for m in sorted(months))
     return dirs
