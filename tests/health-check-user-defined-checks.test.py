@@ -29,6 +29,7 @@ from __future__ import annotations
 import ast
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 import time
@@ -149,6 +150,29 @@ class TestUserDefinedChecks(unittest.TestCase):
                 decls = hc.load_user_checks(
                     hc.user_checks_path(workspace_dir=self.ws, host=self.host))
                 self.assertEqual(decls[0]["timeout"], hc.USER_CHECK_TIMEOUT_S)
+
+    def test_the_group_kill_falls_back_to_the_process_when_there_is_no_group(self):
+        """A process that already exited has no group left to signal; the fallback
+        must still reap the direct child rather than let the OSError escape."""
+        proc = mock.Mock(pid=os.getpid())
+        with mock.patch.object(hc.os, "getpgid", side_effect=OSError("ESRCH")):
+            hc._kill_user_command_tree(proc)
+        proc.kill.assert_called_once_with()
+        proc.wait.assert_called_once()
+
+    def test_a_process_that_ignores_the_kill_does_not_block_the_run(self):
+        proc = mock.Mock(pid=os.getpid())
+        proc.wait.side_effect = hc.subprocess.TimeoutExpired(cmd="x", timeout=5)
+        with mock.patch.object(hc.os, "getpgid", return_value=1), \
+                mock.patch.object(hc.os, "killpg"):
+            hc._kill_user_command_tree(proc)
+
+    def test_an_unresolvable_path_yields_no_rows_instead_of_raising(self):
+        """The declaration path is resolved OUTSIDE load_user_checks, so its own
+        failure needs its own guard — otherwise it takes the health check down."""
+        self._declare({"checks": [{"name": "n", "command": "true"}]})
+        with mock.patch.object(hc, "_host_label", side_effect=RuntimeError("no scutil")):
+            self.assertEqual(hc.check_user_defined(workspace_dir=self.ws), [])
 
     # --- e) a command that cannot even be spawned ---------------------------
 
