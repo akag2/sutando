@@ -338,6 +338,51 @@ class TheActorPrecedenceComesFromItsOwner(unittest.TestCase):
                          "the precedence is spelled here again, so it can drift")
 
 
+class TheIdentityProbesAreTriStateNotBoolean(unittest.TestCase):
+    """`None` means CANNOT READ; "" means the process states none. A probe that
+    collapses them publishes THIS process's identity as the watcher's."""
+
+    def test_environ_read_returns_the_first_name_that_is_set(self):
+        blob = b"HOME=/root\0SUTANDO_INSTANCE=inst-b\0SUTANDO_AGENT=agent-z\0"
+        with patch.object(Path, "read_bytes", return_value=blob):
+            self.assertEqual(
+                hc._pid_env_first("4242", ["SUTANDO_INSTANCE", "SUTANDO_AGENT"]), "inst-b")
+
+    def test_a_name_set_but_empty_falls_through_to_the_next(self):
+        blob = b"SUTANDO_INSTANCE=\0SUTANDO_AGENT=agent-z\0"
+        with patch.object(Path, "read_bytes", return_value=blob):
+            self.assertEqual(
+                hc._pid_env_first("4242", ["SUTANDO_INSTANCE", "SUTANDO_AGENT"]), "agent-z")
+
+    def test_none_of_the_names_present_states_none_rather_than_cannot_read(self):
+        with patch.object(Path, "read_bytes", return_value=b"HOME=/root\0"):
+            self.assertEqual(hc._pid_env_first("4242", ["SUTANDO_INSTANCE"]), "")
+
+    def test_an_unreadable_process_is_None_not_empty(self):
+        with patch.object(Path, "read_bytes", side_effect=OSError("no /proc")), \
+             patch.object(hc.subprocess, "run", side_effect=OSError("no ps")):
+            self.assertIsNone(hc._pid_env_first("4242", ["SUTANDO_INSTANCE"]))
+
+    def test_no_stated_default_yields_no_repair_target(self):
+        # Naming a target from a guessed identity is what gets a stranger killed.
+        with patch.object(hc, "_pid_instance_id", return_value="i"), \
+             patch.object(hc, "_pid_actor_id", return_value="a"), \
+             patch.object(hc, "stated_default_identity", return_value=None):
+            self.assertIsNone(hc._watcher_sentinel_target(Path("/tmp"), "4242"))
+
+    def test_a_raising_resolver_yields_no_repair_target(self):
+        with patch.object(hc, "_pid_instance_id", return_value="i"), \
+             patch.object(hc, "_pid_actor_id", return_value="a"), \
+             patch.object(hc, "stated_default_identity", side_effect=RuntimeError("x")):
+            self.assertIsNone(hc._watcher_sentinel_target(Path("/tmp"), "4242"))
+
+    def test_a_short_ps_line_is_skipped_not_parsed(self):
+        # A header row or a truncated line has no argv column to judge.
+        parent, live = hc._ps_watcher_index("  PID PPID\n 100 1 bash src/watch-tasks-stream.sh\n")
+        self.assertIn("100", parent)
+        self.assertNotIn("PID", parent)
+
+
 class TheDarwinArgvParseIsExercisedOnAnyPlatform(unittest.TestCase):
     """KERN_PROCARGS2's layout is parsed by hand, so the loops need a test.
 
