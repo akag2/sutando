@@ -10,7 +10,10 @@ explicitly rather than the exit code. --strict is for shell callers only.
 """
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
+import json
 import pathlib
 import unittest
 
@@ -58,6 +61,30 @@ class StrictIsOptIn(unittest.TestCase):
              "    return 0", ns)
         self.assertEqual(ns["rc"]({"rooms": []}, True), 0)
         self.assertEqual(ns["rc"](None, True), 0)
+
+
+class MainActuallyReturnsTheCode(unittest.TestCase):
+    """Execute the real _main. The assertions above read source text and an
+    exec'd replica, so line 292 (the --strict return) never ran under them."""
+
+    def setUp(self):
+        self.m = _load()
+
+    def _run(self, argv):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = self.m._main(argv)
+        return rc, buf.getvalue()
+
+    def test_strict_returns_1_on_a_failed_op(self):
+        rc, out = self._run(["--strict", "send", "!r:x", "/nope/missing.png"])
+        self.assertEqual(rc, 1)
+        self.assertIs(json.loads(out)["ok"], False)
+
+    def test_the_default_returns_0_on_the_same_failed_op(self):
+        rc, out = self._run(["send", "!r:x", "/nope/missing.png"])
+        self.assertEqual(rc, 0, "the default contract must not change")
+        self.assertIs(json.loads(out)["ok"], False)
 
 
 if __name__ == "__main__":
