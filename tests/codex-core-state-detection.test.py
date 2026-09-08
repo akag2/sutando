@@ -40,13 +40,13 @@ def check(name, cond):
 
 
 class _Proc:
-    def __init__(self, rc):
+    def __init__(self, rc, stdout="", stderr=""):
         self.returncode = rc
-        self.stdout = ""
+        self.stdout = stdout
+        self.stderr = stderr
 
 
 def _reset_caches():
-    rh._CORE_ENV_CACHE.clear()
     rh._CODEX_LOGIN_CACHE[0] = 0.0
     rh._CODEX_LOGIN_CACHE[1] = None
 
@@ -61,27 +61,56 @@ with patch.object(rh, "_core_session_env", lambda v: None), \
     os.environ.pop("SUTANDO_CORE_RUNTIME", None)
     check("core_runtime: defaults to claude when unknown", rh.core_runtime() == "claude")
 
-# 2) A logged-out codex core → _login_signal() True (via `codex login status` != 0).
+# 2) Genuine logout: exit != 0 AND an explicit "Not logged in" message → True.
 _reset_caches()
 with patch.object(rh, "core_runtime", lambda: "codex"), \
         patch.object(rh, "_core_session_env", lambda v: None), \
-        patch.object(rh.subprocess, "run", lambda *a, **k: _Proc(1)):
-    check("codex logged-out: _login_signal True", rh._login_signal() is True)
+        patch.object(rh.subprocess, "run", lambda *a, **k: _Proc(1, "Not logged in\n")):
+    check("codex logged-out (explicit msg): _login_signal True", rh._login_signal() is True)
 
-# 3) A signed-in codex core → False (exit 0), and never scrapes the pane.
+# 3) Signed in → exit 0 → False, and never scrapes the pane.
 _reset_caches()
 with patch.object(rh, "core_runtime", lambda: "codex"), \
         patch.object(rh, "_core_session_env", lambda v: None), \
         patch.object(rh, "_pane_text", lambda: (_ for _ in ()).throw(AssertionError("pane read for codex"))), \
-        patch.object(rh.subprocess, "run", lambda *a, **k: _Proc(0)):
+        patch.object(rh.subprocess, "run", lambda *a, **k: _Proc(0, "Logged in as user@example\n")):
     check("codex signed-in: _login_signal False (no pane scrape)", rh._login_signal() is False)
 
-# 4) `codex login status` can't run → unknown → False (never a false logged-out).
+# 4) FINDING 1 — a config error / missing-node failure is NOT a logout.
+#    codex 0.137 exits 1 for a bad config.toml; node-missing wrappers exit 127.
+_reset_caches()
+with patch.object(rh, "core_runtime", lambda: "codex"), \
+        patch.object(rh, "_core_session_env", lambda v: None), \
+        patch.object(rh.subprocess, "run", lambda *a, **k: _Proc(1, "", "Error loading configuration\n")):
+    check("codex config error: _codex_login_needed None (not a logout)", rh._codex_login_needed() is None)
+_reset_caches()
+with patch.object(rh, "core_runtime", lambda: "codex"), \
+        patch.object(rh, "_core_session_env", lambda v: None), \
+        patch.object(rh.subprocess, "run", lambda *a, **k: _Proc(127, "", "node: command not found\n")):
+    check("codex exit 127 (no node): _codex_login_needed None", rh._codex_login_needed() is None)
+
+# 5) probe can't even start → unknown → not a logout.
 _reset_caches()
 with patch.object(rh, "core_runtime", lambda: "codex"), \
         patch.object(rh, "_core_session_env", lambda v: None), \
         patch.object(rh.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(OSError("no codex"))):
     check("codex probe fails: _login_signal False (no false logged-out)", rh._login_signal() is False)
+
+# 6) FINDING 2 — if the core's account can't be resolved, DON'T probe the
+#    monitor's account: return unknown (None) instead of a wrong verdict.
+_reset_caches()
+_seen_env = {}
+def _capture_run(cmd, *a, **k):
+    _seen_env["CODEX_HOME"] = (k.get("env") or {}).get("CODEX_HOME")
+    return _Proc(1, "Not logged in\n")
+with patch.dict(os.environ, {"CODEX_HOME": "/monitor/account"}, clear=False), \
+        patch.object(rh, "core_runtime", lambda: "codex"), \
+        patch.object(rh, "_core_session_env", lambda v: rh._ENV_UNAVAILABLE), \
+        patch.object(rh.subprocess, "run", _capture_run):
+    check("codex core account unresolved → None (not the monitor's verdict)",
+          rh._codex_login_needed() is None)
+    check("codex core account unresolved → probe NOT run against monitor account",
+          "CODEX_HOME" not in _seen_env)
 
 # 5) Claude path is unchanged: _login_signal defers to needs_login(pane).
 _reset_caches()

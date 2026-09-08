@@ -27,6 +27,7 @@ observer; it starts nothing and kills nothing.
 import json
 import math
 import os
+import re
 import tempfile
 import socket
 import subprocess
@@ -483,75 +484,76 @@ def needs_login(pane_text):
 
 
 # --- Runtime awareness (silent-core coverage for non-Claude cores) -----------
-# The Claude core's logged-out state is scraped from its auth PROMPT (needs_login
-# above). A Codex core shows different text — but Codex ships an authoritative,
-# non-interactive check, `codex login status` (exit 0 = signed in), the same one
-# startup/verify use. So for a codex core we ask Codex directly instead of
-# guessing at its TUI. Everything is gated on the runtime, so the Claude path is
-# unchanged. Crash/hang/working/idle are already runtime-neutral (process probe
-# + core-status.json), so only login needed a per-runtime branch.
-_CORE_ENV_CACHE: dict = {}       # var -> (value_or_None, ts)
-_CORE_ENV_TTL = 30.0
-_CODEX_LOGIN_CACHE = [0.0, None]  # [ts, needs_login_bool_or_None]
-_CODEX_LOGIN_TTL = 30.0           # `codex login status` spawns node — don't per-tick it
+# Claude's logout is scraped from its auth prompt (needs_login). Codex shows
+# different text but ships `codex login status`, so we ask it directly. All
+# gated on the runtime; the Claude path is unchanged.
+_CODEX_LOGIN_CACHE = [0.0, None]  # [ts, needs_login: True|False|None]
+_CODEX_LOGIN_TTL = 30.0           # the probe spawns node — don't run it per-tick
+# Sentinel: the tmux query itself could not run (distinct from "var is unset").
+_ENV_UNAVAILABLE = object()
+# `codex login status` prints this when the account is genuinely unauthenticated;
+# other non-zero exits (config error, exit 127 no-node) are NOT logout.
+_CODEX_LOGGED_OUT_RE = re.compile(r"not logged in|not authenticated|run .?codex login", re.I)
 
 
 def _core_session_env(var):
-    """Read an env var from the core's tmux session, where start-cli.sh exports
-    SUTANDO_CORE_RUNTIME / CODEX_HOME. Cached briefly. None if unavailable —
-    callers treat that as 'unknown', never a positive reading."""
-    now = time.time()
-    hit = _CORE_ENV_CACHE.get(var)
-    if hit is not None and now - hit[1] < _CORE_ENV_TTL:
-        return hit[0]
-    val = None
+    """An env var from the core's tmux session (start-cli.sh exports
+    SUTANDO_CORE_RUNTIME / CODEX_HOME). Returns the value, None if the session
+    ran but the var is unset, or _ENV_UNAVAILABLE if the query itself failed."""
     rc, out = _run(["tmux", "-S", TMUX_SOCKET, "show-environment", "-t", "=" + SESSION, var])
-    if rc == 0:
-        for line in out.splitlines():
-            if line.startswith(var + "="):
-                val = line[len(var) + 1:]
-                break
-    _CORE_ENV_CACHE[var] = (val, now)
-    return val
+    if rc != 0:
+        return _ENV_UNAVAILABLE  # can't tell — caller must not guess
+    for line in out.splitlines():
+        if line.startswith(var + "="):
+            return line[len(var) + 1:]
+    return None  # session queried, var not set
 
 
 def core_runtime():
-    """The core's runtime ('claude' | 'codex' | …). Defaults to 'claude' so any
-    detection failure preserves the existing Claude behavior."""
-    rt = (_core_session_env("SUTANDO_CORE_RUNTIME")
-          or os.environ.get("SUTANDO_CORE_RUNTIME") or "claude")
-    return rt.strip() or "claude"
+    """The core's runtime ('claude' | 'codex' | …). Defaults to 'claude' so a
+    detection failure preserves existing Claude behavior."""
+    v = _core_session_env("SUTANDO_CORE_RUNTIME")
+    if v is _ENV_UNAVAILABLE or not v:
+        v = os.environ.get("SUTANDO_CORE_RUNTIME") or "claude"
+    return v.strip() or "claude"
 
 
 def _codex_login_needed():
-    """True = a codex core needs login (`codex login status` exited non-zero),
-    False = signed in, None = the check could not run (→ unknown, never a false
-    'logged out'). Runs against the core's own CODEX_HOME so it inspects the same
-    account the core uses. Cached: the subprocess spawns node, too costly to run
-    every health tick."""
+    """True = codex account is genuinely logged out, False = signed in, None =
+    can't tell. Only an exit 0 (signed in) or an explicit unauthenticated
+    message is conclusive; a config error / missing-node / other failure returns
+    None so it is never mistaken for a logout. Probes the CORE's CODEX_HOME."""
     now = time.time()
     if now - _CODEX_LOGIN_CACHE[0] < _CODEX_LOGIN_TTL:
         return _CODEX_LOGIN_CACHE[1]
     env = dict(os.environ)
     ch = _core_session_env("CODEX_HOME")
+    if ch is _ENV_UNAVAILABLE:
+        return None  # can't identify the core's account → never probe the wrong one
     if ch:
-        env["CODEX_HOME"] = ch
+        env["CODEX_HOME"] = ch  # explicit; else the session's default matches ours
     try:
         p = subprocess.run(["codex", "login", "status"], capture_output=True,
                            text=True, timeout=8, env=env)
-        needed = (p.returncode != 0)
     except (OSError, subprocess.SubprocessError):
-        needed = None  # couldn't run → unknown; NEVER report a false logged-out
+        needed = None  # couldn't run → unknown, never a false logged-out
+    else:
+        text = (p.stdout or "") + (p.stderr or "")
+        if p.returncode == 0:
+            needed = False  # authoritative signed-in (startup/verify rely on this)
+        elif _CODEX_LOGGED_OUT_RE.search(text):
+            needed = True  # explicit unauthenticated message
+        else:
+            needed = None  # non-zero for some OTHER reason (config/interpreter) → unknown
     _CODEX_LOGIN_CACHE[0], _CODEX_LOGIN_CACHE[1] = now, needed
     return needed
 
 
 def _login_signal():
-    """Runtime-aware 'is the core logged out?' → bool. Claude: scrape the auth
-    prompt (unchanged). Codex: ask `codex login status`. Unknown → False, so a
-    probe that can't run never fabricates a logged-out verdict."""
+    """Runtime-aware 'is the core logged out?'. Claude scrapes the pane
+    (unchanged); Codex asks `codex login status`. Unknown → False."""
     if core_runtime() == "codex":
-        return bool(_codex_login_needed())
+        return _codex_login_needed() is True
     return needs_login(_pane_text())
 
 
@@ -622,9 +624,8 @@ def derive():
         # so it must NOT license overriding a login marker — that would be the
         # same absence-of-evidence mistake in the other direction.
         acting = status in ("running", "idle") and ts is not None and not stale
-        # Runtime-aware: Claude scrapes its auth prompt; Codex asks
-        # `codex login status`. Claude behavior is unchanged (core_runtime()
-        # defaults to 'claude').
+        # Runtime-aware: Claude scrapes the pane, Codex asks `codex login
+        # status`. Claude path unchanged (core_runtime defaults to 'claude').
         login = _login_signal()
         # status_fresh: True = advanced within the window, False = stale,
         # None = no record to judge (can't prove either way).
