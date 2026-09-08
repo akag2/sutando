@@ -19,6 +19,7 @@ protocol, so a test can plug an in-process transport in.
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import re
 import signal
@@ -180,6 +181,17 @@ def answer(task: Path, results: Path, transport_factory=ws_transport,
     return body
 
 
+def _backoff_delay(n: int) -> float:
+    """2**n seconds capped at RETRY_MAX_S, with the cap applied BEFORE the power.
+
+    Evaluating 2.0 ** n first raises OverflowError at n >= 1024, which exits the
+    seat; the entrypoint treats that exit as fatal and stops the gateway too.
+    """
+    if RETRY_MAX_S <= 0.0:
+        return 0.0
+    return RETRY_MAX_S if n >= math.log2(RETRY_MAX_S) else 2.0 ** n
+
+
 def main() -> int:
     tasks, results = WS / "tasks", WS / "results"
     results.mkdir(parents=True, exist_ok=True)
@@ -209,7 +221,7 @@ def main() -> int:
                           f"({len(body)} chars)", flush=True)
             else:
                 n = attempts[task.name] = attempts.get(task.name, 0) + 1
-                delay = min(2.0 ** n, RETRY_MAX_S)
+                delay = _backoff_delay(n)
                 retry_at[task.name] = time.time() + delay
                 print(f"seat-ag2-assistant: {task.stem} still pending after attempt {n}; "
                       f"retrying in {delay:.0f}s", file=sys.stderr, flush=True)
