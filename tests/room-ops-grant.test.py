@@ -228,7 +228,9 @@ class CliDispatchTests(unittest.TestCase):
 
         with mock.patch.object(gr, "grant_room", boom):
             rc = self._run(["grant", ROOM, "--tier", "@u:hs=admin"])
-        self.assertEqual(rc, 0)          # bad input is a clean result, not a crash
+        # rc follows `ok` for every subcommand, so a rejected grant cannot read
+        # as an applied one. Nonzero is not a crash; the JSON still explains why.
+        self.assertEqual(rc, 1)
         self.assertEqual(called["n"], 0)  # never reached the network call
 
 

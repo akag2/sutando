@@ -284,7 +284,9 @@ def _main(argv):
         fn = _react.react if a.cmd == "react" else _react.unreact
         res = fn(a.room_id, a.event_id, key, a.agent_mxid)
     print(json.dumps(res, indent=2))
-    return 0
+    # The result's own `ok` decides the exit code. Printing a failure while
+    # exiting 0 makes every `&&` chain and `set -e` caller read it as delivered.
+    return 1 if isinstance(res, dict) and res.get("ok") is False else 0
 
 
 if __name__ == "__main__":
