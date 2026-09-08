@@ -405,6 +405,7 @@ def main() -> int:
         test_one_reminder_per_turn_not_a_standing_refusal,
         test_ended_on_a_message_versus_sent_then_went_quiet,
         test_a_delivered_result_archived_flat_is_still_a_message,
+        test_the_reader_uses_the_writers_archive_calendar,
         test_turn_start_is_reachable_from_the_command_line,
         test_record_say_contract_in_process,
         test_a_result_older_than_the_boundary_is_not_this_turns,
@@ -699,6 +700,42 @@ def test_a_delivered_result_archived_flat_is_still_a_message() -> None:
         found = turn_ledger._result_after(since, ws)
         check("a flat-archived delivery is found",
               found is not None and "task-abc123" in found["target"], repr(found))
+
+
+def test_the_reader_uses_the_writers_archive_calendar() -> None:
+    """The writer partitions by LOCAL month; a UTC reader misses it at a boundary.
+
+    Frozen at 2026-09-01 01:00 UTC, a Los Angeles host archives into 2026-08
+    while UTC says 2026-09, so the delivered reply became invisible and the turn
+    was reminded for silence after it had answered.
+    """
+    import calendar, task_archive
+    boundary = calendar.timegm(datetime.datetime(2026, 9, 1, 1, 0, 0).timetuple())
+    previous = os.environ.get("TZ")
+    try:
+        os.environ["TZ"] = "America/Los_Angeles"
+        time.tzset()
+        writer_month = task_archive.archive_month(boundary)
+        utc_month = datetime.datetime.fromtimestamp(
+            boundary, datetime.timezone.utc).strftime("%Y-%m")
+        check("setup: the two calendars genuinely disagree here",
+              writer_month != utc_month, f"{writer_month} vs {utc_month}")
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = _workspace(tmp)
+            partition = pathlib.Path(ws) / "results" / "archive" / writer_month
+            partition.mkdir(parents=True, exist_ok=True)
+            reply = partition / "task-reply.txt"
+            reply.write_text("a real reply\n", encoding="utf-8")
+            os.utime(reply, (boundary + 30, boundary + 30))
+            found = turn_ledger._result_after(boundary - 60, ws)
+            check("a reply in the writer's partition is found",
+                  found is not None and "task-reply" in found["target"], repr(found))
+    finally:
+        if previous is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = previous
+        time.tzset()
 
 
 def test_turn_start_is_reachable_from_the_command_line() -> None:
