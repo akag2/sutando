@@ -2731,6 +2731,13 @@ async def _supervise_loop(coro_fn, name):
 _CORE_NOTICE_LEDGER = "core-state-notice-discord.json"
 _CORE_NOTICE_SUFFIX = " _(automated notice)_"
 _CORE_NOTICE_RECOVERY_INTERVAL_S = 15
+# Serialize plan→send→commit (review 2026-09-08, should-fix #2): discord
+# dispatches on_message handlers concurrently, so two messages for the same
+# channel during an outage could both plan (each seeing no cooldown yet), both
+# send, then both commit — a duplicate notice. This lock also serializes intake
+# against the recovery loop, since they share the ledger. One event loop, so one
+# asyncio.Lock suffices.
+_core_notice_lock = asyncio.Lock()
 
 
 async def _send_core_notice(channel, body) -> bool:
@@ -2751,17 +2758,18 @@ async def _core_notice_on_intake(channel) -> None:
     (deduped per reason per cooldown). Recovery is the periodic sweep's job, so
     a healthy core here is simply a no-op. Never raises."""
     try:
-        plan = _plan_core_notices(STATE_DIR, {str(channel.id)},
-                                  ledger_name=_CORE_NOTICE_LEDGER,
-                                  suffix=_CORE_NOTICE_SUFFIX)
-        if plan is None or plan.kind != "degraded":
-            return
-        sent = []
-        for _room, body in plan.items:
-            if await _send_core_notice(channel, body):
-                sent.append(_room)
-                print(f"  [core-notice] {plan.reason} sent to #{channel.id}", flush=True)
-        plan.commit(sent)
+        async with _core_notice_lock:  # serialize plan→send→commit vs peers/recovery
+            plan = _plan_core_notices(STATE_DIR, {str(channel.id)},
+                                      ledger_name=_CORE_NOTICE_LEDGER,
+                                      suffix=_CORE_NOTICE_SUFFIX)
+            if plan is None or plan.kind != "degraded":
+                return
+            sent = []
+            for _room, body in plan.items:
+                if await _send_core_notice(channel, body):
+                    sent.append(_room)
+                    print(f"  [core-notice] {plan.reason} sent to #{channel.id}", flush=True)
+            plan.commit(sent)
     except Exception as e:  # noqa: BLE001 — intake must not fail on a notice
         print(f"  [core-notice] intake sweep failed: {e}", flush=True)
 
@@ -2770,25 +2778,26 @@ async def _core_notice_recovery_once() -> None:
     """One recovery pass: if the core is healthy and channels are owed a
     recovery line, send it and clear them. Never raises."""
     try:
-        plan = _plan_core_notices(STATE_DIR, set(),
-                                  ledger_name=_CORE_NOTICE_LEDGER,
-                                  suffix=_CORE_NOTICE_SUFFIX)
-        if plan is None or plan.kind != "recovery":
-            return
-        sent = []
-        for room, body in plan.items:
-            ch = client.get_channel(int(room)) if room.isdigit() else None
-            if ch is None:
-                # Unresolved (uncached DM / not yet ready): drop the owed
-                # recovery so it can't wedge the ledger forever. Losing a
-                # recovery line is benign — the real answer still delivers
-                # through the normal result path.
-                sent.append(room)
-                continue
-            if await _send_core_notice(ch, body):
-                sent.append(room)
-                print(f"  [core-notice] recovery sent to #{room}", flush=True)
-        plan.commit(sent)
+        async with _core_notice_lock:  # shares the ledger with intake
+            plan = _plan_core_notices(STATE_DIR, set(),
+                                      ledger_name=_CORE_NOTICE_LEDGER,
+                                      suffix=_CORE_NOTICE_SUFFIX)
+            if plan is None or plan.kind != "recovery":
+                return
+            sent = []
+            for room, body in plan.items:
+                ch = client.get_channel(int(room)) if room.isdigit() else None
+                if ch is None:
+                    # Unresolved (uncached DM / not yet ready): drop the owed
+                    # recovery so it can't wedge the ledger forever. Losing a
+                    # recovery line is benign — the real answer still delivers
+                    # through the normal result path.
+                    sent.append(room)
+                    continue
+                if await _send_core_notice(ch, body):
+                    sent.append(room)
+                    print(f"  [core-notice] recovery sent to #{room}", flush=True)
+            plan.commit(sent)
     except Exception as e:  # noqa: BLE001 — supervised; keep looping
         print(f"  [core-notice] recovery sweep failed: {e}", flush=True)
 

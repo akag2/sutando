@@ -119,6 +119,21 @@ def main():
         mod._core_notice_sweep({"C0XYZ"})
         expect(any(k.get("channel") == "C0XYZ" for k in sent),
                "retry: notice re-attempted after a failed send")
+
+        # 5. thread targeting (review should-fix #3): a channel @mention's notice
+        # threads under the ask, and recovery threads into the same place.
+        sent.clear()
+        _write_state(state_dir, "logged-out")
+        target = mod._core_notice_target("C0THREAD", "1700000000.000100")
+        mod._core_notice_sweep({target})
+        expect(len(sent) == 1 and sent[0].get("channel") == "C0THREAD"
+               and sent[0].get("thread_ts") == "1700000000.000100",
+               "intake: channel @mention notice posts in-thread")
+        _write_state(state_dir, "idle-ready")
+        mod._core_notice_sweep(set())
+        expect(any(k.get("thread_ts") == "1700000000.000100"
+                   and "back online" in k.get("text", "") for k in sent),
+               "recovery: back-online threads into the same conversation")
     finally:
         import shutil
         shutil.rmtree(state_dir, ignore_errors=True)

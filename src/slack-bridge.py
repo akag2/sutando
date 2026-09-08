@@ -981,14 +981,36 @@ def _slack_context_note(event: dict) -> tuple[str, set[str]]:
 _CORE_NOTICE_LEDGER = "core-state-notice-slack.json"
 _CORE_NOTICE_SUFFIX = " _(automated notice)_"
 _CORE_NOTICE_RECOVERY_INTERVAL_S = 15
+# Serialize plan→send→commit (review 2026-09-08, should-fix #2): slack_bolt
+# dispatches event handlers on a thread pool, and the recovery daemon thread
+# sweeps the same ledger — without this, two messages for one channel during an
+# outage (or intake racing recovery) could double-send. Notices are rare, so
+# holding it across the send is fine.
+_core_notice_lock = threading.Lock()
+# The notice "room" is the reply TARGET, not just the channel: a channel
+# @mention is answered in-thread, so its notice must thread too (review
+# should-fix #3) — else the outage line lands top-level in a busy channel,
+# detached from the ask. We encode channel[+thread_ts] into the ledger key with
+# a separator outside Slack's id/ts alphabets; recovery decodes it to thread the
+# "back online" line into the same place. Dedup is thus per-conversation.
+_CORE_NOTICE_SEP = "\x1f"
 
 
-def _core_notice_send(channel: str, body: str) -> bool:
-    """Post one notice to a Slack channel (top-level). True iff it reached
-    Slack. Best-effort: a failure just means the next sweep retries — it must
-    never raise into the caller (intake) or the recovery thread."""
+def _core_notice_target(channel: str, thread_ts: str | None) -> str:
+    return f"{channel}{_CORE_NOTICE_SEP}{thread_ts}" if thread_ts else channel
+
+
+def _core_notice_send(room: str, body: str) -> bool:
+    """Post one notice to a Slack reply target (channel, in-thread when the room
+    key carries a thread_ts). True iff it reached Slack. Best-effort: a failure
+    just means the next sweep retries — it must never raise into intake or the
+    recovery thread."""
+    channel, _, thread_ts = room.partition(_CORE_NOTICE_SEP)
     try:
-        app.client.chat_postMessage(channel=channel, text=body)
+        kwargs = {"channel": channel, "text": body}
+        if thread_ts:
+            kwargs["thread_ts"] = thread_ts
+        app.client.chat_postMessage(**kwargs)
         return True
     except Exception as e:  # noqa: BLE001 — a notice must never break delivery
         print(f"  [core-notice] send to {channel} failed: {e}", flush=True)
@@ -997,13 +1019,15 @@ def _core_notice_send(channel: str, body: str) -> bool:
 
 def _core_notice_sweep(rooms) -> None:
     """One sweep pass over the shared core-state logic, on Slack's ledger.
-    Degraded → notice the given rooms; healthy → recover any owed channels.
-    Never raises (the recovery thread and intake both depend on that)."""
+    Degraded → notice the given rooms; healthy → recover any owed targets.
+    Serialized + never raises (the recovery thread and intake both depend on
+    that)."""
     try:
-        _sweep_core_notices(
-            STATE_DIR, rooms, _core_notice_send,
-            log=lambda m: print(f"  [core-notice] {m}", flush=True),
-            ledger_name=_CORE_NOTICE_LEDGER, suffix=_CORE_NOTICE_SUFFIX)
+        with _core_notice_lock:
+            _sweep_core_notices(
+                STATE_DIR, rooms, _core_notice_send,
+                log=lambda m: print(f"  [core-notice] {m}", flush=True),
+                ledger_name=_CORE_NOTICE_LEDGER, suffix=_CORE_NOTICE_SUFFIX)
     except Exception as e:  # noqa: BLE001
         print(f"  [core-notice] sweep failed: {e}", flush=True)
 
@@ -1320,8 +1344,9 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
         pass
     # Silent-core fix: the task is queued above; if the core can't answer right
     # now, tell this channel why instead of leaving the sender in silence. The
-    # task stays queued regardless — the notice only explains the delay.
-    _core_notice_sweep({channel})
+    # notice targets the reply location (in-thread for a channel @mention) and
+    # the task stays queued regardless — the notice only explains the delay.
+    _core_notice_sweep({_core_notice_target(channel, thread_ts)})
     return task_id
 
 
