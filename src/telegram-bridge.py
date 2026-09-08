@@ -37,6 +37,10 @@ sys.stderr.reconfigure(line_buffering=True)
 # so Gemini can react in-stream. No-op when voice isn't connected. Import is
 # best-effort so the bridge keeps booting if vision_push.py is missing.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+# ag2-sparrow package root — the shared core_state_notice module (same path the
+# gateway/discord/slack bridges add for `import ag2_sparrow`).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "packages" / "ag2-sparrow"))
+from ag2_sparrow.core_state_notice import sweep_core_state_notices as _sweep_core_notices  # noqa: E402
 try:
     from vision_push import push_image as _push_vision_image  # type: ignore
 except Exception:  # pragma: no cover — bridge must keep running
@@ -726,6 +730,40 @@ def log_privacy_setting(get_me):
     )
 
 
+# --- Core-state notices (silent-core fix), parity with gateway/discord/slack --
+# When the core can't answer (usage limit / logged out / crashed / wedged), tell
+# the chat why instead of dropping the message silently. Shared dedup/cooldown/
+# recovery logic + ledger schema live in ag2_sparrow.core_state_notice; this is
+# the (synchronous) Telegram binder. A DISTINCT ledger file keeps telegram's
+# cooldown state from colliding with the other bridges' in the shared state dir.
+# Suffix is PLAIN (no markdown) — these sendMessage calls use no parse_mode.
+_CORE_NOTICE_LEDGER = "core-state-notice-telegram.json"
+_CORE_NOTICE_SUFFIX = " (automated notice)"
+
+
+def _core_notice_send(chat_id, body) -> bool:
+    """Send one notice to a Telegram chat. True iff Telegram accepted it.
+    Best-effort: a failure just means the next sweep retries — never raises."""
+    try:
+        return bool(api("sendMessage", chat_id=int(chat_id), text=body).get("ok"))
+    except Exception as e:  # noqa: BLE001 — a notice must never break delivery
+        print(f"  [core-notice] send to {chat_id} failed: {e}", flush=True)
+        return False
+
+
+def _core_notice_sweep(rooms) -> None:
+    """One sweep over the shared core-state logic on Telegram's ledger.
+    Degraded → notice the given chats; healthy → recover any owed chats.
+    Never raises (intake and the per-tick recovery both depend on that)."""
+    try:
+        _sweep_core_notices(
+            STATE_DIR, rooms, _core_notice_send,
+            log=lambda m: print(f"  [core-notice] {m}", flush=True),
+            ledger_name=_CORE_NOTICE_LEDGER, suffix=_CORE_NOTICE_SUFFIX)
+    except Exception as e:  # noqa: BLE001
+        print(f"  [core-notice] sweep failed: {e}", flush=True)
+
+
 def main():  # pragma: no cover
     global _TOFU_ENROLLMENT_CODE
     _single_instance_acquire("telegram-bridge")
@@ -1032,6 +1070,9 @@ def main():  # pragma: no cover
                     pass
                 task_file.write_text(_task_content)
                 pending_replies[task_id] = chat_id
+                # Silent-core fix: task is queued above; if the core can't
+                # answer now, tell this chat why instead of going silent.
+                _core_notice_sweep({str(chat_id)})
                 pending_task_tiers[task_id] = "owner"  # telegram is owner-only (allowlist-gated); enables progress streaming
                 pending_task_private[task_id] = chat_is_private  # audience, not sender: gates the step text
                 # Observability: one inbound accepted-message event. Source the
@@ -1150,6 +1191,12 @@ def main():  # pragma: no cover
             poll_progress(pending_replies)
         except Exception as e:
             print(f"[Telegram] poll_progress error: {e}", flush=True)
+
+        # Silent-core fix: announce recovery to any chat owed one once the core
+        # is healthy again. Degraded notices ride intake; recovery can't (no
+        # message need arrive when the core returns), so it runs each tick
+        # (getUpdates long-poll paces this loop at ~10s).
+        _core_notice_sweep(set())
 
         # Check for results to send back (includes any orphaned-by-restart
         # routing recovered from the task files themselves — see
