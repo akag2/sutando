@@ -17,7 +17,7 @@ So this tool never accepts a list. It reads `held_item_ids` from the state file
 and applies explicit add/remove operations:
 
   idle-held.py --state <ws>/state/idle-streak.json --remove cinny-717 --reason merged
-  idle-held.py --state ... --add ds-pr-13:owner
+  idle-held.py --state ... --add ds-pr-13:owner --note owner/repo#13
   idle-held.py --state ... --remove X --reason "..." --write | idle-surface-hash.py --state ... --commit
 
 A removal REQUIRES a reason, because a silent shrink is the failure that
