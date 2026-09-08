@@ -26,8 +26,15 @@ UNPROCESSED=""
 shopt -s nullglob 2>/dev/null
 for f in "$TASKS_DIR"/*.txt; do
   BASENAME=$(basename "$f")
-  # Skip if result already exists
-  [ -f "$RESULTS_DIR/$BASENAME" ] && continue
+  # A result must carry something. An empty (or whitespace-only) file satisfied the
+  # existence check while delivering silence, which is the failure this hook exists to catch.
+  if [ -f "$RESULTS_DIR/$BASENAME" ]; then
+    if [ -n "$(tr -d '[:space:]' < "$RESULTS_DIR/$BASENAME" 2>/dev/null)" ]; then continue; fi
+    UNPROCESSED+="--- $BASENAME (result file is EMPTY — it delivers nothing; write a real reply) ---
+
+"
+    continue
+  fi
   UNPROCESSED+="--- $BASENAME ---
 $(cat "$f")
 

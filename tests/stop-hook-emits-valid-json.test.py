@@ -71,6 +71,16 @@ def main() -> None:
         for label, needle in (("quotes", '"quotes"'), ("backslash", "\\"), ("newline", "\n")):
             assert needle in ctx, f"task body lost its {label}"
 
+        # An empty result satisfied the old existence check while delivering silence.
+        # `[no-send]` must keep passing: it is deliberate protocol, not an absent reply.
+        for body, should_block in (("", True), ("  \n\t\n", True),
+                                   ("[no-send]\n", False), ("a real answer\n", False)):
+            (ws / "results" / "task-1.txt").write_text(body)
+            blocked = json.loads(_run(ws)) != {}
+            assert blocked is should_block, (
+                f"result {body!r}: blocked={blocked}, expected {should_block}"
+            )
+
     print("stop-hook-emits-valid-json: PASS")
 
 
