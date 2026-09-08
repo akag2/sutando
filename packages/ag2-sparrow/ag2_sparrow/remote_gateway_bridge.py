@@ -3404,6 +3404,12 @@ def _maybe_core_state_notices(inflight: set[str]) -> None:
         # POSTed to. Intake rooms above are already shape-filtered.
         sweep_core_state_notices(
             _STATE, rooms, _core_notice_send, log=_log,
+            # Instance-suffix the ledger like every other gateway state file
+            # (gateway-status{_INST_SUFFIX}.json, remote-task-inflight…): a
+            # named instance (e.g. dev) sharing this workspace/state dir with the
+            # default instance would otherwise collide on one notice ledger and
+            # cross-suppress each other's cooldowns (silent-core follow-up).
+            ledger_name=f"core-state-notice{_INST_SUFFIX}.json",
             recovery_target_ok=lambda r: bool(_MATRIX_ROOM_RE.match(r)))
     except urllib.error.HTTPError:
         raise
