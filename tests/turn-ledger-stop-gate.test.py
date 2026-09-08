@@ -644,23 +644,32 @@ def test_one_reminder_per_turn_not_a_standing_refusal() -> None:
 def test_ended_on_a_message_versus_sent_then_went_quiet() -> None:
     """The distinction the owner corrected me on twice.
 
-    "A message was sent this turn" is not "the turn ended on a message". A turn
-    that replies, works for ten minutes, then stops silently satisfies the first
-    and violates the second — and it is the case I kept committing.
+    Each case gets its own workspace. A successful `stop_gate` advances the
+    boundary past the send, so reusing one would leave the second case with
+    nothing after the boundary — it would then be reminded for "nothing sent"
+    and pass without ever exercising the elapsed-time rule.
     """
     with tempfile.TemporaryDirectory() as tmp:
         ws = _workspace(tmp)
-        turn_ledger.stop_gate(ws)
-
+        turn_ledger.stop_gate(ws)                     # boundary
         turn_ledger.begin_turn(ws)
         turn_ledger.record_send("room", "!r:example.org", workspace=ws)
         check("a message just sent ends the turn cleanly",
               turn_ledger.stop_gate(ws) is None, "")
 
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = _workspace(tmp)
+        turn_ledger.stop_gate(ws)                     # boundary
+        turn_ledger.begin_turn(ws)
+        turn_ledger.record_send("room", "!r:example.org", workspace=ws)
         original = turn_ledger.ENDED_ON_A_MESSAGE_S
         try:
-            turn_ledger.ENDED_ON_A_MESSAGE_S = 0.001   # the send is now "long ago"
-            turn_ledger.begin_turn(ws)
+            turn_ledger.ENDED_ON_A_MESSAGE_S = 0.0    # the send is now "long ago"
+            # The send is still AFTER the boundary, so this measures the elapsed
+            # rule rather than an empty window.
+            assert turn_ledger.delivery_after(turn_ledger.last_stop_ts(ws), ws) is not None, (
+                "setup wrong: nothing after the boundary, so the rule is untested"
+            )
             check("a turn that sent early then went quiet IS reminded",
                   turn_ledger.stop_gate(ws) is not None,
                   "this is the case the previous design could not see")
