@@ -37,6 +37,10 @@ import time
 from pathlib import Path
 
 CORE_SUPERVISOR_FILE = "core-supervisor.json"
+# The gateway's ledger filename (unchanged). Every bridge sharing a workspace
+# writes its OWN ledger — discord/slack/telegram pass a distinct `ledger_name`
+# so concurrent writers never collide on one file and one surface's cooldown
+# can't suppress another's notice. Room-id namespaces differ per surface too.
 LEDGER_FILE = "core-state-notice.json"
 
 _FIELD_MAX = 200  # supervisor fields are another process's output — bound them
@@ -69,18 +73,20 @@ _STATE_TO_REASON = {
     "hung": "hung",
 }
 
+# The gateway's original suffix; other surfaces (discord/slack/telegram) pass
+# their own via the `suffix` arg so the notice names the right transport.
 _NOTICE_SUFFIX = " _(automated notice from the agent's gateway)_"
 
 
-def _degraded_body(reason_key: str) -> str:
+def _degraded_body(reason_key: str, suffix: str = _NOTICE_SUFFIX) -> str:
     return (f"⚠️ I received your message, but I can't work on it right now: "
             f"{_REASONS[reason_key]}. It's queued and I'll pick it up as soon "
-            f"as I'm back.{_NOTICE_SUFFIX}")
+            f"as I'm back.{suffix}")
 
 
-def _recovery_body() -> str:
+def _recovery_body(suffix: str = _NOTICE_SUFFIX) -> str:
     return ("✅ I'm back online — working through the messages that arrived "
-            f"while I was unavailable.{_NOTICE_SUFFIX}")
+            f"while I was unavailable.{suffix}")
 
 
 def _bounded_str(v) -> str | None:
@@ -147,7 +153,7 @@ def _enabled() -> bool:
     return (os.environ.get("SPARROW_CORE_NOTICE") or "1").strip() != "0"
 
 
-def _load_ledger(state_dir: Path) -> dict:
+def _load_ledger(state_dir: Path, ledger_name: str = LEDGER_FILE) -> dict:
     """Two separated concerns (review 2026-09-07, should-fix #1):
 
     ``active``    room → reason: a degraded notice was DELIVERED and its
@@ -161,7 +167,7 @@ def _load_ledger(state_dir: Path) -> dict:
     flap cleared the cooldown with the recovery, re-noticing immediately. A v1
     (or corrupt) file resets to empty: worst case one duplicate notice."""
     try:
-        data = json.loads((Path(state_dir) / LEDGER_FILE).read_text())
+        data = json.loads((Path(state_dir) / ledger_name).read_text())
         if isinstance(data, dict) and data.get("schema_version") == 2:
             active = data.get("active")
             last_sent = data.get("last_sent")
@@ -182,7 +188,8 @@ def _load_ledger(state_dir: Path) -> dict:
     return {"active": {}, "last_sent": {}}
 
 
-def _save_ledger(state_dir: Path, ledger: dict, now: float) -> None:
+def _save_ledger(state_dir: Path, ledger: dict, now: float,
+                 ledger_name: str = LEDGER_FILE) -> None:
     """Atomic, best-effort. A lost ledger's worst case is one duplicate notice
     per room after a restart — strictly better than a lost notice. Cooldown
     history past its window is dead weight — prune it here so the file stays
@@ -193,7 +200,7 @@ def _save_ledger(state_dir: Path, ledger: dict, now: float) -> None:
         if (kept := {k: ts for k, ts in per_reason.items()
                      if now - ts < cooldown})
     }
-    path = Path(state_dir) / LEDGER_FILE
+    path = Path(state_dir) / ledger_name
     tmp = path.with_suffix(f".json.{os.getpid()}.tmp")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -203,55 +210,93 @@ def _save_ledger(state_dir: Path, ledger: dict, now: float) -> None:
         tmp.unlink(missing_ok=True)
 
 
-def sweep_core_state_notices(state_dir: Path, rooms, send, log=None,
-                             now: float | None = None) -> None:
-    """One pass: notice degraded, announce recovery, persist the ledger.
+class NoticePlan:
+    """What a sweep WOULD send this pass, decided but not yet sent — so a caller
+    that sends synchronously (gateway) and one that sends with ``await``
+    (discord/slack/telegram) can share the exact ledger + cooldown logic.
 
-    ``rooms``: room ids that currently hold a queued-but-unanswered task (the
-    caller filters to valid, sendable destinations). ``send(room, body) → bool``
-    posts one room message; False = not delivered, so no ledger entry is
-    written and the next sweep retries — a failed send must never burn the
-    room's one notice. Exceptions from ``send`` propagate (the caller owns
-    auth/transport policy).
+    ``kind`` ∈ {"degraded", "recovery"}; ``items`` is a list of (room, body)
+    to attempt. The caller sends each, collects the rooms that SUCCEEDED, and
+    passes them back to :meth:`commit` — so a failed send burns nothing and the
+    next pass retries. Nothing is persisted until commit.
+    """
 
-    Spam bound: per room, at most one degraded notice per reason per cooldown
-    window, and at most one recovery per DELIVERED notice — so no sequence of
-    state changes (including flapping between degraded reasons, or between
-    degraded and healthy) can exceed notices ≤ |reasons| + recoveries per
-    window per room.
+    __slots__ = ("kind", "reason", "items", "_ledger", "_now",
+                 "_state_dir", "_ledger_name")
+
+    def __init__(self, kind, reason, items, ledger, now, state_dir, ledger_name):
+        self.kind, self.reason, self.items = kind, reason, items
+        self._ledger, self._now = ledger, now
+        self._state_dir, self._ledger_name = state_dir, ledger_name
+
+    def commit(self, sent_rooms) -> None:
+        sent = set(sent_rooms)
+        if not sent and self.kind == "degraded":
+            return  # nothing delivered → nothing to persist (recovery still prunes)
+        if self.kind == "degraded":
+            for room in sent:
+                self._ledger["last_sent"].setdefault(room, {})[self.reason] = self._now
+                self._ledger["active"][room] = self.reason
+        else:  # recovery: the owed notice is discharged only once delivered
+            for room in sent:
+                self._ledger["active"].pop(room, None)
+        _save_ledger(self._state_dir, self._ledger, self._now, self._ledger_name)
+
+
+def plan_notices(state_dir, rooms, now=None,
+                 ledger_name: str = LEDGER_FILE) -> "NoticePlan | None":
+    """Read core state + ledger and decide what to send — WITHOUT sending.
+
+    Returns None when there is nothing to do (feature disabled, no verdict, an
+    unrecognized state, cooldown covers every room, or no recovery owed). The
+    same spam bound holds regardless of caller: per room, ≤ one degraded notice
+    per reason per cooldown window, and ≤ one recovery per DELIVERED notice.
     """
     if not _enabled():
-        return
+        return None
     verdict = read_core_state(state_dir, now)
     if verdict is None:
-        return  # no evidence either way — neither notice nor recovery
+        return None  # no evidence either way — neither notice nor recovery
     now = now if now is not None else time.time()
     state, kind = verdict
     reason = degraded_reason(state, kind)
-    ledger = _load_ledger(state_dir)
+    ledger = _load_ledger(state_dir, ledger_name)
     if reason is not None:
         cooldown = _cooldown_s()
-        dirty = False
-        for room in sorted(set(rooms)):
-            last = ledger["last_sent"].get(room, {}).get(reason)
-            if last is not None and now - last < cooldown:
-                continue  # this room already knows about this failure mode
-            if send(room, _degraded_body(reason)):
-                ledger["last_sent"].setdefault(room, {})[reason] = now
-                ledger["active"][room] = reason
-                dirty = True
-                if log:
-                    log(f"core-state notice ({reason}) sent to {room}")
-        if dirty:
-            _save_ledger(state_dir, ledger, now)
-        return
+        items = [(room, _degraded_body(reason))
+                 for room in sorted(set(rooms))
+                 if not (0 <= now - (ledger["last_sent"].get(room, {})
+                                     .get(reason, -cooldown - 1)) < cooldown)]
+        return NoticePlan("degraded", reason, items, ledger, now,
+                          state_dir, ledger_name)
     if state not in _HEALTHY_STATES:
-        return  # unrecognized state — not proof of recovery
+        return None  # unrecognized state — not proof of recovery
     if not ledger["active"]:
+        return None
+    items = [(room, _recovery_body()) for room in sorted(ledger["active"])]
+    return NoticePlan("recovery", None, items, ledger, now,
+                      state_dir, ledger_name)
+
+
+def sweep_core_state_notices(state_dir: Path, rooms, send, log=None,
+                             now: float | None = None) -> None:
+    """One synchronous pass: notice degraded, announce recovery, persist.
+
+    Thin wrapper over :func:`plan_notices` for a caller with a synchronous
+    ``send(room, body) → bool`` (the gateway bridge). ``send`` returning False
+    means not delivered, so no ledger entry is written and the next pass
+    retries; exceptions from ``send`` propagate (the caller owns auth/transport
+    policy). Async callers use ``plan_notices`` + ``NoticePlan.commit`` instead.
+    """
+    plan = plan_notices(state_dir, rooms, now)
+    if plan is None:
         return
-    for room in sorted(ledger["active"]):
-        if send(room, _recovery_body()):
-            del ledger["active"][room]
+    verb = "notice" if plan.kind == "degraded" else "recovery notice"
+    sent = []
+    for room, body in plan.items:
+        if send(room, body):
+            sent.append(room)
             if log:
-                log(f"core-state recovery notice sent to {room}")
-    _save_ledger(state_dir, ledger, now)
+                extra = f" ({plan.reason})" if plan.kind == "degraded" else ""
+                log(f"core-state {verb}{extra} sent to {room}")
+    plan.commit(sent)

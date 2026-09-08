@@ -244,6 +244,55 @@ def test_read_core_state_bounds_and_shapes():
         assert csn.degraded_reason("blocked-known", None) is None
 
 
+def test_plan_commit_seam_for_async_callers():
+    # The plan/commit split lets an await-based caller (discord/slack/telegram)
+    # reuse the exact ledger + cooldown logic: plan → send each item however
+    # you like → commit only the rooms that succeeded.
+    with tempfile.TemporaryDirectory() as d:
+        tmp = pathlib.Path(d)
+        _write_state(tmp, "logged-out")
+        now = time.time()
+        plan = csn.plan_notices(tmp, {"!a:s", "!b:s"}, now=now)
+        assert plan.kind == "degraded" and plan.reason == "logged-out"
+        assert {r for r, _ in plan.items} == {"!a:s", "!b:s"}
+        # simulate: !a delivered, !b failed → only !a is committed
+        plan.commit(["!a:s"])
+        # !a is now inside cooldown (no re-plan), !b is not (retry available)
+        p2 = csn.plan_notices(tmp, {"!a:s", "!b:s"}, now=now + 1)
+        assert {r for r, _ in p2.items} == {"!b:s"}
+        p2.commit(["!b:s"])
+        # recovery is owed to BOTH delivered rooms once healthy
+        _write_state(tmp, "idle-ready")
+        rec = csn.plan_notices(tmp, set(), now=now + 2)
+        assert rec.kind == "recovery" and {r for r, _ in rec.items} == {"!a:s", "!b:s"}
+        rec.commit(["!a:s", "!b:s"])
+        assert csn.plan_notices(tmp, set(), now=now + 3) is None
+
+
+def test_ledger_name_isolates_surfaces():
+    # Two bridges share a state dir; each MUST use its own ledger file or they
+    # corrupt each other and one surface's cooldown suppresses the other's.
+    with tempfile.TemporaryDirectory() as d:
+        tmp = pathlib.Path(d)
+        _write_state(tmp, "crashed")
+        now = time.time()
+        # discord notices its room and commits to its own ledger
+        pd = csn.plan_notices(tmp, {"123"}, now=now, ledger_name="nd.json")
+        pd.commit(["123"])
+        # slack, same room-id string, DIFFERENT ledger → not suppressed
+        ps = csn.plan_notices(tmp, {"123"}, now=now + 1, ledger_name="ns.json")
+        assert {r for r, _ in ps.items} == {"123"}
+        # two distinct files exist; the gateway's default ledger is untouched
+        assert (tmp / "nd.json").exists() and not (tmp / "ns.json").exists()
+        assert not (tmp / csn.LEDGER_FILE).exists()
+
+
+def test_suffix_names_the_surface():
+    assert "gateway" in csn._degraded_body("crashed")
+    assert csn._degraded_body("crashed", suffix=" _(x)_").endswith(" _(x)_")
+    assert csn._recovery_body(suffix=" _(x)_").endswith(" _(x)_")
+
+
 if __name__ == "__main__":
     test_no_supervisor_file_does_nothing()
     test_degraded_notices_once_per_room_with_cooldown()
@@ -258,4 +307,7 @@ if __name__ == "__main__":
     test_kill_switch_env_disables_everything()
     test_bodies_are_fixed_strings_never_file_content()
     test_read_core_state_bounds_and_shapes()
+    test_plan_commit_seam_for_async_callers()
+    test_ledger_name_isolates_surfaces()
+    test_suffix_names_the_surface()
     print("ALL PASS")
