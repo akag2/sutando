@@ -10994,8 +10994,16 @@ def check_claude_hook_registration(
             bits.append(f"{len(foreign)} registered but NOT running the installer's command "
                         f"— a different program, another checkout, or the path is "
                         f"only an argument ({', '.join(foreign)})")
+        # The bare installer registers the opt-in-only transcript archiver, so the remedy
+        # must not prescribe it when that hook is the only thing missing.
+        only_archive = bool(missing) and set(missing) == {_TRANSCRIPT_ARCHIVE_HOOK} and not foreign
+        remedy = ("that hook copies full transcripts to ~/Desktop and is left to explicit opt-in — "
+                  "it is not repaired automatically; run `bash src/install-claude-hooks.sh` only if "
+                  "you intend to enable it"
+                  if only_archive else
+                  "re-run `SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1 bash src/install-claude-hooks.sh`")
         result = {"name": name, "status": "warn",
-                  "detail": f"{'; '.join(bits)} in {settings} — re-run `bash src/install-claude-hooks.sh`"}
+                  "detail": f"{'; '.join(bits)} in {settings} — {remedy}"}
         if missing:
             # Keyed structurally so --fix cannot fire on the warn branches the
             # installer can't repair; `foreign` excluded (displacement unverified).
