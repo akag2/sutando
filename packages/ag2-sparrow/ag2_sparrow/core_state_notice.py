@@ -22,8 +22,8 @@ This module closes that gap without touching delivery semantics:
     tiers (guest/team), so file content is never forwarded.
 
 Fail-quiet by design: no supervisor file (standalone ag2-sparrow installs), a
-malformed file, a stale file (watcher dead — its verdict is no longer
-evidence), or an unrecognized state each mean "do nothing", never a guess.
+malformed file, or an unrecognized state each mean "do nothing", never a
+guess. There is deliberately no mtime-staleness gate — see read_core_state.
 Flap-bounded: cooldown history survives recovery (see _load_ledger), so no
 sequence of state changes — degraded reasons alternating, or degraded/healthy
 flapping — can exceed one notice per (room, reason) plus one recovery per
@@ -38,10 +38,6 @@ from pathlib import Path
 
 CORE_SUPERVISOR_FILE = "core-supervisor.json"
 LEDGER_FILE = "core-state-notice.json"
-
-# Past this age the watcher itself is presumed dead and the file is history,
-# not state — acting on it could notice a healthy core or vouch for a dead one.
-STALE_STATE_S = 15 * 60
 
 _FIELD_MAX = 200  # supervisor fields are another process's output — bound them
 
@@ -97,15 +93,23 @@ def _bounded_str(v) -> str | None:
 def read_core_state(state_dir: Path, now: float | None = None):
     """``core-supervisor.json`` → (state, kind) or None.
 
-    None means "no verdict": file absent (standalone install), unreadable,
-    malformed, or stale. MUST NOT raise — this runs inside the poll loop and a
-    broken side-channel must never become a delivery blocker (same contract as
-    the heartbeat's core-status read).
+    None means "no verdict": file absent (standalone install), unreadable, or
+    malformed. MUST NOT raise — this runs inside the poll loop and a broken
+    side-channel must never become a delivery blocker (same contract as the
+    heartbeat's core-status read).
+
+    Deliberately NO mtime-staleness gate (live finding 2026-09-08): the
+    watcher writes ONLY on state change (core-input-watch's `sig != last_sig`
+    guard), so a stable state — including a multi-hour usage-limit outage, or
+    a week-long weekly-limit one — leaves the mtime arbitrarily old while the
+    content is perfectly current. An earlier 15-minute bound here therefore
+    reintroduced the original silent-drop for any outage longer than the
+    bound. The orphaned-file risk the bound guarded against (watcher dead,
+    last state degraded) is bounded instead by the per-(room, reason)
+    cooldown, and the watcher is supervisor-managed on real installs.
     """
     path = Path(state_dir) / CORE_SUPERVISOR_FILE
     try:
-        if (now or time.time()) - path.stat().st_mtime > STALE_STATE_S:
-            return None
         with open(path) as f:
             data = json.load(f)
         if not isinstance(data, dict):

@@ -62,10 +62,9 @@ def test_degraded_notices_once_per_room_with_cooldown():
         csn.sweep_core_state_notices(tmp, {"!a:s", "!c:s"}, s, now=now + 61)
         assert [r for r, _ in s.sent].count("!c:s") == 1
         # past the cooldown the same room re-notices (long outage: one
-        # reminder per window, not one per message). The watcher rewrites the
-        # file every tick in production; mirror that or it goes stale first.
+        # reminder per window, not one per message) — with the file untouched
+        # since the outage began, as a write-on-change watcher leaves it
         later = now + csn._cooldown_s() + 1
-        _write_state(tmp, "blocked-human", kind="session-limit", mtime=later)
         csn.sweep_core_state_notices(tmp, {"!a:s"}, s, now=later)
         assert [r for r, _ in s.sent].count("!a:s") == 2
 
@@ -158,14 +157,26 @@ def test_v1_ledger_resets_cleanly():
         assert json.loads((tmp / csn.LEDGER_FILE).read_text())["schema_version"] == 2
 
 
+def test_old_mtime_is_still_a_verdict():
+    # The watcher writes only on CHANGE (core-input-watch `sig != last_sig`),
+    # so a multi-hour outage leaves an old mtime on perfectly current content.
+    # An mtime-staleness gate here silently dropped notices for any outage
+    # longer than the bound (live finding 2026-09-08) — age must not matter.
+    with tempfile.TemporaryDirectory() as d:
+        tmp = pathlib.Path(d)
+        s = _Sender()
+        now = time.time()
+        _write_state(tmp, "blocked-human", kind="session-limit",
+                     mtime=now - 6 * 3600)
+        csn.sweep_core_state_notices(tmp, {"!a:s"}, s, now=now)
+        assert len(s.sent) == 1 and "usage limit" in s.sent[0][1]
+
+
 def test_no_verdict_inputs_do_nothing():
     with tempfile.TemporaryDirectory() as d:
         tmp = pathlib.Path(d)
         s = _Sender()
         now = time.time()
-        # stale file: the watcher is dead — its verdict is history, not state
-        _write_state(tmp, "crashed", mtime=now - csn.STALE_STATE_S - 1)
-        csn.sweep_core_state_notices(tmp, {"!a:s"}, s, now=now)
         # unrecognized state: neither a notice nor proof of recovery
         _write_state(tmp, "gateway-down")
         csn.sweep_core_state_notices(tmp, {"!a:s"}, s, now=now)
@@ -241,6 +252,7 @@ if __name__ == "__main__":
     test_recovery_announced_once_and_flap_stays_bounded()
     test_alternating_reasons_bounded_per_reason()
     test_v1_ledger_resets_cleanly()
+    test_old_mtime_is_still_a_verdict()
     test_no_verdict_inputs_do_nothing()
     test_unrecognized_state_does_not_fake_recovery()
     test_kill_switch_env_disables_everything()
