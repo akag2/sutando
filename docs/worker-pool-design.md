@@ -1587,14 +1587,45 @@ itself to a room whose worker might still come back.
    needs a second command. `probation` is never the last word.
 
    **Retirement is ONE rename, because the allowance is a FAMILY of names and `rmtree` is not
-   one act.** The sweep ends probation with `rename(<instance>.admit, <instance>.admit.retired)`
-   and removes the tombstone afterwards; a tombstone left by a crash is inert, and removing it is
-   idempotent. Removing children first is what must not happen: unlinking `spent` and the phase
+   one act.** The sweep ends probation with
+   `rename(<instance>.admit, <instance>.admit.retired.<verdict>)`.
+   Removing children first is what must not happen: unlinking `spent` and the phase
    records leaves the root standing holding no name, and that is precisely the state recovery is
    required to read as unfinished issuance — so the next sweep finishes it, minting a fresh
    allowance beside a task that has already completed. The single rename flips the worker's gate
    (does the directory exist?) and both of recovery's names (`token`, `spent`) at the same instant,
    which is the property the two-question split depends on.
+
+   **That rename is atomic over the FAMILY, and not over retirement.** The probation entry and the
+   verdict scalar live in the pool-status record — a different object, with its own write — so
+   retirement is TWO durable writes and has a seam whichever order they take. Neither order is safe
+   on its own, and the two fail in opposite directions:
+
+   | crash lands | the shape left on disk | what reads it wrong |
+   |---|---|---|
+   | after the record write, before the rename | probation gone, verdict set, the allowance directory still STANDING | the gate is on, and every clock that could end it retired with the entry — terminal `probation` |
+   | after the rename, before the record write | probation present, `token` and `spent` both absent from the live path | recovery's two names say unfinished issuance, so the next sweep mints a fresh allowance inside the retired instance |
+
+   **So retirement commits at the rename, and the tombstone carries the verdict.** The order is
+   fixed: **(R1)** `rename(<instance>.admit, <instance>.admit.retired.<verdict>)`, **(R2)** drop
+   `probation.<instance>` and set the verdict scalar, **(R3)** unlink the tombstone. R1 is the
+   commit point; R2 is a *replay* of a decision already durable, which is what makes it idempotent
+   and what lets it run with no clock of its own — the clock that decided the verdict is exactly
+   what retirement consumed. A bare `.retired` marker could not carry that: `eligible` and `wedged`
+   differ only in the verdict, and after R1 nothing else on disk still distinguishes them.
+
+   **Recovery therefore asks a THIRD question, before the other two.** A committed retirement and an
+   unfinished issuance are indistinguishable by `token` and `spent` alone — the rename took both
+   names with it — so the sweep stats the tombstone first. A tombstone present means retirement is
+   committed and terminal: replay R2, unlink, mint nothing. That is what makes a tombstone inert. It
+   is not inert on its own, and this rule replaces the earlier claim that it was.
+
+   **A worker between consumption and claim retires the same way.** Its `spent`, its journal and its
+   phase directories all move with the family in R1, so its promotion rename finds no parent and
+   `ENOENT` there means retired-under-me: it stops, and re-creates nothing. It cannot re-consume
+   either — `spent` went with the family, but so did the `token`. No path out of that state issues a
+   second admission, which is what holds the at-most-once floor across a retirement that races a
+   live worker.
 
    The journal clock deliberately does NOT require the journal to be unclaimed: between (2) and (3)
    the journal is the only durable timestamp that exists, so qualifying it on `unclaimed` would leave
@@ -1618,6 +1649,8 @@ itself to a room whose worker might still come back.
    crash after publish, before token   next sweep re-issues the token; worker admits 1
    crash after mkdir, worker gated     no token exists to consume; the sweep finishes issuance once
    worker never reaches its gate      window from `since` elapses -> wedged, allowance removed
+   crash between R1 and R2            the tombstone is recognised; R2 replays, nothing is minted
+   retirement races a live worker     family moves under it; promotion ENOENTs, no second admission
    claimed, unfinished past window    window from claimed/<task_id> elapses -> wedged
    ```
 

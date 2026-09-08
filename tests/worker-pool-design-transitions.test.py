@@ -45,6 +45,7 @@ class Disk:
         self.admit_dir = False        # <instance>.admit/ exists -- may hold NO file yet
         self.spent = False            # created BEFORE the token leaves; never moves
 
+        self.tombstone = None         # <instance>.admit.retired.<verdict>: verdict rides the name
         self.phase_dirs = set()       # which of held/ claimed/ EXIST -- a rename needs its parent
 
         self.torn = False             # a promotion lands between two directory reads
@@ -60,7 +61,9 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
         dir_is_allowance=False, walk_recovery=False, single_phase_parent=False,
         nonatomic_teardown=False, spent_first_recovery=False, spent_is_mutex=False,
         consume_between_reads=False, contender_after_spent=False,
-        clear_spent_on_rollback=False, gate_lags_the_request=False):
+        clear_spent_on_rollback=False, gate_lags_the_request=False,
+        crash_retire_status=False, tombstone_recognition=True,
+        status_first_retirement=False):
     """Three separable pre-fix knobs, so a control isolates ONE defect at a time.
 
     `durable_gate=False`  -- no directory gate at all (the pre-#3860 reader).
@@ -84,11 +87,22 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
         contender was already past the gate.
     `gate_lags_the_request=True` -- the request does NOT gate, so a worker between the kick and
         the sweep reads stale as ordinary eligibility.
+
+    Retirement spans TWO durable records -- the allowance family and the pool-status entry --
+    so it has a seam of its own:
+
+    `crash_retire_status=True` -- crash between the root rename and the record write, the seam
+        the one-line teardown could not express.
+    `tombstone_recognition=False` -- recovery asks only `token` and `spent`, so a committed
+        retirement reads as unfinished issuance and it mints over the tombstone.
+    `status_first_retirement=True` -- the REJECTED order: the record write goes first, so a
+        crash leaves the allowance standing and gating with no probation entry left to end it.
     """
     d = Disk(); d.record["w"] = "wedged"; claimed = 0; fail = [claim_fails_once]; now = [0]
     crash_once = [mode == "crash_issuance"]
     crash_mkdir = [mode == "crash_mkdir"]
     crash_teardown = [nonatomic_teardown]
+    crash_retire = [crash_retire_status]
     interleave = [consume_between_reads]
     arm_contender = [contender_after_spent]
     paused_contender = [False]
@@ -157,8 +171,23 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
         if d.token: return d.token_at
         return None
 
+    def finish_retirement():
+        """(R2) the record write, then (R3) drop the tombstone.
+
+        A REPLAY, not a decision: the verdict is read back off the tombstone the rename already
+        committed, so running this once or five times lands the same record.
+        """
+        d.probation.pop("w", None); d.record["w"] = d.tombstone
+        d.tombstone = None                                            # (R3) idempotent
+
     def retire(state):
-        """End probation. ONE rename of the root, so no reader sees a half-removed family.
+        """End probation. TWO durable records, ONE commit point.
+
+        The allowance is a FAMILY of names and retires by a single rename (R1). The pool-status
+        probation entry and its verdict scalar are a SEPARATE object with a SEPARATE write (R2),
+        so retirement has a seam whatever order they take. R1 goes first and carries the verdict
+        in the tombstone name, which makes R2 a replay of a decision already durable -- and makes
+        a crash between them recoverable from disk alone.
 
         Unlinking children first leaves the root standing with no name inside it, which
         recovery reads as unfinished issuance and finishes -- after the task completed.
@@ -167,8 +196,25 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
             crash_teardown[0] = False
             d.spent = False; d.journal = None; d.claimed_rec = None   # children gone
             return                                                    # crash before the root
-        d.probation.pop("w", None); d.token = False; d.journal = None; d.claimed_rec = None
-        d.spent = False; d.admit_dir = False; d.phase_dirs.clear(); d.record["w"] = state
+
+        if status_first_retirement:
+            # REJECTED. The record goes first, so a crash strands a LIVE allowance directory
+            # gating a worker whose probation entry -- and with it every clock -- is gone.
+            d.probation.pop("w", None); d.record["w"] = state
+            if crash_retire[0]:
+                crash_retire[0] = False; return
+            d.token = False; d.journal = None; d.claimed_rec = None
+            d.spent = False; d.admit_dir = False; d.phase_dirs.clear()
+            return
+
+        # (R1) one rename of the root. The family becomes an inert tombstone NAMING the verdict;
+        # the worker's gate and both of recovery's names flip at that one instant.
+        d.tombstone = state
+        d.token = False; d.journal = None; d.claimed_rec = None
+        d.spent = False; d.admit_dir = False; d.phase_dirs.clear()
+        if crash_retire[0]:
+            crash_retire[0] = False; return                           # crash between R1 and R2
+        finish_retirement()
 
     def sweep():
         now[0] += 10; d.writers.add(("record", "sweep")); d.computed_at = now[0]
@@ -192,6 +238,10 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
         if d.request and "w" in d.probation:                  # crash after (b), before (c)
             d.request = False; return
         if "w" in d.probation:
+            # A committed retirement is INDISTINGUISHABLE from unfinished issuance by the two
+            # names alone -- the rename took both with it. Ask the third question first.
+            if d.tombstone is not None and tombstone_recognition:
+                finish_retirement(); return
             # `dir_is_allowance=True` is the pre-fix reading: EEXIST proves a mint, so an
             # empty directory is never finished and the verdict has no clock to end on.
             if not (walked() if walk_recovery else issued()) and not (dir_is_allowance and d.admit_dir):
@@ -794,6 +844,69 @@ class RetirementIsOneRenameNotAChildwiseRemoval(unittest.TestCase):
         verdict, _c, _p, d = run(["kick", "sweep", "worker", "wait", "sweep"])
         self.assertEqual(verdict, "wedged")
         self.assertFalse(d.token or d.spent or d.admit_dir)
+
+
+class RetirementSpansTwoRecordsAndCommitsAtTheRename(unittest.TestCase):
+    """The rename is atomic over the allowance FAMILY. It is not atomic with the pool-status
+    record, which is a separate object with a separate write -- so retirement has a seam
+    whichever order the two take, and the one-line teardown could not express either side.
+
+    The contract: R1 renames the root to a tombstone CARRYING the verdict, R2 replays that
+    verdict into the record, R3 drops the tombstone. Recovery asks whether a tombstone exists
+    BEFORE reading two absent names as unfinished issuance.
+    """
+
+    DONE = ["kick", "sweep", "worker", "finish", "sweep", "sweep"]
+    TIMEOUT = ["kick", "sweep", "worker", "wait", "sweep", "sweep"]
+
+    def test_crash_between_the_rename_and_the_record_mints_over_the_tombstone(self):
+        # THE DEFECT. Both names went with the family, so recovery reads a committed
+        # retirement as unfinished issuance and mints beside the completed admission.
+        v, _c, _p, d = run(self.DONE, crash_retire_status=True, tombstone_recognition=False)
+        self.assertTrue(d.token, "a fresh allowance was minted inside a retired instance")
+        self.assertTrue(d.admit_dir, "the retired root was re-created")
+        self.assertEqual(v, "probation", "probation reopened after retirement committed")
+
+    def test_tombstone_recognition_finishes_the_retirement_instead(self):
+        v, _c, _p, d = run(self.DONE, crash_retire_status=True)
+        self.assertEqual(v, "eligible")
+        self.assertFalse(d.token or d.spent or d.admit_dir, "nothing was minted")
+        self.assertIsNone(d.tombstone, "the tombstone was dropped once the record landed")
+        self.assertNotIn("w", d.probation, "the probation entry retired with it")
+
+    def test_the_tombstone_carries_the_verdict_so_the_replay_cannot_invent_one(self):
+        # The two exits differ ONLY in the verdict, and the clock that decided it is exactly
+        # what retirement consumed. A bare marker could not tell the recovery which to write.
+        done, _c, _p, dd = run(self.DONE, crash_retire_status=True)
+        timeout, _c2, _p2, dt = run(self.TIMEOUT, crash_retire_status=True)
+        self.assertEqual((done, timeout), ("eligible", "wedged"))
+        self.assertIsNone(dd.tombstone); self.assertIsNone(dt.tombstone)
+
+    def test_status_first_strands_a_gating_allowance_with_no_record_to_end_it(self):
+        # The REJECTED order. The gate is on, the probation entry is gone, and every clock
+        # went with it -- so nothing left on disk can ever turn the gate off.
+        v, _c, _p, d = run(self.DONE, status_first_retirement=True, crash_retire_status=True)
+        self.assertTrue(d.admit_dir, "the allowance directory outlived its record")
+        self.assertNotIn("w", d.probation, "the probation entry is already gone")
+        self.assertEqual(v, "probation", "gated forever: terminal probation")
+
+    def test_retirement_racing_a_worker_between_consumption_and_claim(self):
+        # Consumed, not promoted: the family moves out from under the worker, so its promotion
+        # has no parent and `spent` left with it -- it can neither finish nor re-consume.
+        order = ["kick", "sweep", "worker", "wait", "sweep", "worker", "sweep"]
+        v, _c, _p, d = run(order, mode="crash_between", crash_retire_status=True)
+        self.assertEqual(v, "wedged")
+        self.assertFalse(d.token, "the racing worker did not re-mint an allowance")
+        self.assertFalse(d.spent or d.admit_dir)
+        self.assertIsNone(d.claimed_rec, "no admission landed after retirement committed")
+        self.assertIsNone(d.tombstone)
+
+    def test_the_seam_does_not_change_the_outcome_once_recognised(self):
+        # Control: crash or no crash, the same schedule ends in the same record.
+        for order in (self.DONE, self.TIMEOUT):
+            clean, _c, _p, _d = run(order)
+            crashed, _c2, _p2, _d2 = run(order, crash_retire_status=True)
+            self.assertEqual(clean, crashed, f"the seam moved the outcome for {order}")
 
 
 class RecoverysTwoStatsAreOrderedNotInterchangeable(unittest.TestCase):
