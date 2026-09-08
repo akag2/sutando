@@ -665,8 +665,7 @@ def test_ended_on_a_message_versus_sent_then_went_quiet() -> None:
         original = turn_ledger.ENDED_ON_A_MESSAGE_S
         try:
             turn_ledger.ENDED_ON_A_MESSAGE_S = 0.0    # the send is now "long ago"
-            # The send is still AFTER the boundary, so this measures the elapsed
-            # rule rather than an empty window.
+            # Still after the boundary, so this measures the elapsed rule.
             assert turn_ledger.delivery_after(turn_ledger.last_stop_ts(ws), ws) is not None, (
                 "setup wrong: nothing after the boundary, so the rule is untested"
             )
