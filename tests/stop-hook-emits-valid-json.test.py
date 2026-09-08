@@ -27,22 +27,39 @@ Run: python3 tests/stop-hook-emits-valid-json.test.py
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import subprocess
+import sys
 import tempfile
 
 HOOK = pathlib.Path(__file__).resolve().parent.parent / "src" / "check-pending-tasks.sh"
 RESOLVE = 'WORKSPACE="$(bash "$REPO_DIR/scripts/sutando-config.sh" workspace 2>/dev/null)"'
+REPO_LINE = 'REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"'
+REPO = HOOK.resolve().parent.parent
+
+
+def _stub(ws: pathlib.Path) -> pathlib.Path:
+    """The hook, pinned to this repo and the given workspace.
+
+    REPO_DIR must be pinned too: run from a temp dir, `dirname $0/..` points
+    outside the repo, so `sutando-config.sh` is never found and the interpreter
+    cascade silently falls back to PATH — the test would then measure the
+    fallback rather than the contract.
+    """
+    src = HOOK.read_text()
+    assert RESOLVE in src and REPO_LINE in src, "hook layout moved; update this test"
+    src = src.replace(REPO_LINE, f'REPO_DIR="{REPO}"').replace(RESOLVE, f'WORKSPACE="{ws}"')
+    stub = ws / "hook.sh"
+    stub.write_text(src)
+    return stub
 
 BODY = 'a body with "quotes", a backslash \\ and\na second line\n'
 
 
 def _run(workspace: pathlib.Path) -> str:
     """Run the real hook against `workspace`, pinning its resolver to it."""
-    src = HOOK.read_text()
-    assert RESOLVE in src, "workspace resolution line moved; update this test"
-    stub = workspace / "hook.sh"
-    stub.write_text(src.replace(RESOLVE, f'WORKSPACE="{workspace}"'))
+    stub = _stub(workspace)
     out = subprocess.run(
         ["bash", str(stub)], capture_output=True, text=True, stdin=subprocess.DEVNULL
     )
@@ -71,7 +88,46 @@ def main() -> None:
         for label, needle in (("quotes", '"quotes"'), ("backslash", "\\"), ("newline", "\n")):
             assert needle in ctx, f"task body lost its {label}"
 
+    _test_broken_path_still_blocks()
     print("stop-hook-emits-valid-json: PASS")
+
+
+def _test_broken_path_still_blocks() -> None:
+    """A configured interpreter must win over a broken `python3` on PATH.
+
+    `scripts/python-binary.sh` resolves $SUTANDO_PY, then the bundled runtime,
+    then PATH — so an install with a configured Python must not be defeated by
+    whatever `python3` happens to resolve to. A bare `python3` in the hook
+    ignored that cascade and emitted nothing for a nonempty queue.
+
+    PATH is shadowed, not emptied: emptying removes `cat` and the config helper,
+    so the hook would fail for reasons unrelated to the contract under test.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = pathlib.Path(tmp)
+        (ws / "tasks").mkdir()
+        (ws / "results").mkdir()
+        (ws / "tasks" / "task-1.txt").write_text("id: task-1\ntask: answer me\n")
+
+        stub = _stub(ws)
+
+        shim = ws / "bin"
+        shim.mkdir()
+        broken = shim / "python3"
+        broken.write_text("#!/bin/sh\necho 'wrong interpreter' >&2\nexit 127\n")
+        broken.chmod(0o755)
+
+        env = dict(
+            os.environ,
+            PATH=f"{shim}:{os.environ.get('PATH', '')}",
+            SUTANDO_PY=sys.executable,
+        )
+        out = subprocess.run(["/bin/bash", str(stub)], capture_output=True, text=True,
+                             stdin=subprocess.DEVNULL, env=env)
+        assert out.returncode == 0, f"hook exited {out.returncode}: {out.stderr}"
+        assert json.loads(out.stdout)["decision"] == "block", (
+            f"a broken python3 on PATH defeated the configured interpreter: {out.stdout!r}"
+        )
 
 
 if __name__ == "__main__":
