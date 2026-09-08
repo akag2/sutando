@@ -107,6 +107,69 @@ def test_recovery_validates_and_purges_targets():
         assert active == {}, "both the recovered and the purged key are cleared"
 
 
+def test_partial_success_committed_before_exception():
+    # Review r4 #2: room A succeeds, room B raises → A's cooldown must be
+    # recorded (committed in finally) so it isn't re-noticed next sweep.
+    with tempfile.TemporaryDirectory() as d:
+        tmp = pathlib.Path(d)
+        now = time.time()
+        _write_state(tmp, "crashed")
+        _write_heartbeat(tmp, now)
+
+        def send(room, body):
+            if room == "!b:s":
+                raise RuntimeError("boom on B")
+            return True
+
+        for tick in range(3):
+            try:
+                csn.sweep_core_state_notices(tmp, {"!a:s", "!b:s"}, send,
+                                             now=now + tick)
+            except RuntimeError:
+                pass
+        # A must have been noticed exactly once despite B raising every tick.
+        active = json.loads((tmp / csn.LEDGER_FILE).read_text())["active"]
+        assert active.get("!a:s") == "crashed"
+
+
+def test_persistence_failure_keeps_process_local_cooldown():
+    # Review r4 #3: if the ledger can't be written, successful-send accounting
+    # survives in-process so we don't re-send every sweep.
+    import unittest.mock as mock
+    csn._MEM_LEDGERS.clear()
+    with tempfile.TemporaryDirectory() as d:
+        tmp = pathlib.Path(d)
+        now = time.time()
+        _write_state(tmp, "crashed")
+        _write_heartbeat(tmp, now)
+        s = _Sender()
+        with mock.patch.object(csn.os, "replace", side_effect=OSError("read-only")):
+            for tick in range(3):
+                csn.sweep_core_state_notices(tmp, {"!a:s"}, s, now=now + tick)
+        assert len(s.sent) == 1, "one notice despite the disk write failing every sweep"
+    csn._MEM_LEDGERS.clear()
+
+
+def test_numeric_guards():
+    # #10 cooldown + #9 heartbeat numeric validation.
+    import os as _os
+    with tempfile.TemporaryDirectory() as d:
+        tmp = pathlib.Path(d)
+        now = time.time()
+        for bad in ("nan", "0", "-1"):
+            _os.environ["SPARROW_CORE_NOTICE_COOLDOWN_S"] = bad
+            try:
+                assert csn._cooldown_s() == 1800.0, f"{bad} → default cooldown"
+            finally:
+                del _os.environ["SPARROW_CORE_NOTICE_COOLDOWN_S"]
+        # inf / future heartbeat must NOT read fresh
+        _write_state(tmp, "logged-out")
+        (tmp / csn.CORE_HEARTBEAT_FILE).write_text("1e999")  # -> inf
+        assert csn.read_core_state(tmp, now) is None
+        (tmp / csn.CORE_HEARTBEAT_FILE).write_text(str(int(now + 10_000)))  # far future
+        assert csn.read_core_state(tmp, now) is None
+
+
 def test_no_supervisor_file_does_nothing():
     with tempfile.TemporaryDirectory() as d:
         tmp = pathlib.Path(d)
@@ -367,6 +430,9 @@ if __name__ == "__main__":
     test_watcher_heartbeat_gates_freshness()
     test_invalid_heartbeat_is_no_verdict()
     test_recovery_validates_and_purges_targets()
+    test_partial_success_committed_before_exception()
+    test_persistence_failure_keeps_process_local_cooldown()
+    test_numeric_guards()
     test_no_supervisor_file_does_nothing()
     test_degraded_notices_once_per_room_with_cooldown()
     test_failed_send_burns_nothing_and_retries()

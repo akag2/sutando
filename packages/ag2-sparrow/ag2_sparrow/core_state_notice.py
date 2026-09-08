@@ -16,7 +16,9 @@ This module closes that gap without touching delivery semantics:
     (room, reason) per cooldown window, so a burst of messages during one
     outage produces one line, while a new failure mode re-notices.
   * When the core comes back, each noticed room gets one recovery line and its
-    ledger entry clears — the next outage starts clean.
+    recovery debt (``active``) clears. Its cooldown history (``last_sent``)
+    deliberately survives, so a fresh outage within the window won't re-notice
+    the same reason.
   * Notice bodies are built ONLY from fixed strings in this module. The
     supervisor file's ``prompt``/``detail`` carry core pane text; rooms span
     tiers (guest/team), so file content is never forwarded.
@@ -32,9 +34,25 @@ delivered notice per cooldown window.
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 from pathlib import Path
+
+# Cap notices sent per sweep so one pass can't run an unbounded sequence of slow
+# network requests inline on a bridge's hot path (review 2026-09-08 r4, #1).
+# Uncapped rooms simply carry to the next sweep — degraded ones re-plan (still
+# no cooldown), recovery ones stay in `active`.
+MAX_NOTICES_PER_SWEEP = 8
+# A recovery target that keeps failing to deliver is purged after this many
+# attempts, so a room the bot lost access to can't be retried forever (#6).
+MAX_RECOVERY_ATTEMPTS = 5
+
+# Process-local ledger overlay, keyed by (state_dir, ledger_name). Holds
+# successful-send accounting that could NOT be persisted to disk (#3), so a
+# transient ledger-write failure doesn't make this process re-send every sweep.
+# Cleared for a key once a disk write for it succeeds (disk is then canonical).
+_MEM_LEDGERS: dict = {}
 
 CORE_SUPERVISOR_FILE = "core-supervisor.json"
 # Written every tick by core-input-watch (str epoch seconds); its freshness is
@@ -42,9 +60,12 @@ CORE_SUPERVISOR_FILE = "core-supervisor.json"
 # can't serve this role.
 CORE_HEARTBEAT_FILE = "core-supervisor-heartbeat"
 # Older than this → the watcher is presumed dead, so its last state is history,
-# not evidence (silent-core review 2026-09-08, should-fix #1). Generous vs the
-# watcher's ~3s tick so a brief hiccup never reads as death.
+# not evidence. Generous vs the watcher's ~3s tick so a brief hiccup never reads
+# as death.
 WATCHER_STALE_S = 120
+# A heartbeat timestamped slightly ahead of us is fine (clock jitter); further
+# into the future is implausible and treated as invalid rather than fresh.
+_HEARTBEAT_FUTURE_SKEW_S = 5
 # The gateway's ledger filename (unchanged). Every bridge sharing a workspace
 # writes its OWN ledger — discord/slack/telegram pass a distinct `ledger_name`
 # so concurrent writers never collide on one file and one surface's cooldown
@@ -126,7 +147,15 @@ def _watcher_liveness(state_dir: Path, now: float) -> str:
         return "absent"
     except Exception:  # noqa: BLE001 — present but unreadable/garbled
         return "invalid"
-    return "fresh" if (now - ts) <= WATCHER_STALE_S else "stale"
+    # A non-finite ts (inf/nan from "1e999") or one implausibly in the future
+    # (a forged/rolled-back clock) would otherwise read "fresh" forever and
+    # trust a dead watcher's state indefinitely (review 2026-09-08 r4, #9).
+    if not math.isfinite(ts):
+        return "invalid"
+    age = now - ts
+    if age < -_HEARTBEAT_FUTURE_SKEW_S:
+        return "invalid"  # heartbeat from the future beyond tolerated skew
+    return "fresh" if age <= WATCHER_STALE_S else "stale"
 
 
 def read_core_state(state_dir: Path, now: float | None = None):
@@ -170,6 +199,17 @@ def read_core_state(state_dir: Path, now: float | None = None):
         return None
 
 
+def is_core_healthy(state_dir: Path) -> bool:
+    """A fresh re-read: True only when the core is CURRENTLY in a known-healthy
+    state. Used to abort a recovery batch the moment the supervisor flips back to
+    degraded (review 2026-09-08 r4, #5), so a stale "back online" isn't sent."""
+    verdict = read_core_state(state_dir)
+    if verdict is None:
+        return False  # no verdict (watcher dead / unknown) — don't send recovery
+    state, kind = verdict
+    return degraded_reason(state, kind) is None and state in _HEALTHY_STATES
+
+
 def degraded_reason(state: str, kind: str | None) -> str | None:
     """Supervisor state → reason key, or None when the core can serve tasks.
 
@@ -184,11 +224,23 @@ def degraded_reason(state: str, kind: str | None) -> str | None:
     return _STATE_TO_REASON.get(state)
 
 
+_DEFAULT_COOLDOWN_S = 1800.0
+
+
 def _cooldown_s() -> float:
+    """The per-(room, reason) cooldown. Only a FINITE POSITIVE value is honored
+    (review 2026-09-08 r4, #10): nan/0/negative would make every sweep eligible
+    (defeating the spam bound) and inf would mean a permanent cooldown — both are
+    treated as misconfiguration and fall back to the default. Turning notices
+    off is the separate, documented SPARROW_CORE_NOTICE=0 control."""
+    raw = os.environ.get("SPARROW_CORE_NOTICE_COOLDOWN_S")
+    if not raw:
+        return _DEFAULT_COOLDOWN_S
     try:
-        return float(os.environ.get("SPARROW_CORE_NOTICE_COOLDOWN_S") or 1800)
+        v = float(raw)
     except ValueError:
-        return 1800.0
+        return _DEFAULT_COOLDOWN_S
+    return v if (math.isfinite(v) and v > 0) else _DEFAULT_COOLDOWN_S
 
 
 def _enabled() -> bool:
@@ -207,14 +259,20 @@ def _load_ledger(state_dir: Path, ledger_name: str = LEDGER_FILE) -> dict:
     both bounds: alternating reasons (usage-limit ↔ logged-out) overwrote each
     other's cooldown and re-sent on every alternation, and a degraded/healthy
     flap cleared the cooldown with the recovery, re-noticing immediately. A v1
-    (or corrupt) file resets to empty: worst case one duplicate notice."""
+    (or corrupt) file resets to empty: worst case one duplicate notice.
+
+    Overlaid with any process-local accounting that failed to persist (#3), so
+    a transient ledger-write failure doesn't make this process re-send every
+    sweep. ``fail`` (room → failed-recovery attempts) bounds retries (#6)."""
+    disk = {"active": {}, "last_sent": {}, "fail": {}}
     try:
         data = json.loads((Path(state_dir) / ledger_name).read_text())
         if isinstance(data, dict) and data.get("schema_version") == 2:
             active = data.get("active")
             last_sent = data.get("last_sent")
+            fail = data.get("fail")
             if isinstance(active, dict) and isinstance(last_sent, dict):
-                return {
+                disk = {
                     "active": {str(r): str(v) for r, v in active.items()
                                if isinstance(v, str)},
                     "last_sent": {
@@ -222,45 +280,81 @@ def _load_ledger(state_dir: Path, ledger_name: str = LEDGER_FILE) -> dict:
                                  if isinstance(ts, (int, float))}
                         for r, v in last_sent.items() if isinstance(v, dict)
                     },
+                    "fail": {str(r): int(n) for r, n in fail.items()
+                             if isinstance(n, int)} if isinstance(fail, dict) else {},
                 }
     except FileNotFoundError:
         pass
     except Exception:  # noqa: BLE001 — a corrupt ledger resets, never wedges
         pass
-    return {"active": {}, "last_sent": {}}
+    return _overlay_mem(state_dir, ledger_name, disk)
+
+
+def _overlay_mem(state_dir: Path, ledger_name: str, disk: dict) -> dict:
+    """Merge the process-local overlay (unpersisted successful accounting) on top
+    of the disk ledger. Single writer per surface, so the overlay is never
+    staler than disk for keys it holds — it wins outright."""
+    mem = _MEM_LEDGERS.get((str(state_dir), ledger_name))
+    if not mem:
+        return disk
+    disk["active"].update(mem.get("active", {}))
+    for room, per_reason in mem.get("last_sent", {}).items():
+        dst = disk["last_sent"].setdefault(room, {})
+        for reason, ts in per_reason.items():
+            dst[reason] = max(dst.get(reason, ts), ts)
+    disk["fail"].update(mem.get("fail", {}))
+    return disk
 
 
 def _save_ledger(state_dir: Path, ledger: dict, now: float,
                  ledger_name: str = LEDGER_FILE) -> None:
-    """Atomic, best-effort. A lost ledger's worst case is one duplicate notice
-    per room after a restart — strictly better than a lost notice. Cooldown
-    history past its window is dead weight — prune it here so the file stays
-    bounded by the set of currently-chatty rooms."""
+    """Atomic. Cooldown history past its window is dead weight — prune it here so
+    the file stays bounded by the set of currently-chatty rooms.
+
+    On a write FAILURE the accounting is stashed in the process-local overlay
+    (#3) rather than silently lost, so a read-only/full disk can't make this
+    process re-send every sweep — the earlier "worst case one duplicate after
+    restart" comment was wrong for a persistent failure. On success the overlay
+    for this key is dropped (disk is canonical again)."""
     cooldown = _cooldown_s()
     ledger["last_sent"] = {
         room: kept for room, per_reason in ledger["last_sent"].items()
         if (kept := {k: ts for k, ts in per_reason.items()
                      if now - ts < cooldown})
     }
+    ledger.setdefault("fail", {})
+    key = (str(state_dir), ledger_name)
     path = Path(state_dir) / ledger_name
     tmp = path.with_suffix(f".json.{os.getpid()}.tmp")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp.write_text(json.dumps({"schema_version": 2, **ledger}))
         os.replace(tmp, path)
+        _MEM_LEDGERS.pop(key, None)  # persisted → disk is canonical
     except OSError:
-        tmp.unlink(missing_ok=True)
+        # Keep the accounting in-process so we don't re-send known-delivered
+        # notices next sweep. Bounded by the chatty-room set (pruned above).
+        _MEM_LEDGERS[key] = {"active": dict(ledger["active"]),
+                             "last_sent": {r: dict(v) for r, v
+                                           in ledger["last_sent"].items()},
+                             "fail": dict(ledger["fail"])}
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
 
 
 class NoticePlan:
     """What a sweep WOULD send this pass, decided but not yet sent — so a caller
-    that sends synchronously (gateway) and one that sends with ``await``
-    (discord/slack/telegram) can share the exact ledger + cooldown logic.
+    that sends synchronously (gateway, slack, telegram) and one that sends with
+    ``await`` (discord) can share the exact ledger + cooldown logic.
 
     ``kind`` ∈ {"degraded", "recovery"}; ``items`` is a list of (room, body)
     to attempt. The caller sends each, collects the rooms that SUCCEEDED, and
     passes them back to :meth:`commit` — so a failed send burns nothing and the
-    next pass retries. Nothing is persisted until commit.
+    next pass retries (bounded for recovery, see below). Nothing is persisted
+    until commit; call it even after a partial/aborted batch so completed sends
+    are recorded (review 2026-09-08 r4, #2).
     """
 
     __slots__ = ("kind", "reason", "items", "_ledger", "_now",
@@ -283,11 +377,23 @@ class NoticePlan:
             for room in sent:
                 self._ledger["last_sent"].setdefault(room, {})[self.reason] = self._now
                 self._ledger["active"][room] = self.reason
-        else:  # recovery: discharge delivered notices AND drop invalid targets
-            if not sent and not self._purge:
+        else:  # recovery: discharge delivered, purge invalid, bound retries
+            attempted = {room for room, _ in self.items}
+            failed = attempted - sent  # tried this pass but did not deliver
+            fail = self._ledger.setdefault("fail", {})
+            purge = set(self._purge)
+            for room in failed:
+                # A target that keeps refusing delivery (bot lost access, target
+                # gone) is retried a bounded number of times, then given up on —
+                # a recovery line is benign to drop (review 2026-09-08 r4, #6).
+                fail[room] = fail.get(room, 0) + 1
+                if fail[room] >= MAX_RECOVERY_ATTEMPTS:
+                    purge.add(room)
+            if not sent and not failed and not purge:
                 return
-            for room in sent | self._purge:
+            for room in sent | purge:
                 self._ledger["active"].pop(room, None)
+                fail.pop(room, None)
         _save_ledger(self._state_dir, self._ledger, self._now, self._ledger_name)
 
 
@@ -326,8 +432,9 @@ def plan_notices(state_dir, rooms, now=None, ledger_name: str = LEDGER_FILE,
                  for room in sorted(set(rooms))
                  if not (0 <= now - (ledger["last_sent"].get(room, {})
                                      .get(reason, -cooldown - 1)) < cooldown)]
-        return NoticePlan("degraded", reason, items, ledger, now,
-                          state_dir, ledger_name)
+        # Cap per sweep (#1) — the overflow re-plans next pass (still no cooldown).
+        return NoticePlan("degraded", reason, items[:MAX_NOTICES_PER_SWEEP],
+                          ledger, now, state_dir, ledger_name)
     if state not in _HEALTHY_STATES:
         return None  # unrecognized state — not proof of recovery
     if not ledger["active"]:
@@ -340,7 +447,9 @@ def plan_notices(state_dir, rooms, now=None, ledger_name: str = LEDGER_FILE,
         purge = set()
     if not active and not purge:
         return None
-    items = [(room, _recovery_body(suffix)) for room in active]
+    # Cap sends per sweep (#1); overflow stays in `active` for the next pass.
+    # Purges are cheap (no network) so they all apply this pass.
+    items = [(room, _recovery_body(suffix)) for room in active[:MAX_NOTICES_PER_SWEEP]]
     return NoticePlan("recovery", None, items, ledger, now,
                       state_dir, ledger_name, purge=purge)
 
@@ -356,11 +465,18 @@ def sweep_core_state_notices(state_dir: Path, rooms, send, log=None,
     ``send(room, body) → bool`` (the gateway bridge and the slack/telegram
     bridges — all synchronous). ``send`` returning False means not delivered,
     so no ledger entry is written and the next pass retries; exceptions from
-    ``send`` propagate (the caller owns auth/transport policy). ``ledger_name``
-    and ``suffix`` let each surface keep its own ledger + wording (the gateway
-    keeps the defaults). ``recovery_target_ok`` validates ledger-derived
-    recovery destinations (see :func:`plan_notices`). Async callers (discord)
-    use ``plan_notices`` + ``NoticePlan.commit`` directly.
+    ``send`` propagate (the caller owns auth/transport policy) — but only AFTER
+    the sends that DID succeed are committed (review 2026-09-08 r4, #2), so a
+    later 401 can't strip an earlier room's cooldown. ``ledger_name`` and
+    ``suffix`` let each surface keep its own ledger + wording (gateway keeps the
+    defaults). ``recovery_target_ok`` validates ledger-derived recovery
+    destinations (see :func:`plan_notices`). Async callers (discord) use
+    ``plan_notices`` + ``NoticePlan.commit`` directly.
+
+    Recovery batches revalidate the core is STILL healthy before each send (#5):
+    if the supervisor has flipped back to degraded mid-batch, remaining "back
+    online" lines are obsolete, so the batch stops and only completed work is
+    committed — the still-degraded rooms keep their recovery debt.
     """
     plan = plan_notices(state_dir, rooms, now, ledger_name, suffix,
                         recovery_target_ok)
@@ -368,10 +484,14 @@ def sweep_core_state_notices(state_dir: Path, rooms, send, log=None,
         return
     verb = "notice" if plan.kind == "degraded" else "recovery notice"
     sent = []
-    for room, body in plan.items:
-        if send(room, body):
-            sent.append(room)
-            if log:
-                extra = f" ({plan.reason})" if plan.kind == "degraded" else ""
-                log(f"core-state {verb}{extra} sent to {room}")
-    plan.commit(sent)
+    try:
+        for room, body in plan.items:
+            if plan.kind == "recovery" and not is_core_healthy(state_dir):
+                break  # core degraded again — stop sending stale recoveries (#5)
+            if send(room, body):
+                sent.append(room)
+                if log:
+                    extra = f" ({plan.reason})" if plan.kind == "degraded" else ""
+                    log(f"core-state {verb}{extra} sent to {room}")
+    finally:
+        plan.commit(sent)  # record completed sends even if a later send raised (#2)
