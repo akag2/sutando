@@ -41,6 +41,7 @@ import os
 import pathlib
 import subprocess
 import sys
+from unittest import mock
 import tempfile
 import time
 
@@ -396,6 +397,7 @@ def main() -> int:
         test_room_ops_records_only_a_successful_say,
         test_an_absent_ledger_still_blocks_after_the_first_stop,
         test_the_command_line_surface,
+        test_record_say_contract_in_process,
         test_a_result_older_than_the_boundary_is_not_this_turns,
         test_bookkeeping_never_raises_into_the_send_path,
     ):
@@ -536,6 +538,70 @@ def test_bookkeeping_never_raises_into_the_send_path() -> None:
                   turn_ledger.stop_gate(ws) in (None,) or isinstance(turn_ledger.stop_gate(ws), str), "")
         finally:
             os.chmod(state, mode)
+
+
+def test_record_say_contract_in_process() -> None:
+    """`_record_say`'s own contract, called directly.
+
+    The sibling test drives the real dispatch in a SUBPROCESS, which is the right
+    shape for the wiring but invisible to coverage run in this process — the added
+    lines read as untested. This exercises the same three cases in-process, so the
+    contract is measured where it is asserted.
+    """
+    room_ops_dir = str(REPO / "skills" / "agent-room-ops")
+    if room_ops_dir not in sys.path:
+        sys.path.insert(0, room_ops_dir)
+    import room_ops  # noqa: PLC0415 — imported here so the path insert above applies
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = _workspace(tmp)
+        # Both are required: the resolver honours the pin only in test mode.
+        os.environ["SUTANDO_TEST_MODE"] = "1"
+        os.environ["SUTANDO_WORKSPACE"] = str(ws)
+        assert turn_ledger.ledger_path().resolve() == (
+            ws / "state" / turn_ledger.LEDGER_NAME).resolve(), "unpinned — would write live"
+        try:
+            room_ops._record_say({"ok": True, "room_id": "!confirmed:ag2.space",
+                                  "event_id": "$evt"})
+            room_ops._record_say({"ok": True, "room_id": "!unconfirmed:ag2.space",
+                                  "event_id": None})
+            room_ops._record_say({"ok": False, "room_id": "!refused:ag2.space",
+                                  "event_id": None})
+            room_ops._record_say(None)
+            room_ops._record_say("not a dict")
+        finally:
+            os.environ.pop("SUTANDO_WORKSPACE", None)
+            os.environ.pop("SUTANDO_TEST_MODE", None)
+
+        # The dispatch call site, in-process: `_main` is what actually wires the
+        # recording to a send, and the sibling test reaches it only in a subprocess.
+        os.environ["SUTANDO_TEST_MODE"] = "1"
+        os.environ["SUTANDO_WORKSPACE"] = str(ws)
+        try:
+            with mock.patch.object(room_ops._say, "say",
+                                   return_value={"ok": True, "room_id": "!dispatch:ag2.space",
+                                                 "event_id": "$e"}):
+                room_ops._main(["say", "!dispatch:ag2.space", "hello"])
+
+            # The docstring promises this never raises into the send path. A message
+            # has already gone out by then, so there is nothing left to undo.
+            with mock.patch.object(turn_ledger, "record_send",
+                                   side_effect=RuntimeError("ledger exploded")), \
+                 mock.patch.dict(sys.modules, {"turn_ledger": turn_ledger}):
+                room_ops._record_say({"ok": True, "room_id": "!boom:ag2.space",
+                                      "event_id": "$e"})
+            check("a raising ledger does not break the send path", True, "")
+        finally:
+            os.environ.pop("SUTANDO_WORKSPACE", None)
+            os.environ.pop("SUTANDO_TEST_MODE", None)
+
+        targets = [e.get("target") for e in turn_ledger.read_entries(ws)]
+        check("the dispatch path records", "!dispatch:ag2.space" in targets, repr(targets))
+        check("a confirmed say is recorded", "!confirmed:ag2.space" in targets, repr(targets))
+        check("an unconfirmed say is recorded too (fail-open, matching receipt.py)",
+              "!unconfirmed:ag2.space" in targets, repr(targets))
+        check("a refused say records nothing", "!refused:ag2.space" not in targets, repr(targets))
+        check("a non-dict result is ignored rather than raising", True, "")
 
 
 if __name__ == "__main__":
