@@ -156,6 +156,7 @@ def _is_discord_channel_id(value: str) -> bool:
     mistaken for one. Shape only — resolution stays with fetch_channel."""
     return value.isdigit() and 17 <= len(value) <= 20
 from result_markers import parse_markers, dedup_cross_channel_target, dedup_requeue_count, build_requeued_task, has_skip_action  # noqa: E402
+from ag2_sparrow.core_state_notice import plan_notices as _plan_core_notices  # noqa: E402
 import mention_gate  # noqa: E402  — owner @-mention ingestion gate (skills/mention-gate)
 from policy.guardrail import engage_rulebook, DISCORD_PROVENANCE  # noqa: E402
 from policy.egress.result import guard_result_for_tier, resolve_access_tier as _resolve_task_tier  # noqa: E402
@@ -2715,6 +2716,92 @@ async def _supervise_loop(coro_fn, name):
         await asyncio.sleep(POLL_LOOP_RESTART_SEC)
 
 
+# --- Core-state notices (silent-core fix), parity with the gateway bridge -----
+# When the Claude core can't answer — usage limit hit, logged out, crashed, or
+# wedged at a prompt — the bridge kept queuing messages but never told the
+# sender, so a Discord user saw only silence (owner report 2026-09-07). The
+# detection (state/core-supervisor.json, written by core-input-watch) and the
+# dedup/cooldown/recovery logic are shared with the gateway in
+# ag2_sparrow.core_state_notice; this is the async binder for Discord.
+#
+# A DISTINCT ledger file: discord and the gateway share one workspace/state dir,
+# so a shared ledger would mean two processes writing one file (corruption) and
+# one surface's cooldown suppressing the other's notice.
+_CORE_NOTICE_LEDGER = "core-state-notice-discord.json"
+_CORE_NOTICE_SUFFIX = " _(automated notice)_"
+_CORE_NOTICE_RECOVERY_INTERVAL_S = 15
+
+
+async def _send_core_notice(channel, body) -> bool:
+    """One notice line to a Discord channel. True iff it reached Discord.
+    Self-contained and best-effort: a failure just means intake/the sweep
+    retries — it must never raise into the caller or the poll loop."""
+    try:
+        for chunk in _chunk_for_discord(body):
+            await channel.send(chunk)
+        return True
+    except Exception as e:  # noqa: BLE001 — a notice must never break delivery
+        print(f"  [core-notice] send to #{getattr(channel, 'id', '?')} failed: {e}", flush=True)
+        return False
+
+
+async def _core_notice_on_intake(channel) -> None:
+    """At message admission: if the core is degraded, tell THIS channel why
+    (deduped per reason per cooldown). Recovery is the periodic sweep's job, so
+    a healthy core here is simply a no-op. Never raises."""
+    try:
+        plan = _plan_core_notices(STATE_DIR, {str(channel.id)},
+                                  ledger_name=_CORE_NOTICE_LEDGER,
+                                  suffix=_CORE_NOTICE_SUFFIX)
+        if plan is None or plan.kind != "degraded":
+            return
+        sent = []
+        for _room, body in plan.items:
+            if await _send_core_notice(channel, body):
+                sent.append(_room)
+                print(f"  [core-notice] {plan.reason} sent to #{channel.id}", flush=True)
+        plan.commit(sent)
+    except Exception as e:  # noqa: BLE001 — intake must not fail on a notice
+        print(f"  [core-notice] intake sweep failed: {e}", flush=True)
+
+
+async def _core_notice_recovery_once() -> None:
+    """One recovery pass: if the core is healthy and channels are owed a
+    recovery line, send it and clear them. Never raises."""
+    try:
+        plan = _plan_core_notices(STATE_DIR, set(),
+                                  ledger_name=_CORE_NOTICE_LEDGER,
+                                  suffix=_CORE_NOTICE_SUFFIX)
+        if plan is None or plan.kind != "recovery":
+            return
+        sent = []
+        for room, body in plan.items:
+            ch = client.get_channel(int(room)) if room.isdigit() else None
+            if ch is None:
+                # Unresolved (uncached DM / not yet ready): drop the owed
+                # recovery so it can't wedge the ledger forever. Losing a
+                # recovery line is benign — the real answer still delivers
+                # through the normal result path.
+                sent.append(room)
+                continue
+            if await _send_core_notice(ch, body):
+                sent.append(room)
+                print(f"  [core-notice] recovery sent to #{room}", flush=True)
+        plan.commit(sent)
+    except Exception as e:  # noqa: BLE001 — supervised; keep looping
+        print(f"  [core-notice] recovery sweep failed: {e}", flush=True)
+
+
+async def poll_core_state_recovery():
+    """Announce recovery to every channel that got a degraded notice, once the
+    core is healthy again. Degraded notices ride message intake (a message must
+    arrive to warrant one); recovery cannot — no message need arrive when the
+    core comes back — so it runs on this timer."""
+    while True:
+        await _core_notice_recovery_once()
+        await asyncio.sleep(_CORE_NOTICE_RECOVERY_INTERVAL_S)
+
+
 @client.event
 async def on_resumed():  # pragma: no cover — gateway callback; counter logic is unit-tested
     global _resume_count
@@ -2805,6 +2892,9 @@ async def on_ready():
         client.loop.create_task(_supervise_loop(poll_dm_fallback, "poll_dm_fallback"))
         # Auto-mod LLM-judge flush timer (per-guild gate enforced inside flush)
         client.loop.create_task(_supervise_loop(_mod_flush_timer_loop, "_mod_flush_timer_loop"))
+        # Core-state recovery notices (silent-core fix): announce "back online"
+        # to channels that got a degraded notice. Degraded notices ride intake.
+        client.loop.create_task(_supervise_loop(poll_core_state_recovery, "poll_core_state_recovery"))
 
 
 def _message_mentions_bot(message):
@@ -4311,6 +4401,11 @@ async def _handle_discord_message(message, force=False):
     pending_replies[task_id] = message.channel
     pending_task_tiers[task_id] = access_tier
     pending_task_collab[task_id] = bool(is_collaborator)
+    # Silent-core fix: the task is durably queued above; if the core can't
+    # answer right now (usage limit / logged out / crashed / wedged), tell this
+    # channel why instead of leaving the sender staring at silence. Never blocks
+    # or fails admission — the notice only explains the delay.
+    await _core_notice_on_intake(message.channel)
     # Observability: one inbound accepted-message event.
     _emit_channel(
         "discord", "in",

@@ -243,14 +243,15 @@ class NoticePlan:
         _save_ledger(self._state_dir, self._ledger, self._now, self._ledger_name)
 
 
-def plan_notices(state_dir, rooms, now=None,
-                 ledger_name: str = LEDGER_FILE) -> "NoticePlan | None":
+def plan_notices(state_dir, rooms, now=None, ledger_name: str = LEDGER_FILE,
+                 suffix: str = _NOTICE_SUFFIX) -> "NoticePlan | None":
     """Read core state + ledger and decide what to send — WITHOUT sending.
 
     Returns None when there is nothing to do (feature disabled, no verdict, an
     unrecognized state, cooldown covers every room, or no recovery owed). The
     same spam bound holds regardless of caller: per room, ≤ one degraded notice
     per reason per cooldown window, and ≤ one recovery per DELIVERED notice.
+    ``suffix`` lets a surface name its own transport in the notice body.
     """
     if not _enabled():
         return None
@@ -263,7 +264,7 @@ def plan_notices(state_dir, rooms, now=None,
     ledger = _load_ledger(state_dir, ledger_name)
     if reason is not None:
         cooldown = _cooldown_s()
-        items = [(room, _degraded_body(reason))
+        items = [(room, _degraded_body(reason, suffix))
                  for room in sorted(set(rooms))
                  if not (0 <= now - (ledger["last_sent"].get(room, {})
                                      .get(reason, -cooldown - 1)) < cooldown)]
@@ -273,7 +274,7 @@ def plan_notices(state_dir, rooms, now=None,
         return None  # unrecognized state — not proof of recovery
     if not ledger["active"]:
         return None
-    items = [(room, _recovery_body()) for room in sorted(ledger["active"])]
+    items = [(room, _recovery_body(suffix)) for room in sorted(ledger["active"])]
     return NoticePlan("recovery", None, items, ledger, now,
                       state_dir, ledger_name)
 
