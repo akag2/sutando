@@ -482,6 +482,79 @@ def needs_login(pane_text):
     return any(m in low for m in _LOGIN_MARKERS)
 
 
+# --- Runtime awareness (silent-core coverage for non-Claude cores) -----------
+# The Claude core's logged-out state is scraped from its auth PROMPT (needs_login
+# above). A Codex core shows different text — but Codex ships an authoritative,
+# non-interactive check, `codex login status` (exit 0 = signed in), the same one
+# startup/verify use. So for a codex core we ask Codex directly instead of
+# guessing at its TUI. Everything is gated on the runtime, so the Claude path is
+# unchanged. Crash/hang/working/idle are already runtime-neutral (process probe
+# + core-status.json), so only login needed a per-runtime branch.
+_CORE_ENV_CACHE: dict = {}       # var -> (value_or_None, ts)
+_CORE_ENV_TTL = 30.0
+_CODEX_LOGIN_CACHE = [0.0, None]  # [ts, needs_login_bool_or_None]
+_CODEX_LOGIN_TTL = 30.0           # `codex login status` spawns node — don't per-tick it
+
+
+def _core_session_env(var):
+    """Read an env var from the core's tmux session, where start-cli.sh exports
+    SUTANDO_CORE_RUNTIME / CODEX_HOME. Cached briefly. None if unavailable —
+    callers treat that as 'unknown', never a positive reading."""
+    now = time.time()
+    hit = _CORE_ENV_CACHE.get(var)
+    if hit is not None and now - hit[1] < _CORE_ENV_TTL:
+        return hit[0]
+    val = None
+    rc, out = _run(["tmux", "-S", TMUX_SOCKET, "show-environment", "-t", "=" + SESSION, var])
+    if rc == 0:
+        for line in out.splitlines():
+            if line.startswith(var + "="):
+                val = line[len(var) + 1:]
+                break
+    _CORE_ENV_CACHE[var] = (val, now)
+    return val
+
+
+def core_runtime():
+    """The core's runtime ('claude' | 'codex' | …). Defaults to 'claude' so any
+    detection failure preserves the existing Claude behavior."""
+    rt = (_core_session_env("SUTANDO_CORE_RUNTIME")
+          or os.environ.get("SUTANDO_CORE_RUNTIME") or "claude")
+    return rt.strip() or "claude"
+
+
+def _codex_login_needed():
+    """True = a codex core needs login (`codex login status` exited non-zero),
+    False = signed in, None = the check could not run (→ unknown, never a false
+    'logged out'). Runs against the core's own CODEX_HOME so it inspects the same
+    account the core uses. Cached: the subprocess spawns node, too costly to run
+    every health tick."""
+    now = time.time()
+    if now - _CODEX_LOGIN_CACHE[0] < _CODEX_LOGIN_TTL:
+        return _CODEX_LOGIN_CACHE[1]
+    env = dict(os.environ)
+    ch = _core_session_env("CODEX_HOME")
+    if ch:
+        env["CODEX_HOME"] = ch
+    try:
+        p = subprocess.run(["codex", "login", "status"], capture_output=True,
+                           text=True, timeout=8, env=env)
+        needed = (p.returncode != 0)
+    except (OSError, subprocess.SubprocessError):
+        needed = None  # couldn't run → unknown; NEVER report a false logged-out
+    _CODEX_LOGIN_CACHE[0], _CODEX_LOGIN_CACHE[1] = now, needed
+    return needed
+
+
+def _login_signal():
+    """Runtime-aware 'is the core logged out?' → bool. Claude: scrape the auth
+    prompt (unchanged). Codex: ask `codex login status`. Unknown → False, so a
+    probe that can't run never fabricates a logged-out verdict."""
+    if core_runtime() == "codex":
+        return bool(_codex_login_needed())
+    return needs_login(_pane_text())
+
+
 def _core_status(workspace):
     """Read the agent's own status ('running'|'idle') from core-status.json.
 
@@ -549,7 +622,10 @@ def derive():
         # so it must NOT license overriding a login marker — that would be the
         # same absence-of-evidence mistake in the other direction.
         acting = status in ("running", "idle") and ts is not None and not stale
-        login = needs_login(_pane_text())
+        # Runtime-aware: Claude scrapes its auth prompt; Codex asks
+        # `codex login status`. Claude behavior is unchanged (core_runtime()
+        # defaults to 'claude').
+        login = _login_signal()
         # status_fresh: True = advanced within the window, False = stale,
         # None = no record to judge (can't prove either way).
         status_fresh = None if ts is None else (not stale)

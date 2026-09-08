@@ -384,6 +384,9 @@ class TestMainAutoAnswerWiring(unittest.TestCase):
 
             def derive(self):
                 return {"health": "working"}
+
+            def core_runtime(self):
+                return "claude"
         argv = ["core-input-watch.py", "--socket", "/tmp/x.sock", "--out", out,
                 "--once", "--stable", "1"] + extra_args
         with patch.object(_mod, "capture", lambda s, sess: pane), \
@@ -530,6 +533,9 @@ class TestMainOnce(unittest.TestCase):
 
             def derive(self):
                 return {"health": "working"}
+
+            def core_runtime(self):
+                return "claude"
 
         orig_cap, orig_load = _mod.capture, _mod._load_runtime_health
         _mod.capture = lambda sock, sess: _BYPASS          # a recognized gate
