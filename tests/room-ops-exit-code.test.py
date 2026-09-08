@@ -16,6 +16,7 @@ import io
 import json
 import pathlib
 import unittest
+from unittest import mock
 
 SRC = (pathlib.Path(__file__).resolve().parents[1] /
        "skills" / "agent-room-ops" / "room_ops.py")
@@ -29,38 +30,29 @@ def _load():
 
 
 class StrictIsOptIn(unittest.TestCase):
+    """Behavioural only. keweichen mutated the predicate from `is False` to
+    `is not None` and all six replica-based tests still passed."""
+
     def setUp(self):
-        self.src = SRC.read_text()
+        self.m = _load()
 
-    def test_the_flag_exists(self):
-        self.assertIn('"--strict"', self.src)
+    def _rc(self, res, strict):
+        return self.m._strict_rc(res, strict)
 
-    def test_the_return_is_guarded_by_the_flag(self):
-        tail = self.src[self.src.rindex("print(json.dumps(res"):]
-        self.assertIn("a.strict", tail,
-            "the nonzero exit must be reachable only with --strict")
-        self.assertIn('res.get("ok")', tail)
-
-    def test_default_stays_zero_and_strict_maps_false_to_one(self):
-        ns: dict = {}
-        exec("def rc(res, strict):\n"
-             "    if strict and isinstance(res, dict) and res.get('ok') is False:\n"
-             "        return 1\n"
-             "    return 0", ns)
-        rc = ns["rc"]
+    def test_a_false_ok_exits_1_only_under_strict(self):
         bad = {"ok": False, "reason": "file not found"}
-        self.assertEqual(rc(bad, False), 0, "default contract must not change")
-        self.assertEqual(rc(bad, True), 1)
-        self.assertEqual(rc({"ok": True}, True), 0)
+        self.assertEqual(self._rc(bad, True), 1)
+        self.assertEqual(self._rc(bad, False), 0, "the default contract must not change")
 
-    def test_a_result_without_an_ok_key_stays_zero_even_strict(self):
-        ns: dict = {}
-        exec("def rc(res, strict):\n"
-             "    if strict and isinstance(res, dict) and res.get('ok') is False:\n"
-             "        return 1\n"
-             "    return 0", ns)
-        self.assertEqual(ns["rc"]({"rooms": []}, True), 0)
-        self.assertEqual(ns["rc"](None, True), 0)
+    def test_a_TRUE_ok_exits_0_even_under_strict(self):
+        """The mutation that survived: `is not None` would return 1 here."""
+        self.assertEqual(self._rc({"ok": True, "event_id": "$x"}, True), 0)
+
+    def test_a_result_without_an_ok_key_exits_0_even_under_strict(self):
+        """No `ok` key: `is not None` leaves this at 0, so the ok:true case
+        above is the one that kills that mutation. Pinned for the contract."""
+        self.assertEqual(self._rc({"rooms": []}, True), 0)
+        self.assertEqual(self._rc(None, True), 0)
 
 
 class MainActuallyReturnsTheCode(unittest.TestCase):
@@ -85,6 +77,31 @@ class MainActuallyReturnsTheCode(unittest.TestCase):
         rc, out = self._run(["send", "!r:x", "/nope/missing.png"])
         self.assertEqual(rc, 0, "the default contract must not change")
         self.assertIs(json.loads(out)["ok"], False)
+
+
+    def test_events_stream_honours_strict_through_real_main(self):
+        """keweichen: the stream branch returned before the strict mapping, so
+        `--strict events stream --once` reported ok:false with rc 0.
+
+        Stubbed, never dialled: calling it live BLOCKS on a real connection —
+        I hung a terminal proving that before writing it this way.
+        """
+        buf = io.StringIO()
+        with mock.patch.object(self.m._events, "stream",
+                               side_effect=self.m._events.StreamDisconnected("no gateway configured")):
+            with contextlib.redirect_stdout(buf):
+                rc = self.m._main(["--strict", "events", "stream", "--once"])
+        out = json.loads([l for l in buf.getvalue().strip().split("\n") if l.strip()][-1])
+        self.assertIs(out["ok"], False, "the stub must produce the failure shape")
+        self.assertEqual(rc, 1, "a failed stream must not exit 0 under --strict")
+
+    def test_events_stream_still_exits_0_on_that_failure_WITHOUT_strict(self):
+        buf = io.StringIO()
+        with mock.patch.object(self.m._events, "stream",
+                               side_effect=self.m._events.StreamDisconnected("no gateway configured")):
+            with contextlib.redirect_stdout(buf):
+                rc = self.m._main(["events", "stream", "--once"])
+        self.assertEqual(rc, 0, "the default contract must not change")
 
 
 if __name__ == "__main__":
