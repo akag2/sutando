@@ -8357,6 +8357,45 @@ def _pid_parent(pid: "str | int", ps_output: "str | None" = None) -> "str | None
     return None
 
 
+def _proc_argv_vector(pid: int) -> "list[str] | None":
+    """Real argv of `pid` as a LIST, or None when no authoritative read exists.
+
+    A flattened argv cannot separate an operand containing a space from two
+    operands, so the executed script is not recoverable from it by any rule.
+    """
+    try:  # linux: NUL-delimited, authoritative
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        if raw:
+            return [a for a in raw.decode("utf8", "replace").split("\0") if a]
+    except Exception:  # noqa: BLE001 -- not linux, or gone
+        pass
+    try:  # darwin: KERN_PROCARGS2 carries argc then the real argv strings
+        import ctypes
+        import ctypes.util
+        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        mib = (ctypes.c_int * 3)(1, 49, int(pid))  # CTL_KERN, KERN_PROCARGS2
+        size = ctypes.c_size_t(262144)
+        buf = ctypes.create_string_buffer(size.value)
+        if libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) != 0:
+            return None
+        data = buf.raw[:size.value]
+        argc = int.from_bytes(data[:4], sys.byteorder)
+        parts = data[4:].split(b"\0")
+        i = 0
+        while i < len(parts) and parts[i] == b"":
+            i += 1
+        i += 1                                   # the exec path
+        while i < len(parts) and parts[i] == b"":
+            i += 1
+        out = []
+        while i < len(parts) and len(out) < argc:
+            out.append(parts[i].decode("utf8", "replace"))
+            i += 1
+        return out or None
+    except Exception:  # noqa: BLE001 -- probe failure must not fail the check
+        return None
+
+
 def _proc_argv(pid: int) -> str:
     """argv of `pid`, or "" if no such process.
 
@@ -8458,28 +8497,43 @@ _WATCHER_SHELLS = ("sh", "bash", "zsh", "ksh")
 _WATCHER_SCRIPT = re.compile(r"(?:^|[\s/])watch-tasks-stream\.sh(?=\s|$)")
 
 
-def _is_watcher_argv(argv: str) -> bool:
-    """True for `<shell> <path>/watch-tasks-stream.sh [tasks-dir]`.
+def _as_pid(tok: str) -> "int | None":
+    try:
+        return int(tok)
+    except (TypeError, ValueError):
+        return None
 
-    A field COUNT cannot decide this: the notifier execs the script WITH a tasks
-    directory, and an install path containing a space splits into more tokens
-    again -- both real shapes, both previously read as "not a watcher".
+
+def _is_watcher_argv(argv: str, pid: "int | None" = None) -> "bool | None":
+    """True/False from the EXECUTED script; None when nothing can prove it.
+
+    Callers disagree on what None should mean, which is why this is tri-state:
+    over-counting a watcher costs delayed tasks, publishing a wrong pid costs a
+    killed stranger.
     """
+    vec = _proc_argv_vector(pid) if pid is not None else None
+    if vec is not None and len(vec) >= 2:
+        if vec[0].rsplit("/", 1)[-1] not in _WATCHER_SHELLS:
+            return False
+        if vec[1].startswith("-"):
+            return False
+        return _WATCHER_SCRIPT.search(vec[1]) is not None
     parts = argv.split()
     if len(parts) < 2:
         return False
     if parts[0].rsplit("/", 1)[-1] not in _WATCHER_SHELLS:
         return False
-    # `<shell> -c ...` is a wrapper running something that merely mentions the
-    # script -- the self-match this predicate exists to exclude.
     if parts[1].startswith("-"):
         return False
-    # Bind to the EXECUTED script: the first `.sh` token. Searching all of argv
-    # matched a different script handed the watcher's path as data.
-    for tok in parts[1:]:
-        if tok.endswith(".sh"):
-            return _WATCHER_SCRIPT.search(tok) is not None
-    return False
+    # The script always begins with parts[1] and any continuation is space-led,
+    # which the pattern's lookahead accepts -- so a hit here holds under any split.
+    if _WATCHER_SCRIPT.search(parts[1]) is not None:
+        return True
+    if len(parts) == 2:
+        return False
+    # Only a later token matches, and a spaced script path is the same string as a
+    # script plus arguments -- nothing here can decide between them.
+    return None if _WATCHER_SCRIPT.search(argv) else False
 
 
 # Read from the module that defines the precedence; a copy here is how this
@@ -8578,7 +8632,9 @@ def _watcher_trees(ps_output: "str | None" = None) -> dict:
         parts = line.split(None, 2)
         if len(parts) < 3 or parts[0] == me:
             continue
-        if not _is_watcher_argv(parts[2]):
+        # None is UNKNOWN: count it, because a missed watcher starts a second
+        # one and every task is then processed twice.
+        if _is_watcher_argv(parts[2], _as_pid(parts[0])) is False:
             continue
         parent[parts[0]] = parts[1]
     trees: dict = {}
@@ -9039,7 +9095,7 @@ def fix_task_watcher_sentinel(check: dict) -> str:
     pid_file = Path(target)
     # Re-measure before writing: the check ran earlier, and this file is what
     # the Stop hook kills.
-    if not _is_watcher_argv(_proc_argv(int(pid))):
+    if _is_watcher_argv(_proc_argv(int(pid)), int(pid)) is not True:
         return f"pid {pid} is no longer the watcher — not re-stamped"
     try:
         # Separate try: mkdir raises FileExistsError when state/ is a plain
@@ -9058,7 +9114,7 @@ def fix_task_watcher_sentinel(check: dict) -> str:
         return f"could not write {pid_file}: {e}"
     # The probe above was a snapshot taken BEFORE publication; retract our own
     # stamp if it went stale mid-write.
-    if not _is_watcher_argv(_proc_argv(int(pid))):
+    if _is_watcher_argv(_proc_argv(int(pid)), int(pid)) is not True:
         try:
             # Read-then-unlink, NOT arbitrated the way the write above is:
             # POSIX has no conditional unlink, so a claim landing here is lost.

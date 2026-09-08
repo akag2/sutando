@@ -148,7 +148,7 @@ class PoolHost(unittest.TestCase):
             saved = (hc._proc_argv, hc._is_watcher_argv, hc.WORKSPACE_DIR)
             try:
                 hc._proc_argv = lambda pid: WATCHER_ARGV
-                hc._is_watcher_argv = lambda argv: True
+                hc._is_watcher_argv = lambda argv, pid=None: True
                 hc.WORKSPACE_DIR = Path(td) / "ws"
                 out = hc.fix_task_watcher_sentinel(
                     {"_sentinel_restamp_pid": "4242",
@@ -343,9 +343,15 @@ class TheWatcherPredicateIsAShapeNotAFieldCount(unittest.TestCase):
     existing case used the synthetic two-token form, so none of them could see it.
     """
 
+    # The script token carries the name, so every way of re-splitting the flattened
+    # argv still yields a watcher -- these are decidable from the string alone.
     REAL = [
         ("the synthetic form the older cases use", "bash src/watch-tasks-stream.sh"),
         ("the notifier's production exec", "bash /repo/src/watch-tasks-stream.sh /w/tasks"),
+    ]
+    # A space in the INSTALL path pushes the name out of the script token, and then
+    # "one spaced path" and "a script plus arguments" are the same string.
+    REAL_UNDECIDABLE = [
         ("an app checkout whose path has a space",
          "bash /Users/x/Library/Application Support/Sutando/src/watch-tasks-stream.sh"),
         ("both at once", "bash /Users/x/Application Support/src/watch-tasks-stream.sh /w/my tasks"),
@@ -361,13 +367,26 @@ class TheWatcherPredicateIsAShapeNotAFieldCount(unittest.TestCase):
     def test_every_real_launch_shape_is_recognised(self):
         for label, argv in self.REAL:
             with self.subTest(shape=label):
-                self.assertTrue(hc._is_watcher_argv(argv), argv)
+                self.assertIs(hc._is_watcher_argv(argv), True, argv)
+
+    def test_an_undecidable_real_shape_is_never_REJECTED(self):
+        # The defect this class was written for: a production watcher read as "not
+        # a watcher". UNKNOWN keeps it counted; only False would resurrect that.
+        for label, argv in self.REAL_UNDECIDABLE:
+            with self.subTest(shape=label):
+                self.assertIsNot(hc._is_watcher_argv(argv), False, argv)
+
+    def test_an_undecidable_real_shape_still_counts_as_a_tree(self):
+        # What the caller does with UNKNOWN is the behaviour the probe depends on.
+        for label, argv in self.REAL_UNDECIDABLE:
+            with self.subTest(shape=label):
+                self.assertTrue(hc._watcher_trees("  100 1 %s\n" % argv), argv)
 
     def test_the_controls_impostors_are_still_refused(self):
-        # Without these the predicate could pass by accepting anything.
+        # assertIs, not assertFalse: None must not be able to satisfy the control.
         for label, argv in self.IMPOSTORS:
             with self.subTest(shape=label):
-                self.assertFalse(hc._is_watcher_argv(argv), argv)
+                self.assertIs(hc._is_watcher_argv(argv), False, argv)
 
     def test_a_production_shaped_duplicate_is_counted_as_a_second_tree(self):
         # The consequence: two real watchers read as one, so the duplicate the

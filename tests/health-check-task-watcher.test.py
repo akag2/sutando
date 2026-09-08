@@ -768,22 +768,64 @@ def case_q_trees_swallows_probe_failure() -> list[str]:
 
 
 def case_aa_argv_classification_binds_to_the_executed_script():
-    """A different script handed the watcher's path as DATA is not a watcher."""
+    """The EXECUTED script decides, read from the real argv vector — not from spelling.
+
+    Spawns real processes: a flattened argv cannot separate a spaced path from
+    two operands, so no string rule can pass this matrix.
+    """
+    import shutil
+    import subprocess
+    import tempfile
+
     fails = []
+    tmp = tempfile.mkdtemp()
+
+    def mk(rel):
+        path = os.path.join(tmp, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write("#!/bin/bash\nsleep 8\n")
+        os.chmod(path, 0o755)
+        return path
+
     shapes = [
-        ("bash /tmp/unrelated.sh /repo/src/watch-tasks-stream.sh", False),
-        ("bash /repo/src/watch-tasks-stream.sh", True),
-        ("bash /repo/src/watch-tasks-stream.sh /ws/tasks", True),
-        ("bash /My Path/src/watch-tasks-stream.sh", True),
-        ("bash /My Path/src/watch-tasks-stream.sh /ws/tasks", True),
-        ("bash -c echo watch-tasks-stream.sh", False),
-        ("bash /repo/src/x-watch-tasks-stream.sh", False),
-        ("python3 /repo/src/watch-tasks-stream.sh", False),
+        ("dir ending .sh, real watcher", ["/bin/bash", mk("dir.sh/src/watch-tasks-stream.sh"), "/ws/tasks"], True),
+        ("no extension + path as DATA", ["/bin/bash", mk("unrelated"), "/repo/src/watch-tasks-stream.sh"], False),
+        (".bash + path as DATA", ["/bin/bash", mk("unrelated.bash"), "/repo/src/watch-tasks-stream.sh"], False),
+        (".sh + path as DATA", ["/bin/bash", mk("unrelated.sh"), "/repo/src/watch-tasks-stream.sh"], False),
+        ("path WITH SPACES + tasks", ["/bin/bash", mk("My Path/src/watch-tasks-stream.sh"), "/ws/tasks"], True),
+        ("plain watcher, no args", ["/bin/bash", mk("plain/src/watch-tasks-stream.sh")], True),
     ]
-    for argv, want in shapes:
+    try:
+        for label, cmd, want in shapes:
+            proc = subprocess.Popen(cmd)
+            try:
+                time.sleep(0.35)
+                got = hc._is_watcher_argv(" ".join(cmd), proc.pid)
+                if got is not want:
+                    fails.append(f"aa) {label}: got {got}, want {want}")
+            finally:
+                proc.kill()
+                proc.wait()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return fails
+
+
+def case_ab_ambiguous_flattened_argv_declines_rather_than_guesses():
+    """No pid and >2 tokens is UNDECIDABLE, and must report None, not a guess."""
+    fails = []
+    checks = [
+        ("bash /a/b.sh /c/watch-tasks-stream.sh", None),   # script + operand, or spaced path?
+        ("bash /repo/src/watch-tasks-stream.sh", True),    # one operand however spelled
+        ("python3 /repo/src/watch-tasks-stream.sh", False),
+        ("bash -c echo watch-tasks-stream.sh", False),
+        ("bash", False),
+    ]
+    for argv, want in checks:
         got = hc._is_watcher_argv(argv)
         if got is not want:
-            fails.append(f"aa) _is_watcher_argv({argv!r}) = {got}, want {want}")
+            fails.append(f"ab) _is_watcher_argv({argv!r}) = {got}, want {want}")
     return fails
 
 
@@ -825,6 +867,7 @@ def main() -> int:
         ("y2", case_y2_private_keys_stay_out_of_the_json_payload),
         ("z", case_z_an_unreadable_watcher_identity_offers_no_repair_target),
         ("aa", case_aa_argv_classification_binds_to_the_executed_script),
+        ("ab", case_ab_ambiguous_flattened_argv_declines_rather_than_guesses),
     ]
     all_failures = []
     for label, fn in cases:
