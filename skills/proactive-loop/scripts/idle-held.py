@@ -268,6 +268,9 @@ def main(argv=None) -> int:
     ap.add_argument("--remove", action="append", default=[], metavar="ID")
     ap.add_argument("--reason", action="append", default=[],
                     help="why an id is being removed; one per --remove")
+    ap.add_argument("--note", action="append", default=[],
+                    help="the held item's note; one per --add. An `owner/repo#n` "
+                         "here is what --audit-prs reads to check the hold")
     ap.add_argument("--write", action="store_true",
                     help="persist the new held_item_ids (atomic; other keys untouched)")
     ap.add_argument("--audit-prs", action="store_true",
@@ -336,6 +339,12 @@ def main(argv=None) -> int:
               "A silent shrink is the failure this tool exists to stop.", file=sys.stderr)
         return 1
 
+    if a.add and len(a.note) != len(a.add):
+        print(f"REFUSED: {len(a.add)} --add but {len(a.note)} --note. A hold with no "
+              "note is invisible to --audit-prs, which is the other half of the "
+              "silent-shrink failure.", file=sys.stderr)
+        return 1
+
     adds = []
     for spec in a.add:
         if ":" not in spec:
@@ -362,6 +371,8 @@ def main(argv=None) -> int:
           file=sys.stderr)
     for rid, why in zip(a.remove, a.reason):
         print(f"  removed {rid}: {why}", file=sys.stderr)
+    for (aid, _g), note in zip(adds, a.note):
+        print(f"  added {aid}: {note}", file=sys.stderr)
 
     if a.write:
         def apply_under_lock(fresh):
@@ -375,6 +386,11 @@ def main(argv=None) -> int:
             log = fresh.setdefault("held_item_removals", [])
             for rid, why in zip(a.remove, a.reason):
                 log.append({"id": rid, "reason": why})
+            # Same lock as the id write: an id that lands without its note is the
+            # unauditable hold this pairing exists to prevent.
+            notes = fresh.setdefault("held_item_notes", {})
+            for (aid, _g), note in zip(adds, a.note):
+                notes[aid] = note
             return None
 
         res = locked_update(state, apply_under_lock, indent=2)
