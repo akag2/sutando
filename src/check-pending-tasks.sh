@@ -32,10 +32,10 @@ UNPROCESSED=""
 shopt -s nullglob 2>/dev/null
 for f in "$TASKS_DIR"/*.txt; do
   BASENAME=$(basename "$f")
-  # A result must carry something. An empty (or whitespace-only) file satisfied the
-  # existence check while delivering silence, which is the failure this hook exists to catch.
+  # Readiness is owned by src/delivery/readiness.py, the same policy every delivery
+  # consumer uses; a local re-implementation drifts from what will actually be sent.
   if [ -f "$RESULTS_DIR/$BASENAME" ]; then
-    if [ -n "$(tr -d '[:space:]' < "$RESULTS_DIR/$BASENAME" 2>/dev/null)" ]; then continue; fi
+    if SUTANDO_SRC="$REPO_DIR/src" SUTANDO_RESULT="$RESULTS_DIR/$BASENAME" "$PYBIN" -c 'import os,sys; sys.path.insert(0, os.environ["SUTANDO_SRC"]); from delivery.readiness import read_ready_result; sys.exit(0 if read_ready_result(os.environ["SUTANDO_RESULT"]) is not None else 1)'; then continue; fi
     UNPROCESSED+="--- $BASENAME (result file is EMPTY — it delivers nothing; write a real reply) ---
 
 "
