@@ -174,19 +174,22 @@ def test_unattempted_rooms_not_charged_a_failure():
                 raise RuntimeError("A raises, aborting before B")
             return True
 
-        # Fewer passes than MAX so A keeps blocking (not yet purged): across all
-        # of them B is never reached, so it must accrue ZERO failures and keep
-        # its recovery debt — the bug charged B a failure per aborted pass.
-        for tick in range(csn.MAX_RECOVERY_ATTEMPTS - 1):
-            try:
-                csn.sweep_core_state_notices(tmp, set(), raising_send, now=now + 1 + tick)
-            except RuntimeError:
-                pass
+        # ONE pass: A (sorted first) raises before B is reached. In THIS pass B
+        # was never attempted, so it must accrue no failure and keep its debt —
+        # the bug charged every planned item, purging B without a send. (Rotation
+        # then gives B its turn on a later pass; that's the #3 anti-starvation
+        # behavior, tested separately.)
+        csn._RR_CURSORS.clear()  # ensure A sorts first this pass
+        try:
+            csn.sweep_core_state_notices(tmp, set(), raising_send, now=now + 1)
+        except RuntimeError:
+            pass
         led = json.loads((tmp / csn.LEDGER_FILE).read_text())
-        assert "!b:s" in led["active"], "B was never attempted; must not be purged"
-        assert led.get("fail", {}).get("!b:s", 0) == 0, "B must not accrue failures"
-        assert led.get("fail", {}).get("!a:s", 0) >= 1, "A (actually attempted) is charged"
+        assert "!b:s" in led["active"], "B not attempted this pass; must keep its debt"
+        assert led.get("fail", {}).get("!b:s", 0) == 0, "B must not accrue a failure"
+        assert led.get("fail", {}).get("!a:s", 0) == 1, "A (attempted) is charged once"
     csn._MEM_LEDGERS.clear()
+    csn._RR_CURSORS.clear()
 
 
 def test_batch_cap_rotation_reaches_all_rooms():
@@ -210,6 +213,36 @@ def test_batch_cap_rotation_reaches_all_rooms():
         for tick in range(4):  # a few rotated passes
             csn.sweep_core_state_notices(tmp, rooms, send, now=now + tick)
         assert attempts[ninth] >= 1, "rotation never reached the reachable 9th room"
+    csn._MEM_LEDGERS.clear()
+    csn._RR_CURSORS.clear()
+
+
+def test_budget_truncation_does_not_starve():
+    # r4-followup-2: 3 rooms (< the count cap), but the TIME budget truncates
+    # each pass after 2 slow sends. Rotation must still advance by ACTUAL
+    # attempts so the 3rd room is eventually reached — not just when len > cap.
+    import unittest.mock as mock
+    csn._MEM_LEDGERS.clear()
+    csn._RR_CURSORS.clear()
+    with tempfile.TemporaryDirectory() as d:
+        tmp = pathlib.Path(d)
+        now = time.time()
+        _write_heartbeat(tmp, now)
+        _write_state(tmp, "crashed")
+        rooms = {"!r0:s", "!r1:s", "!r2:s"}
+        attempts = {r: 0 for r in rooms}
+        clock = [0.0]  # fake monotonic: each send "takes" 6s of the 12s budget
+
+        def send(room, body):
+            attempts[room] += 1
+            clock[0] += 6.0
+            return False  # always fails (no cooldown earned)
+
+        with mock.patch.object(csn.time, "monotonic", lambda: clock[0]):
+            for tick in range(3):
+                clock[0] = 0.0  # reset the per-sweep monotonic base each pass
+                csn.sweep_core_state_notices(tmp, rooms, send, now=now + tick)
+        assert attempts["!r2:s"] >= 1, "budget-truncated small batch starved r2"
     csn._MEM_LEDGERS.clear()
     csn._RR_CURSORS.clear()
 
@@ -516,6 +549,7 @@ if __name__ == "__main__":
     test_recovery_persistence_failure_does_not_resurrect()
     test_unattempted_rooms_not_charged_a_failure()
     test_batch_cap_rotation_reaches_all_rooms()
+    test_budget_truncation_does_not_starve()
     test_persistence_failure_keeps_process_local_cooldown()
     test_numeric_guards()
     test_no_supervisor_file_does_nothing()

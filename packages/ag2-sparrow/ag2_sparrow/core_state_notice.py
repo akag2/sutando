@@ -47,11 +47,13 @@ MAX_NOTICES_PER_SWEEP = 8
 # A recovery target that keeps failing to deliver is purged after this many
 # attempts, so a room the bot lost access to can't be retried forever (#6).
 MAX_RECOVERY_ATTEMPTS = 5
-# Wall-clock ceiling for one sweep's sends, so notice IO on a bridge's main
-# path (gateway/telegram poll loop) can't hold it for the whole per-request
-# timeout budget on slow sends (review r4-followup #5). Rooms past the deadline
-# carry to the next sweep. Below any single per-request timeout so one slow send
-# doesn't blow it wildly, yet enough for a few quick notices.
+# Soft wall-clock budget for one sweep's sends. It is checked BEFORE each send,
+# not enforced mid-flight, so a send already in progress can overrun it by up to
+# that request's own timeout — the budget bounds how many further sends a sweep
+# STARTS, not the hard wall-clock (review r4-followup-2 nit). Paired with short
+# per-request notice timeouts (gateway/telegram 6s) it keeps notice IO on a
+# bridge's main poll path from stacking many slow sends. Rooms past the deadline
+# carry to the next sweep (and the cursor advances, so they aren't starved).
 NOTICE_BUDGET_S = 12.0
 
 # Process-local ledger overlay, keyed by (state_dir, ledger_name). Holds
@@ -68,15 +70,18 @@ _MEM_LEDGERS: dict = {}
 _RR_CURSORS: dict = {}
 
 
-def _rotate_window(seq, key, size):
-    """The next `size` items of `seq`, rotating the start each call so repeated
-    over-capacity passes eventually cover every element."""
-    if len(seq) <= size:
-        return list(seq)
+def _rotate(seq, key, size):
+    """The next `size` items of `seq` starting at this key's cursor. Does NOT
+    advance the cursor — the caller advances it by the number ACTUALLY attempted
+    (NoticePlan.commit), so a pass cut short by the time budget resumes where it
+    stopped rather than replaying the same prefix (review r4-followup-2). Applies
+    even when len(seq) <= size, since the budget can truncate a small batch too."""
+    seq = list(seq)
+    if not seq:
+        return seq
+    n = min(size, len(seq))  # never exceed the set (doubling must not duplicate)
     cur = _RR_CURSORS.get(key, 0) % len(seq)
-    _RR_CURSORS[key] = (cur + size) % len(seq)
-    doubled = list(seq) + list(seq)
-    return doubled[cur:cur + size]
+    return (seq + seq)[cur:cur + n]
 
 CORE_SUPERVISOR_FILE = "core-supervisor.json"
 # Written every tick by core-input-watch (str epoch seconds); its freshness is
@@ -383,16 +388,17 @@ class NoticePlan:
     """
 
     __slots__ = ("kind", "reason", "items", "_ledger", "_now",
-                 "_state_dir", "_ledger_name", "_purge")
+                 "_state_dir", "_ledger_name", "_purge", "_rr_key")
 
     def __init__(self, kind, reason, items, ledger, now, state_dir, ledger_name,
-                 purge=()):
+                 purge=(), rr_key=None):
         self.kind, self.reason, self.items = kind, reason, items
         self._ledger, self._now = ledger, now
         self._state_dir, self._ledger_name = state_dir, ledger_name
         # Recovery-only: active keys that failed target validation — garbage or
         # forged destinations to DROP without sending (review 2026-09-08 r3).
         self._purge = set(purge)
+        self._rr_key = rr_key  # round-robin cursor to advance by actual attempts
 
     def commit(self, sent_rooms, attempted_rooms=None) -> None:
         """Persist the outcome. ``sent_rooms`` delivered; ``attempted_rooms`` is
@@ -403,6 +409,15 @@ class NoticePlan:
         #2: inferring "failed" from planned items charged never-attempted rooms
         a failure and purged them without a single send)."""
         sent = set(sent_rooms)
+        attempted = ({room for room, _ in self.items}
+                     if attempted_rooms is None else set(attempted_rooms))
+        # Advance the round-robin cursor by what we ACTUALLY attempted, so a
+        # pass cut short by the time budget / health-abort resumes past those
+        # rooms next sweep — even when nothing was delivered (every send failed).
+        # Doing this before any early return is what stops a small always-failing
+        # batch from replaying the same prefix forever (review r4-followup-2).
+        if self._rr_key is not None and attempted:
+            _RR_CURSORS[self._rr_key] = _RR_CURSORS.get(self._rr_key, 0) + len(attempted)
         if self.kind == "degraded":
             if not sent:
                 return  # nothing delivered → nothing to persist
@@ -410,8 +425,6 @@ class NoticePlan:
                 self._ledger["last_sent"].setdefault(room, {})[self.reason] = self._now
                 self._ledger["active"][room] = self.reason
         else:  # recovery: discharge delivered, purge invalid, bound retries
-            attempted = ({room for room, _ in self.items}
-                         if attempted_rooms is None else set(attempted_rooms))
             failed = attempted - sent  # ATTEMPTED but did not deliver
             fail = self._ledger.setdefault("fail", {})
             purge = set(self._purge)
@@ -467,10 +480,10 @@ def plan_notices(state_dir, rooms, now=None, ledger_name: str = LEDGER_FILE,
                                      .get(reason, -cooldown - 1)) < cooldown)]
         # Cap per sweep (#1), rotating the window so an always-failing prefix
         # can't starve rooms behind it (#3); overflow re-plans next pass.
-        window = _rotate_window(items, (str(state_dir), ledger_name, "degraded"),
-                                MAX_NOTICES_PER_SWEEP)
+        rr_key = (str(state_dir), ledger_name, "degraded")
+        window = _rotate(items, rr_key, MAX_NOTICES_PER_SWEEP)
         return NoticePlan("degraded", reason, window,
-                          ledger, now, state_dir, ledger_name)
+                          ledger, now, state_dir, ledger_name, rr_key=rr_key)
     if state not in _HEALTHY_STATES:
         return None  # unrecognized state — not proof of recovery
     if not ledger["active"]:
@@ -485,11 +498,11 @@ def plan_notices(state_dir, rooms, now=None, ledger_name: str = LEDGER_FILE,
         return None
     # Cap sends per sweep (#1) with the same rotation (#3); overflow stays in
     # `active` for the next pass. Purges are cheap (no network) so all apply now.
-    window = _rotate_window(active, (str(state_dir), ledger_name, "recovery"),
-                            MAX_NOTICES_PER_SWEEP)
+    rr_key = (str(state_dir), ledger_name, "recovery")
+    window = _rotate(active, rr_key, MAX_NOTICES_PER_SWEEP)
     items = [(room, _recovery_body(suffix)) for room in window]
     return NoticePlan("recovery", None, items, ledger, now,
-                      state_dir, ledger_name, purge=purge)
+                      state_dir, ledger_name, purge=purge, rr_key=rr_key)
 
 
 def sweep_core_state_notices(state_dir: Path, rooms, send, log=None,
