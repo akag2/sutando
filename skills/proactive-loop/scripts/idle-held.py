@@ -269,8 +269,9 @@ def main(argv=None) -> int:
     ap.add_argument("--reason", action="append", default=[],
                     help="why an id is being removed; one per --remove")
     ap.add_argument("--note", action="append", default=[],
-                    help="the held item's note; one per --add. An `owner/repo#n` "
-                         "here is what --audit-prs reads to check the hold")
+                    help="the held item's note; one per --add. Any string is "
+                         "accepted; an `owner/repo#n` in it is what --audit-prs "
+                         "reads, and a hold with no PR needs a note all the same")
     ap.add_argument("--write", action="store_true",
                     help="persist the new held_item_ids (atomic; other keys untouched)")
     ap.add_argument("--audit-prs", action="store_true",
