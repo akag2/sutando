@@ -109,6 +109,16 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
     crash_after_spent = [mode == "crash_after_spent"]
     me = ["p1"]; d.live_owners.add("p1")          # WATCHER_ID of the running worker process
 
+    def as_claimant(name, keep_live=True):
+        """(P1.3 seam) Run the next steps AS a named claimant, optionally leaving the
+        previous one LIVE. restart() replaces `me` and drops the old owner, so a paused
+        claimant cannot coexist with its successor -- which is why A/B/C is unrepresentable.
+        """
+        prev = me[0]
+        if keep_live: d.live_owners.add(prev)
+        me[0] = name; d.live_owners.add(name)
+        return prev
+
     def walked():
         """The REJECTED recovery: a recursive scan of the phase directories.
 
@@ -308,11 +318,26 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
         if "claimed" not in d.phase_dirs: return          # ENOENT: the rename has no parent
         d.claimed_rec, d.claimed_at = task, now[0]; d.journal = None; claimed += 1
 
-    def worker():
-        v = verdict()
+    def worker_read():
+        """(P1.2 seam) The verdict READ, alone. Returns without committing anything.
+
+        Split out so a schedule can pause between reading and acting -- which is what the
+        real system does and what a fused worker() could not express.
+        """
+        return verdict()
+
+    def worker_commit(v):
+        """(P1.2 seam) Act on a verdict READ EARLIER. Never re-reads."""
         if v == "wedged": return
         if v == "eligible":
             nonlocal claimed; claimed += min(2 * runners, pending - claimed); return
+        return _worker_admit()
+
+    def worker():
+        """Read-then-commit with no pause: the composition every existing test uses."""
+        return worker_commit(worker_read())
+
+    def _worker_admit():
         if mode == "seam" and d.journal is not None:          # the REJECTED design: no reconciliation
             return
         if d.journal is not None:                             # reconcile by the CLAIM, not the journal
@@ -349,6 +374,8 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
         if verdict() == "probation" and d.journal is None and d.claimed_rec is None: gate_step1(f"t{claimed+1}")
 
     def restart():
+        # The old owner STOPS being live: a restart is not a second claimant.
+        # Use as_claimant() when the schedule needs both alive at once.
         d.live_owners.discard(me[0]); me[0] = f"p{len(d.live_owners) + 2}"; d.live_owners.add(me[0])
 
     def contender_rename():
@@ -368,7 +395,23 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
         if d.journal is not None:
             d.claims[d.journal] = "other"; d.live_owners.add("other")
 
+    held = [None]                                 # a verdict READ but not yet acted on
+
+    def step_worker_read():
+        """(P1.2 seam) as a schedule step: read now, commit in a LATER step."""
+        held[0] = worker_read()
+
+    def step_worker_commit():
+        """(P1.2 seam) act on the verdict held from an earlier step, never re-reading."""
+        worker_commit(held[0])
+
+    def step_second_claimant():
+        """(P1.3 seam) a SECOND claimant, with the first left live."""
+        as_claimant("p-b", keep_live=True)
+
     steps = {"kick": kick, "sweep": sweep, "worker": worker, "event": worker, "restart": restart,
+             "worker_read": step_worker_read, "worker_commit": step_worker_commit,
+             "second_claimant": step_second_claimant,
              "crash_worker": crash_worker, "finish": finish, "wait": wait, "drift": drift,
              "other_live_claim": other_live_claim, "tear": tear,
              "contender_rename": contender_rename}
@@ -1099,6 +1142,42 @@ class TheRequestGatesUntilTheAllowanceExists(unittest.TestCase):
         self.assertFalse(d.admit_dir)
         _v, _c, _p, d = run(["kick", "sweep"])
         self.assertTrue(d.admit_dir, "the sweep, and only the sweep, creates it")
+
+
+class TheModelCanExpressWhatTheFusedOneCouldNot(unittest.TestCase):
+    """The point of the split, asserted as EXPRESSIBILITY -- not as protocol correctness.
+
+    These schedules were unwritable before: worker() fused the verdict read with the batch
+    commit, and one mutable `me` could not hold a paused claimant beside its successor.
+    They say the seams exist and are reachable; whether the protocol SURVIVES them is the
+    next PR's question, and deliberately not asserted here.
+    """
+
+    def test_a_verdict_can_be_read_and_committed_in_separate_steps(self):
+        fused = run(["kick", "sweep", "worker"])
+        split = run(["kick", "sweep", "worker_read", "worker_commit"])
+        self.assertEqual(fused[:3], split[:3],
+            "read-then-commit with no pause must equal the fused worker()")
+
+    def test_an_action_can_land_BETWEEN_the_read_and_the_commit(self):
+        """The interleaving P1.2 describes: read, something happens, then commit."""
+        v, c, p, d = run(["sweep", "worker_read", "kick", "worker_commit"])
+        self.assertIsNotNone(v, "the schedule must run at all -- it could not be written before")
+        self.assertTrue(d.request, "the kick landed between the read and the commit")
+
+    def test_a_second_claimant_coexists_with_the_first(self):
+        """P1.3: restart() REPLACES the claimant; as_claimant() adds one."""
+        _, _, _, restarted = run(["kick", "sweep", "worker", "restart"])
+        _, _, _, second = run(["kick", "sweep", "worker", "second_claimant"])
+        self.assertEqual(len(restarted.live_owners), len(second.live_owners) - 1,
+            "a restart drops the old owner; a second claimant keeps it live")
+        self.assertIn("p-b", second.live_owners)
+        self.assertIn("p1", second.live_owners)
+
+    def test_restart_still_drops_the_previous_owner(self):
+        """The existing semantics must NOT have changed -- this is a refactor."""
+        _, _, _, d = run(["kick", "sweep", "worker", "restart"])
+        self.assertNotIn("p1", d.live_owners)
 
 
 if __name__ == "__main__":
