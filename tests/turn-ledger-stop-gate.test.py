@@ -406,7 +406,7 @@ def main() -> int:
         test_one_reminder_per_turn_not_a_standing_refusal,
         test_ended_on_a_message_versus_sent_then_went_quiet,
         test_a_delivered_result_archived_flat_is_still_a_message,
-        test_concurrent_writers_while_compaction_is_firing,
+        test_a_concurrent_trim_does_not_swallow_an_append,
         test_the_reader_uses_the_writers_archive_calendar,
         test_turn_start_is_reachable_from_the_command_line,
         test_record_say_contract_in_process,
@@ -704,68 +704,46 @@ def test_a_delivered_result_archived_flat_is_still_a_message() -> None:
               found is not None and "task-abc123" in found["target"], repr(found))
 
 
-def test_concurrent_writers_while_compaction_is_firing() -> None:
-    """Appends racing an actual trim, unlike the sibling test which never trims.
+def test_a_concurrent_trim_does_not_swallow_an_append() -> None:
+    """The lock's actual protection: `_trim` reads a tail then replaces the file,
+    so an append landing in that window is discarded when the two are not serialised.
 
-    What this establishes: with compaction firing throughout, no line is torn, no
-    surviving run has a hole, and the tail is a new record.
-
-    What it does NOT establish: that the writer lock is required. Moving `_trim`
-    outside the lock still passes. Only ~7% of appends survive an aggressive trim,
-    so a race-lost append is indistinguishable from a legitimately evicted one.
+    The window has to be WIDE and the eviction MILD. A small cap trims fast and
+    evicts almost everything, which both narrows the race and destroys the evidence
+    — a lost append then looks identical to a legitimately evicted one.
     """
-    workers, per_worker = 8, 60
+    cap, keep, workers, per_worker = 2_000_000, 1_999_000, 8, 60
     with tempfile.TemporaryDirectory() as tmp:
         ws = _workspace(tmp)
         path = turn_ledger.ledger_path(ws)
         path.parent.mkdir(parents=True, exist_ok=True)
         filler = json.dumps({"kind": "room", "target": "old", "ts": 1.0}) + "\n"
-        # Just under the cap, so the first concurrent appends push it over.
-        worker_cap = 4096
-        path.write_text(filler * ((worker_cap // len(filler)) - 2), encoding="utf-8")
-        before = path.stat().st_size
-        check("setup: primed close to the workers' trim threshold",
-              worker_cap * 0.8 < before <= worker_cap, f"{before} vs cap {worker_cap}")
-        # Every append must cross the cap, or the trim fires once and the racing
-        # window is too narrow for the defect to show at all.
+        path.write_text(filler * (cap // len(filler)), encoding="utf-8")
         code = ("import sys; sys.path.insert(0, sys.argv[1])\n"
                 "import turn_ledger\n"
-                "turn_ledger.MAX_BYTES = 4096\n"
-                # Both, or the seek runs past the file, raises, and is swallowed:
-                # the trim then silently never runs and the race is never exercised.
-                "turn_ledger.TRIM_TO_BYTES = 2048\n"
+                f"turn_ledger.MAX_BYTES={cap}\nturn_ledger.TRIM_TO_BYTES={keep}\n"
                 "for i in range(%d): turn_ledger.record_send('room', sys.argv[3] + '-%%03d' %% i, sys.argv[2])\n"
                 % per_worker)
         procs = [subprocess.Popen([sys.executable, "-c", code, str(REPO / "src"), str(ws), f"c{p}"])
                  for p in range(workers)]
         for proc in procs:
             proc.wait()
-        raw = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
         entries = turn_ledger.read_entries(ws)
-        check("compaction actually fired", path.stat().st_size <= worker_cap * 1.5,
-              f"{path.stat().st_size} vs worker cap {worker_cap}")
+        raw = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
         check("every surviving line is whole", len(entries) == len(raw),
-              f"{len(entries)} parsed of {len(raw)} raw — a torn line survived")
-        # A trim legitimately evicts OLD records, so completeness is not the
-        # invariant; surviving new records must not be corrupted or interleaved.
-        survivors = {e["target"] for e in entries if str(e.get("target", "")).startswith("c")}
-        bad = sorted(t for t in survivors if not re.fullmatch(r"c\d-\d{3}", t))
-        check("surviving new records are well formed", bool(survivors) and not bad,
-              f"{len(survivors)} survivors, malformed: {bad[:4]}")
-        # The discriminator. A trim evicts the OLDEST records, so per worker the
-        # survivors must be a contiguous suffix; a hole is an append the trim ate.
+              f"{len(entries)} parsed of {len(raw)} raw")
+        check("compaction actually fired", len(raw) < (cap // len(filler)) + workers * per_worker,
+              "nothing was evicted, so no trim ran and the race was never exercised")
+        new = [e for e in entries if str(e.get("target", "")).startswith("c")]
         holes = []
         for worker in range(workers):
-            got = sorted(int(t[3:]) for t in survivors if t.startswith(f"c{worker}-"))
-            if got and got != list(range(got[0], got[0] + len(got))):
+            got = sorted(int(e["target"][3:]) for e in new if e["target"].startswith(f"c{worker}-"))
+            if got:
                 missing = [i for i in range(got[0], got[-1]) if i not in set(got)]
-                holes.append(f"c{worker}: {len(missing)} lost, e.g. {missing[:3]}")
-        check("no append was swallowed by a concurrent trim", not holes, "; ".join(holes[:3]))
-        # A trim keeps the TAIL, so whatever is last on disk must be a new record.
-        # Which worker survives is timing; that the newest write is retained is not.
-        last = json.loads(raw[-1])
-        check("the last line on disk is a new record, not an evicted old one",
-              str(last.get("target", "")).startswith("c"), f"tail is {last.get('target')!r}")
+                if missing:
+                    holes.append(f"c{worker}: {len(missing)} lost e.g. {missing[:3]}")
+        check("no append was swallowed by a concurrent trim", not holes,
+              f"{len(new)} of {workers * per_worker} survived; " + "; ".join(holes[:3]))
 
 
 def test_the_reader_uses_the_writers_archive_calendar() -> None:
