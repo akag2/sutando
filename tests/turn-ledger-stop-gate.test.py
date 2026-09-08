@@ -404,6 +404,7 @@ def main() -> int:
         test_the_command_line_surface,
         test_one_reminder_per_turn_not_a_standing_refusal,
         test_ended_on_a_message_versus_sent_then_went_quiet,
+        test_a_delivered_result_archived_flat_is_still_a_message,
         test_turn_start_is_reachable_from_the_command_line,
         test_record_say_contract_in_process,
         test_a_result_older_than_the_boundary_is_not_this_turns,
@@ -674,6 +675,30 @@ def test_ended_on_a_message_versus_sent_then_went_quiet() -> None:
                   "this is the case the previous design could not see")
         finally:
             turn_ledger.ENDED_ON_A_MESSAGE_S = original
+
+
+def test_a_delivered_result_archived_flat_is_still_a_message() -> None:
+    """The bridge archives a delivered reply within seconds, renaming it.
+
+    The archive holds month partitions and a flat top level, and a fresh
+    delivery lands flat. Scanning only the partitions made a real reply
+    invisible, so the guard nagged the turns that had answered.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = _workspace(tmp)
+        turn_ledger.stop_gate(ws)
+        turn_ledger.begin_turn(ws)
+        since = turn_ledger.last_stop_ts(ws)
+        archive = pathlib.Path(ws) / "results" / "archive"
+        archive.mkdir(parents=True, exist_ok=True)
+        # The delivered name carries the -<epoch> suffix the bridge appends.
+        delivered = archive / "task-abc123-1788843624.txt"
+        delivered.write_text("a real reply body\n", encoding="utf-8")
+        check("setup: it is newer than the boundary",
+              delivered.stat().st_mtime > since, "otherwise the scan is untested")
+        found = turn_ledger._result_after(since, ws)
+        check("a flat-archived delivery is found",
+              found is not None and "task-abc123" in found["target"], repr(found))
 
 
 def test_turn_start_is_reachable_from_the_command_line() -> None:

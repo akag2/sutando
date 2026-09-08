@@ -66,8 +66,6 @@ __all__ = [
 LEDGER_NAME = "turn-ledger.jsonl"
 STOP_NAME = "turn-stop.json"
 TURN_NAME = "turn-reminder.json"
-# Below this, the message was effectively the last thing the turn did.
-ENDED_ON_A_MESSAGE_S = 20.0
 
 # An entry is ~90 bytes and the only question ever asked of this file is "since
 # the last Stop", so the cap is about unbounded growth, not retention depth.
@@ -213,8 +211,10 @@ def _result_dirs(results: Path, ts: float) -> list:
     Bounded to the months spanned by the boundary so a large archive is never
     walked whole; a turn cannot predate its own boundary.
     """
-    dirs = [results]
     archive = results / "archive"
+    # The archive holds month partitions AND a flat top level; a freshly
+    # delivered result lands flat, so scanning only the partitions misses it.
+    dirs = [results, archive]
     months = {datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%Y-%m")
               for t in (ts, time.time())}
     dirs.extend(archive / m for m in sorted(months))
@@ -307,6 +307,10 @@ def reminder_spent(workspace: Path | str | None = None) -> bool:
 
 def spend_reminder(workspace: Path | str | None = None) -> None:
     write_status(TURN_NAME, {"reminded": True, "ts": time.time()}, _workspace(workspace))
+
+
+# Below this, the message was effectively the last thing the turn did.
+ENDED_ON_A_MESSAGE_S = 20.0
 
 
 def stop_gate(workspace: Path | str | None = None) -> str | None:
