@@ -980,13 +980,13 @@ def _slack_context_note(event: dict) -> tuple[str, set[str]]:
 # writers and let one surface's cooldown suppress another's notice.
 _CORE_NOTICE_LEDGER = "core-state-notice-slack.json"
 _CORE_NOTICE_SUFFIX = " _(automated notice)_"
-_CORE_NOTICE_RECOVERY_INTERVAL_S = 15
-# Serialize plan→send→commit (review 2026-09-08, should-fix #2): slack_bolt
-# dispatches event handlers on a thread pool, and the recovery daemon thread
-# sweeps the same ledger — without this, two messages for one channel during an
-# outage (or intake racing recovery) could double-send. Notices are rare, so
-# holding it across the send is fine.
-_core_notice_lock = threading.Lock()
+# All notice sends run on ONE background thread (see _core_notice_loop), NOT on
+# slack_bolt's event-handler thread pool (review 2026-09-08 r4, #1): intake no
+# longer posts inline, so a slow notice can't hold a lock across the network and
+# stall other handlers / exhaust the worker pool. A single sender also needs no
+# lock at all (nothing else touches the ledger). The tick is short so the first
+# "you're offline" line is still prompt.
+_CORE_NOTICE_INTERVAL_S = 5
 # The notice "room" is the reply TARGET, not just the channel: a channel
 # @mention is answered in-thread, so its notice must thread too (review
 # should-fix #3) — else the outage line lands top-level in a busy channel,
@@ -1030,29 +1030,46 @@ def _core_notice_send(room: str, body: str) -> bool:
         return False
 
 
+def _core_notice_pending_rooms() -> set:
+    """Reply targets of queued-but-unanswered tasks — the degraded-notice
+    candidates. Deriving these every tick means a task admitted while the core
+    was healthy still gets a notice if the core later dies, and a first notice
+    whose send failed is retried, without a new message (review r4, #4).
+    The shared cooldown keeps this to one notice per (target, reason)."""
+    rooms = set()
+    with pending_replies_lock:
+        items = list(pending_replies.items())
+    for task_id, info in items:
+        if not isinstance(info, dict):
+            continue
+        channel = info.get("channel")
+        if not channel or (RESULTS_DIR / f"{task_id}.txt").exists():
+            continue  # no channel, or already answered → its silence is over
+        rooms.add(_core_notice_target(channel, info.get("thread_ts")))
+    return rooms
+
+
 def _core_notice_sweep(rooms) -> None:
-    """One sweep pass over the shared core-state logic, on Slack's ledger.
-    Degraded → notice the given rooms; healthy → recover any owed targets.
-    Serialized + never raises (the recovery thread and intake both depend on
-    that)."""
+    """One sweep over the shared core-state logic on Slack's ledger. Degraded →
+    notice the given targets; healthy → recover any owed ones. Runs ONLY on the
+    single sender thread, so it needs no lock. Never raises."""
     try:
-        with _core_notice_lock:
-            _sweep_core_notices(
-                STATE_DIR, rooms, _core_notice_send,
-                log=lambda m: print(f"  [core-notice] {m}", flush=True),
-                ledger_name=_CORE_NOTICE_LEDGER, suffix=_CORE_NOTICE_SUFFIX,
-                recovery_target_ok=_core_notice_target_ok)
+        _sweep_core_notices(
+            STATE_DIR, rooms, _core_notice_send,
+            log=lambda m: print(f"  [core-notice] {m}", flush=True),
+            ledger_name=_CORE_NOTICE_LEDGER, suffix=_CORE_NOTICE_SUFFIX,
+            recovery_target_ok=_core_notice_target_ok)
     except Exception as e:  # noqa: BLE001
         print(f"  [core-notice] sweep failed: {e}", flush=True)
 
 
-def _core_notice_recovery_loop() -> None:
-    """Announce recovery to channels owed one once the core is healthy again.
-    Degraded notices ride message intake; recovery can't (no message need
-    arrive when the core returns), so it runs on this timer."""
+def _core_notice_loop() -> None:
+    """The sole notice sender: every tick, notice pending-unanswered targets if
+    the core is degraded, and announce recovery to owed targets once it's
+    healthy. Keeping every send here (not on intake) is the #1 stall fix."""
     while True:
-        _core_notice_sweep(set())
-        time.sleep(_CORE_NOTICE_RECOVERY_INTERVAL_S)
+        _core_notice_sweep(_core_notice_pending_rooms())
+        time.sleep(_CORE_NOTICE_INTERVAL_S)
 
 
 def _write_task(event: dict, prefix: str, text: str, username: str | None) -> str | None:
@@ -1356,11 +1373,10 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
         task_processed("slack")
     except Exception:  # pragma: no cover — telemetry must never break the bridge
         pass
-    # Silent-core fix: the task is queued above; if the core can't answer right
-    # now, tell this channel why instead of leaving the sender in silence. The
-    # notice targets the reply location (in-thread for a channel @mention) and
-    # the task stays queued regardless — the notice only explains the delay.
-    _core_notice_sweep({_core_notice_target(channel, thread_ts)})
+    # Silent-core fix: the task is queued above (pending_replies). The notice —
+    # if the core can't answer right now — is sent by the single _core_notice_loop
+    # thread, which derives its targets from pending unanswered tasks; intake does
+    # NOT post inline, so a slow notice never stalls this handler (review r4, #1).
     return task_id
 
 
@@ -1939,7 +1955,7 @@ def main():  # pragma: no cover
         print("", flush=True)
 
     threading.Thread(target=result_watcher, name="slack-result-watcher", daemon=True).start()
-    threading.Thread(target=_core_notice_recovery_loop, name="slack-core-notice-recovery", daemon=True).start()
+    threading.Thread(target=_core_notice_loop, name="slack-core-notice", daemon=True).start()
     threading.Thread(target=_no_events_hint_thread, name="slack-no-events-hint", daemon=True).start()
     handler = SocketModeHandler(app, APP_TOKEN)
     global _socket_handler

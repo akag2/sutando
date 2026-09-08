@@ -156,7 +156,8 @@ def _is_discord_channel_id(value: str) -> bool:
     mistaken for one. Shape only — resolution stays with fetch_channel."""
     return value.isdigit() and 17 <= len(value) <= 20
 from result_markers import parse_markers, dedup_cross_channel_target, dedup_requeue_count, build_requeued_task, has_skip_action  # noqa: E402
-from ag2_sparrow.core_state_notice import plan_notices as _plan_core_notices  # noqa: E402
+from ag2_sparrow.core_state_notice import (  # noqa: E402
+    plan_notices as _plan_core_notices, is_core_healthy as _core_is_healthy)
 import mention_gate  # noqa: E402  — owner @-mention ingestion gate (skills/mention-gate)
 from policy.guardrail import engage_rulebook, DISCORD_PROVENANCE  # noqa: E402
 from policy.egress.result import guard_result_for_tier, resolve_access_tier as _resolve_task_tier  # noqa: E402
@@ -2738,12 +2739,19 @@ _CORE_NOTICE_RECOVERY_INTERVAL_S = 15
 # against the recovery loop, since they share the ledger. One event loop, so one
 # asyncio.Lock suffices.
 _core_notice_lock = asyncio.Lock()
+_CORE_NOTICE_RESOLVE_TIMEOUT_S = 5
+
+
+def _ascii_snowflake(room: str) -> bool:
+    """A Discord id is bounded ASCII decimal. `str.isdigit()` is NOT enough —
+    "²".isdigit() is True but int("²") raises, which would abort recovery
+    accounting (review 2026-09-08 r4, #7). Validate before any int()."""
+    return bool(re.fullmatch(r"[0-9]{1,20}", room))
 
 
 async def _send_core_notice(channel, body) -> bool:
     """One notice line to a Discord channel. True iff it reached Discord.
-    Self-contained and best-effort: a failure just means intake/the sweep
-    retries — it must never raise into the caller or the poll loop."""
+    Best-effort: a failure just means the next sweep retries — never raises."""
     try:
         for chunk in _chunk_for_discord(body):
             await channel.send(chunk)
@@ -2753,65 +2761,78 @@ async def _send_core_notice(channel, body) -> bool:
         return False
 
 
-async def _core_notice_on_intake(channel) -> None:
-    """At message admission: if the core is degraded, tell THIS channel why
-    (deduped per reason per cooldown). Recovery is the periodic sweep's job, so
-    a healthy core here is simply a no-op. Never raises."""
+async def _resolve_channel(room: str):
+    """id → channel, trying the cache then a BOUNDED fetch. A cache miss is NOT
+    proof the channel is gone (uncached DM after a reconnect), so we attempt one
+    fetch before giving up (review 2026-09-08 r4, #8); None means unresolved
+    this pass — the sweep leaves the debt for a bounded retry rather than
+    treating the miss as delivered."""
+    ch = client.get_channel(int(room))
+    if ch is not None:
+        return ch
     try:
-        async with _core_notice_lock:  # serialize plan→send→commit vs peers/recovery
-            plan = _plan_core_notices(STATE_DIR, {str(channel.id)},
-                                      ledger_name=_CORE_NOTICE_LEDGER,
-                                      suffix=_CORE_NOTICE_SUFFIX)
-            if plan is None or plan.kind != "degraded":
-                return
-            sent = []
-            for _room, body in plan.items:
-                if await _send_core_notice(channel, body):
-                    sent.append(_room)
-                    print(f"  [core-notice] {plan.reason} sent to #{channel.id}", flush=True)
-            plan.commit(sent)
-    except Exception as e:  # noqa: BLE001 — intake must not fail on a notice
-        print(f"  [core-notice] intake sweep failed: {e}", flush=True)
+        return await asyncio.wait_for(client.fetch_channel(int(room)),
+                                      timeout=_CORE_NOTICE_RESOLVE_TIMEOUT_S)
+    except Exception:  # noqa: BLE001 — NotFound/Forbidden/timeout all → unresolved
+        return None
 
 
-async def _core_notice_recovery_once() -> None:
-    """One recovery pass: if the core is healthy and channels are owed a
-    recovery line, send it and clear them. Never raises."""
+async def _core_notice_sweep(rooms) -> None:
+    """One pass over the shared core-state logic for Discord (async): degraded →
+    notice the given rooms; healthy → recover channels owed one. Serialized
+    against itself (one asyncio.Lock, #2/#4) so concurrent intakes and the
+    periodic loop can't double-send or race the ledger. Completed sends are
+    always committed, even if a later send raises or the batch is cancelled
+    (#2); recovery revalidates health before each send (#5) and stops if the
+    core degraded again. Never raises into the caller."""
     try:
-        async with _core_notice_lock:  # shares the ledger with intake
-            plan = _plan_core_notices(STATE_DIR, set(),
-                                      ledger_name=_CORE_NOTICE_LEDGER,
-                                      suffix=_CORE_NOTICE_SUFFIX,
-                                      # purge a corrupt/forged active key (non-
-                                      # snowflake) instead of resolving it (r3).
-                                      recovery_target_ok=lambda r: r.isdigit())
-            if plan is None or plan.kind != "recovery":
+        async with _core_notice_lock:
+            plan = _plan_core_notices(
+                STATE_DIR, {str(r) for r in rooms},
+                ledger_name=_CORE_NOTICE_LEDGER, suffix=_CORE_NOTICE_SUFFIX,
+                recovery_target_ok=_ascii_snowflake)
+            if plan is None:
                 return
             sent = []
-            for room, body in plan.items:
-                ch = client.get_channel(int(room)) if room.isdigit() else None
-                if ch is None:
-                    # Unresolved (uncached DM / not yet ready): drop the owed
-                    # recovery so it can't wedge the ledger forever. Losing a
-                    # recovery line is benign — the real answer still delivers
-                    # through the normal result path.
-                    sent.append(room)
-                    continue
-                if await _send_core_notice(ch, body):
-                    sent.append(room)
-                    print(f"  [core-notice] recovery sent to #{room}", flush=True)
-            plan.commit(sent)
-    except Exception as e:  # noqa: BLE001 — supervised; keep looping
-        print(f"  [core-notice] recovery sweep failed: {e}", flush=True)
+            try:
+                for room, body in plan.items:
+                    if plan.kind == "recovery" and not _core_is_healthy(STATE_DIR):
+                        break  # core degraded again mid-batch — stale recovery (#5)
+                    ch = await _resolve_channel(room)
+                    if ch is not None and await _send_core_notice(ch, body):
+                        sent.append(room)
+                        print(f"  [core-notice] {plan.kind} sent to #{room}", flush=True)
+                    # ch None or send False → NOT counted delivered; the shared
+                    # commit bumps its failure counter and purges after a bound.
+            finally:
+                plan.commit(sent)
+    except Exception as e:  # noqa: BLE001 — a notice must never break delivery
+        print(f"  [core-notice] sweep failed: {e}", flush=True)
+
+
+def _core_notice_pending_rooms() -> set:
+    """Channels of durably queued-but-unanswered tasks — so the periodic loop
+    RETRIES a degraded notice whose first send failed, even if no new message
+    arrives (review 2026-09-08 r4, #4). Mirrors the gateway's in-flight scan."""
+    rooms = set()
+    for tid, channel in list(pending_replies.items()):
+        cid = getattr(channel, "id", None)
+        if cid is None:
+            continue
+        if (RESULTS_DIR / f"{tid}.txt").exists():
+            continue  # answered — its silence is over
+        rooms.add(str(cid))
+    return rooms
 
 
 async def poll_core_state_recovery():
-    """Announce recovery to every channel that got a degraded notice, once the
-    core is healthy again. Degraded notices ride message intake (a message must
-    arrive to warrant one); recovery cannot — no message need arrive when the
-    core comes back — so it runs on this timer."""
+    """Periodic sweep: announce recovery to channels owed one AND retry degraded
+    notices for still-pending tasks (one sweep does whichever the current core
+    state calls for). Degraded notices also ride intake for promptness; this
+    timer is the safety net for a message that arrived while healthy and a core
+    that then died, and for a first notice send that failed."""
     while True:
-        await _core_notice_recovery_once()
+        await _core_notice_sweep(_core_notice_pending_rooms())
         await asyncio.sleep(_CORE_NOTICE_RECOVERY_INTERVAL_S)
 
 
@@ -4441,10 +4462,11 @@ async def _handle_discord_message(message, force=False):
     # Silent-core fix: the task is durably queued AND its reply route persisted
     # above; only now tell this channel why the core can't answer right away
     # (usage limit / logged out / crashed / wedged). Placed after
-    # save_pending_replies (review 2026-09-08 r3, nit) so the notice's network
-    # await doesn't widen the task-written/route-unpersisted crash window. Never
-    # blocks or fails admission — the notice only explains the delay.
-    await _core_notice_on_intake(message.channel)
+    # save_pending_replies (review r3, nit) so the notice's network await doesn't
+    # widen the task-written/route-unpersisted crash window. A failed send here
+    # is retried by poll_core_state_recovery from the pending-task set (r4, #4).
+    # Never blocks or fails admission — the notice only explains the delay.
+    await _core_notice_sweep({str(message.channel.id)})
 
     # Typing indicator
     async with message.channel.typing():

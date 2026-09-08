@@ -118,12 +118,33 @@ def main():
     try:
         bridge = load_bridge(tmp_home)
         bridge.STATE_DIR = state_dir  # redirect ledger + supervisor reads
+        bridge.RESULTS_DIR = state_dir  # pending-rooms result check reads here
         ledger = state_dir / bridge._CORE_NOTICE_LEDGER
+
+        # A cache/fetch registry the sweep resolves ids through.
+        registry: dict = {}
+        bridge.client.get_channel = lambda cid: registry.get(cid)
+
+        async def _fetch(cid):
+            ch = registry.get(("fetch", cid))
+            if ch is None:
+                raise RuntimeError("NotFound")
+            return ch
+        bridge.client.fetch_channel = _fetch
+
+        def sweep(rooms):
+            asyncio.run(bridge._core_notice_sweep(rooms))
+
+        def reset():
+            ledger.unlink(missing_ok=True)  # isolate scenarios: fresh cooldown+active
+
+        MAX = bridge._plan_core_notices.__globals__["MAX_RECOVERY_ATTEMPTS"]
 
         # 1. degraded intake → notice to this channel, committed to DISCORD ledger
         _write_state(state_dir, "logged-out")
         ch = _Channel(555000000000000001)
-        asyncio.run(bridge._core_notice_on_intake(ch))
+        registry[ch.id] = ch
+        sweep({str(ch.id)})
         expect(len(ch.sent) == 1, "intake: exactly one notice sent")
         expect("logged out" in ch.sent[0], "intake: reason wording is 'logged out'")
         expect("_(automated notice)_" in ch.sent[0], "intake: discord suffix, not gateway's")
@@ -132,49 +153,81 @@ def main():
         expect(not (state_dir / "core-state-notice.json").exists(),
                "intake: did NOT touch the gateway ledger")
 
-        # 2. second message same channel/reason → cooldown suppresses
-        ch2 = _Channel(555000000000000001)
-        asyncio.run(bridge._core_notice_on_intake(ch2))
-        expect(ch2.sent == [], "intake: duplicate suppressed by cooldown")
+        # 2. same channel/reason → cooldown suppresses
+        ch.sent.clear()
+        sweep({str(ch.id)})
+        expect(ch.sent == [], "cooldown: duplicate suppressed")
 
-        # 3. healthy core at intake → no-op
+        # 3. recovery via cache resolution → back online, ledger active cleared
+        _write_state(state_dir, "idle-ready")
+        ch.sent.clear()
+        sweep(set())
+        expect(len(ch.sent) == 1 and "back online" in ch.sent[0],
+               "recovery: back-online delivered via cache")
+        expect(json.loads(ledger.read_text()).get("active") == {},
+               "recovery: ledger active cleared")
+
+        # 4. healthy core → no degraded notice
+        reset()
         _write_state(state_dir, "idle-ready")
         ch3 = _Channel(555000000000000002)
-        asyncio.run(bridge._core_notice_on_intake(ch3))
-        expect(ch3.sent == [], "intake: healthy core sends nothing")
+        registry[ch3.id] = ch3
+        sweep({str(ch3.id)})
+        expect(ch3.sent == [], "healthy core sends no degraded notice")
 
-        # 4. recovery pass → the noticed channel gets "back online", ledger clears
-        rec_ch = _Channel(555000000000000001)
-        bridge.client.get_channel = lambda cid: rec_ch if cid == rec_ch.id else None
-        asyncio.run(bridge._core_notice_recovery_once())
-        expect(len(rec_ch.sent) == 1 and "back online" in rec_ch.sent[0],
-               "recovery: back-online line delivered")
-        active = json.loads(ledger.read_text()).get("active", {})
-        expect(active == {}, "recovery: ledger active cleared")
-        # idempotent: nothing owed now
-        rec_ch2 = _Channel(555000000000000001)
-        bridge.client.get_channel = lambda cid: rec_ch2
-        asyncio.run(bridge._core_notice_recovery_once())
-        expect(rec_ch2.sent == [], "recovery: nothing re-sent once cleared")
-
-        # 5. unresolvable channel is dropped from the ledger, never wedged
+        # 5. #8 — a cache MISS is resolved via a bounded fetch, not dropped
+        reset()
         _write_state(state_dir, "crashed")
-        gone = _Channel(555000000000000009)
-        asyncio.run(bridge._core_notice_on_intake(gone))
-        expect(len(gone.sent) == 1, "setup: degraded notice for the vanishing channel")
-        _write_state(state_dir, "running")
-        bridge.client.get_channel = lambda cid: None  # channel no longer resolvable
-        asyncio.run(bridge._core_notice_recovery_once())
-        active = json.loads(ledger.read_text()).get("active", {})
-        expect(active == {}, "recovery: unresolvable channel cleared, not stuck")
+        fch = _Channel(555000000000000007)
+        registry[("fetch", fch.id)] = fch  # only resolvable via fetch, not cache
+        sweep({str(fch.id)})              # degraded notice (cache miss → fetch)
+        expect(len(fch.sent) == 1, "intake: cache-miss channel resolved via fetch")
+        _write_state(state_dir, "idle-ready")
+        fch.sent.clear()
+        sweep(set())
+        expect(len(fch.sent) == 1 and "back online" in fch.sent[0],
+               "recovery: cache-miss channel resolved via fetch, not dropped")
 
-        # 6. intake send failure burns nothing (retry next message)
+        # 6. #7 — a forged non-ASCII-decimal active key is purged, not crashed
+        reset()
         _write_state(state_dir, "crashed")
-        failing = _Channel(555000000000000003, ok=False)
-        asyncio.run(bridge._core_notice_on_intake(failing))
-        ok = _Channel(555000000000000003)
-        asyncio.run(bridge._core_notice_on_intake(ok))
-        expect(len(ok.sent) == 1, "intake: retry after a failed send (nothing burned)")
+        good = _Channel(555000000000000010)
+        registry[good.id] = good
+        sweep({str(good.id)})
+        led = json.loads(ledger.read_text())
+        led["active"]["²"] = "crashed"   # "²".isdigit() is True; int() raises
+        ledger.write_text(json.dumps(led))
+        _write_state(state_dir, "idle-ready")
+        good.sent.clear()
+        sweep(set())
+        expect(any("back online" in b for b in good.sent),
+               "purge: valid room still recovered alongside the bad key")
+        expect(json.loads(ledger.read_text()).get("active") == {},
+               "purge: forged '²' key removed, not left wedging the ledger")
+
+        # 7. #8/#6 — a permanently unresolvable room is retried a bounded number
+        # of times then purged (never counted as delivered)
+        reset()
+        _write_state(state_dir, "crashed")
+        lost = _Channel(555000000000000011)
+        registry[lost.id] = lost
+        sweep({str(lost.id)})
+        del registry[lost.id]              # now neither cache nor fetch resolves it
+        _write_state(state_dir, "idle-ready")
+        for _ in range(MAX + 1):
+            sweep(set())
+        expect(all("back online" not in b for b in lost.sent),
+               "unresolved room never received recovery")
+        expect(json.loads(ledger.read_text()).get("active") == {},
+               "unresolved room purged after bounded retries, not stuck forever")
+
+        # 8. #4 — pending unanswered tasks feed the periodic retry set
+        bridge.pending_replies = {"task-x": _Channel(555000000000000012),
+                                  "task-done": _Channel(999)}
+        (state_dir / "task-done.txt").write_text("answered")
+        rooms = bridge._core_notice_pending_rooms()
+        expect(rooms == {"555000000000000012"},
+               "pending rooms: only unanswered tasks (answered one excluded)")
     finally:
         shutil.rmtree(state_dir, ignore_errors=True)
         shutil.rmtree(tmp_home, ignore_errors=True)

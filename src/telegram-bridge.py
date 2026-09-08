@@ -1201,12 +1201,6 @@ def main():  # pragma: no cover
         except Exception as e:
             print(f"[Telegram] poll_progress error: {e}", flush=True)
 
-        # Silent-core fix: announce recovery to any chat owed one once the core
-        # is healthy again. Degraded notices ride intake; recovery can't (no
-        # message need arrive when the core returns), so it runs each tick
-        # (getUpdates long-poll paces this loop at ~10s).
-        _core_notice_sweep(set())
-
         # Check for results to send back (includes any orphaned-by-restart
         # routing recovered from the task files themselves — see
         # _gather_pending_task_ids for why this must run every tick).
@@ -1293,6 +1287,15 @@ def main():  # pragma: no cover
                 archive_file(result_file, "results", task_id)
                 task_file = find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt"
                 archive_file(task_file, "tasks", task_id)
+
+        # Silent-core fix (after result draining, review r4 ordering): if the
+        # core is degraded, notice the chats of still-pending unanswered tasks
+        # (retries a failed first notice without a new message, #4); if it's
+        # healthy, announce recovery to any chat owed one. Single-threaded loop,
+        # so no lock; the shared cooldown keeps it to one notice per chat/reason.
+        _pending_chats = {str(cid) for tid, cid in pending_replies.items()
+                          if not (RESULTS_DIR / f"{tid}.txt").exists()}
+        _core_notice_sweep(_pending_chats)
 
         time.sleep(1)
 

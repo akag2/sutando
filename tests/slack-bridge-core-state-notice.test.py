@@ -134,6 +134,18 @@ def main():
         expect(any(k.get("thread_ts") == "1700000000.000100"
                    and "back online" in k.get("text", "") for k in sent),
                "recovery: back-online threads into the same conversation")
+
+        # 6. #4 — the sender derives targets from pending unanswered tasks
+        mod.RESULTS_DIR = state_dir
+        mod.pending_replies = {
+            "task-a": {"channel": "C0PEND", "thread_ts": None},
+            "task-b": {"channel": "C0THR", "thread_ts": "1700000000.000200"},
+            "task-done": {"channel": "C0DONE", "thread_ts": None},
+        }
+        (state_dir / "task-done.txt").write_text("answered")
+        rooms = mod._core_notice_pending_rooms()
+        expect(rooms == {"C0PEND", mod._core_notice_target("C0THR", "1700000000.000200")},
+               "pending rooms: unanswered only, thread targets encoded")
     finally:
         import shutil
         shutil.rmtree(state_dir, ignore_errors=True)
