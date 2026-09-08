@@ -8474,7 +8474,12 @@ def _is_watcher_argv(argv: str) -> bool:
     # script -- the self-match this predicate exists to exclude.
     if parts[1].startswith("-"):
         return False
-    return _WATCHER_SCRIPT.search(argv) is not None
+    # Bind to the EXECUTED script: the first `.sh` token. Searching all of argv
+    # matched a different script handed the watcher's path as data.
+    for tok in parts[1:]:
+        if tok.endswith(".sh"):
+            return _WATCHER_SCRIPT.search(tok) is not None
+    return False
 
 
 # Read from the module that defines the precedence; a copy here is how this

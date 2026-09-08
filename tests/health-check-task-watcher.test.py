@@ -767,6 +767,26 @@ def case_q_trees_swallows_probe_failure() -> list[str]:
     return []
 
 
+def case_aa_argv_classification_binds_to_the_executed_script():
+    """A different script handed the watcher's path as DATA is not a watcher."""
+    fails = []
+    shapes = [
+        ("bash /tmp/unrelated.sh /repo/src/watch-tasks-stream.sh", False),
+        ("bash /repo/src/watch-tasks-stream.sh", True),
+        ("bash /repo/src/watch-tasks-stream.sh /ws/tasks", True),
+        ("bash /My Path/src/watch-tasks-stream.sh", True),
+        ("bash /My Path/src/watch-tasks-stream.sh /ws/tasks", True),
+        ("bash -c echo watch-tasks-stream.sh", False),
+        ("bash /repo/src/x-watch-tasks-stream.sh", False),
+        ("python3 /repo/src/watch-tasks-stream.sh", False),
+    ]
+    for argv, want in shapes:
+        got = hc._is_watcher_argv(argv)
+        if got is not want:
+            fails.append(f"aa) _is_watcher_argv({argv!r}) = {got}, want {want}")
+    return fails
+
+
 def main() -> int:
     cases = [
         ("a", case_a_no_core_is_ok),
@@ -804,6 +824,7 @@ def main() -> int:
         ("y", case_y_json_repair_line_goes_to_stderr),
         ("y2", case_y2_private_keys_stay_out_of_the_json_payload),
         ("z", case_z_an_unreadable_watcher_identity_offers_no_repair_target),
+        ("aa", case_aa_argv_classification_binds_to_the_executed_script),
     ]
     all_failures = []
     for label, fn in cases:
