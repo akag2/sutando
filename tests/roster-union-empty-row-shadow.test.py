@@ -87,5 +87,41 @@ class ShadowedByAnEmptyLocalRow(unittest.TestCase):
                          f"a non-dict local row shadowed a usable peer row; union: {sorted(u)}")
 
 
+class DiscordOnlyRowIsNotARoute(unittest.TestCase):
+    """keweichen on #4047: _usable counted discord_id, but resolve() builds
+    Matrix targets from stand+room alone — so a discord-only local row was
+    RETAINED as usable and then could not be addressed."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.m = _load(SRC)
+
+    def _roster(self, name, data):
+        p = pathlib.Path(self.d, name)
+        p.write_text(json.dumps(data))
+        return p
+
+    def test_a_discord_only_row_is_not_usable(self):
+        self.assertFalse(self.m._usable({"discord_id": "123456789"}))
+        self.assertFalse(self.m._usable({"discord": "someone#1"}))
+
+    def test_a_discord_only_local_row_loses_to_a_routable_peer_row(self):
+        u = self.m.roster_union([
+            ("local", self._roster("l.json", {"r": {"discord_id": "123"}})),
+            ("peer",  self._roster("p.json", {"r": PEER_COMPLETE})),
+        ])
+        self.assertEqual(u["r"].get("room"), PEER_COMPLETE["room"],
+            "a discord id is not a delivery route for either consumer")
+
+    def test_a_refusal_row_still_wins_over_a_routable_peer_row(self):
+        u = self.m.roster_union([
+            ("local", self._roster("l2.json", {"r": {"stand": "", "room": "",
+                                    "refusal_basis": "owner disabled"}})),
+            ("peer",  self._roster("p2.json", {"r": PEER_COMPLETE})),
+        ])
+        self.assertEqual(u["r"].get("stand"), "")
+        self.assertEqual(u["r"].get("refusal_basis"), "owner disabled")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

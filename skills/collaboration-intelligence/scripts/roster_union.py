@@ -57,8 +57,9 @@ def _usable(row) -> bool:
         return False
     if any(str(row.get(k) or "").strip() for k in ("refusal_basis", "note")):
         return True
-    return bool((row.get("stand") and row.get("room"))
-                or row.get("discord_id") or row.get("discord"))
+    # Only a route both consumers can actually deliver on counts. A discord id
+    # is not one here: resolve() builds Matrix targets from stand+room alone.
+    return bool(row.get("stand") and row.get("room"))
 
 
 def roster_union(paths) -> dict:
