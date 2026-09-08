@@ -709,7 +709,8 @@ def test_the_reader_uses_the_writers_archive_calendar() -> None:
     while UTC says 2026-09, so the delivered reply became invisible and the turn
     was reminded for silence after it had answered.
     """
-    import calendar, task_archive
+    import calendar
+    import task_archive
     boundary = calendar.timegm(datetime.datetime(2026, 9, 1, 1, 0, 0).timetuple())
     previous = os.environ.get("TZ")
     try:
