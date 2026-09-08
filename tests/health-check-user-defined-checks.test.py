@@ -20,6 +20,9 @@ Covers:
   i) an extra row never becomes an issue-> is_issue() stays False on a failing one
   j) the path is per-host + workspace    -> hosts/<label>/health-checks-extra.json
   k) run_all_checks appends them        -> the wiring exists, not just the helper
+  l) a shell that exits 0 leaving a bg child -> the child is killed, not orphaned
+  m) output far larger than the detail cap   -> retained bytes stay bounded
+  n) every outcome carries alerting: False   -> an opt-in probe cannot page anyone
 
 Run: python3 tests/health-check-user-defined-checks.test.py
 Exit code: 0 on pass, 1 on fail.
@@ -303,6 +306,62 @@ class TestUserDefinedChecks(unittest.TestCase):
                     and a.func.id == "check_user_defined" for a in n.args)
         ]
         self.assertEqual(len(extended), 1, "expected exactly one checks.extend(check_user_defined(...))")
+
+
+
+class TestUserCheckContainment(unittest.TestCase):
+    """The three runtime bounds: descendant lifetime, retained output, alerting."""
+
+    def test_a_background_child_does_not_outlive_a_normal_exit(self):
+        with tempfile.TemporaryDirectory() as d:
+            marker = Path(d) / "survived"
+            # The shell exits 0 immediately; the child would write AFTER that exit.
+            cmd = f"(sleep 0.6; touch {marker}) & exit 0"
+            code, _ = hc.run_user_command(cmd, 10.0, Path(d))
+            self.assertEqual(code, 0, "the shell itself must still report its own exit")
+            time.sleep(1.2)
+            self.assertFalse(marker.exists(),
+                             "a background grandchild outlived the command that spawned it")
+
+    def test_the_background_child_really_would_have_written_without_the_bound(self):
+        # Positive control: the same shape, run so nothing reaps the group, DOES write.
+        # Without this, the assertion above passes if `touch` simply never worked.
+        with tempfile.TemporaryDirectory() as d:
+            marker = Path(d) / "survived"
+            os.system(f"(sleep 0.2; touch {marker}) & exit 0")
+            time.sleep(0.9)
+            self.assertTrue(marker.exists(), "control failed: the child never wrote at all")
+
+    def test_output_far_over_the_cap_is_not_retained_whole(self):
+        with tempfile.TemporaryDirectory() as d:
+            mib = 2 * 1024 * 1024
+            code, output = hc.run_user_command(
+                f"python3 -c \"print('x' * {mib})\"", 30.0, Path(d))
+            self.assertEqual(code, 0)
+            self.assertLessEqual(len(output), hc.USER_CHECK_OUTPUT_READ_CAP,
+                                 "the whole sink was read into memory")
+            self.assertGreater(len(output), hc.USER_CHECK_DETAIL_CAP,
+                               "the read must still cover what gets rendered")
+
+    def test_every_outcome_suppresses_alerting(self):
+        outcomes = {
+            "ok": "exit 0",
+            "nonzero": "exit 3",
+            "timeout": "sleep 30",
+        }
+        for label, command in outcomes.items():
+            with self.subTest(outcome=label):
+                decl = {"name": label, "command": command, "timeout": 0.4}
+                row = hc.run_user_check(decl, cwd=Path("."))
+                self.assertIs(row.get("alerting"), False,
+                              f"{label} outcome can wake a notifier surface")
+                self.assertFalse(hc.is_issue(row))
+
+    def test_a_command_that_cannot_run_also_suppresses_alerting(self):
+        with mock.patch.object(hc, "run_user_command", side_effect=RuntimeError("boom")):
+            row = hc.run_user_check({"name": "x", "command": "true", "timeout": 1.0})
+        self.assertIs(row.get("alerting"), False)
+        self.assertEqual(row["status"], "warn")
 
 
 if __name__ == "__main__":

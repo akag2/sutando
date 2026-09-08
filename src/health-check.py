@@ -11429,6 +11429,9 @@ USER_CHECKS_FILE = "health-checks-extra.json"
 USER_CHECK_PREFIX = "extra:"
 USER_CHECK_TIMEOUT_S = 30.0
 USER_CHECK_DETAIL_CAP = 300
+#: Only DETAIL_CAP characters survive normalization; reading the whole sink lets an
+#: opt-in command size this process's memory. 200x headroom over what is rendered.
+USER_CHECK_OUTPUT_READ_CAP = 65536
 
 
 def user_checks_path(workspace_dir: Optional[Path] = None,
@@ -11470,6 +11473,15 @@ def load_user_checks(path: Path) -> list:
     return out
 
 
+def _reap_user_command_group(pgid: int) -> None:
+    """A shell can exit 0 while its background children keep running; the group
+    `start_new_session` created must be cleared on that path too, not only on timeout."""
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
 def _kill_user_command_tree(proc) -> None:
     """SIGKILL the group `start_new_session` gave this command, not just the shell
     — killing the shell alone leaves its children running past the timeout."""
@@ -11495,13 +11507,18 @@ def run_user_command(command: str, timeout_s: float, cwd: Path) -> "tuple[int, s
                                     stdout=sink, stderr=subprocess.STDOUT, start_new_session=True)
         except OSError as exc:
             return 127, f"{type(exc).__name__}: {exc}"
+        # start_new_session makes the child its own group leader, so the group id is
+        # its pid — captured before the wait reaps it and the attribute is stale.
+        pgid = proc.pid
         try:
             code = proc.wait(timeout=timeout_s)
         except subprocess.TimeoutExpired:
             _kill_user_command_tree(proc)
             code = 124
+        else:
+            _reap_user_command_group(pgid)
         sink.seek(0)
-        return code, sink.read()
+        return code, sink.read(USER_CHECK_OUTPUT_READ_CAP)
 
 
 def run_user_check(decl: dict, cwd: Optional[Path] = None) -> dict:
@@ -11511,19 +11528,22 @@ def run_user_check(decl: dict, cwd: Optional[Path] = None) -> dict:
     notifier surfaces, so a host's own probe can never mask or manufacture an alert.
     """
     name = f"{USER_CHECK_PREFIX}{decl['name']}"
+    # Suppression is a property of the CHECK, not of its status: --emit-task,
+    # --notify-on-fail and --notify-slack each read a bare warn as a failure.
+    quiet = {"name": name, "alerting": False}
     try:
         code, output = run_user_command(decl["command"], decl["timeout"],
                                         cwd if cwd is not None else REPO_DIR)
     except Exception as exc:
-        return {"name": name, "status": "warn",
+        return {**quiet, "status": "warn",
                 "detail": f"could not run: {type(exc).__name__}: {exc}"[:USER_CHECK_DETAIL_CAP]}
     detail = " ".join(output.split())[:USER_CHECK_DETAIL_CAP] or "(no output)"
     if code == 124:
-        return {"name": name, "status": "warn",
+        return {**quiet, "status": "warn",
                 "detail": f"TIMEOUT after {decl['timeout']:.0f}s (killed): {detail}"}
     if code == 0:
-        return {"name": name, "status": "ok", "detail": detail}
-    return {"name": name, "status": "warn", "detail": f"exit {code}: {detail}"}
+        return {**quiet, "status": "ok", "detail": detail}
+    return {**quiet, "status": "warn", "detail": f"exit {code}: {detail}"}
 
 
 def check_user_defined(workspace_dir: Optional[Path] = None,
