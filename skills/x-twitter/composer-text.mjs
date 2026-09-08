@@ -30,6 +30,29 @@ export function normalizeComposerText(t) {
     .replace(/\r\n?/g, '\n');          // CRLF -> LF (contenteditable line endings)
 }
 
+// OBSERVED ARTIFACT (measured 2026-09-08 against the live composer, not inferred):
+// X renders each EMPTY line as its own paragraph, so `innerText` emits two newlines
+// where the request had one. Requested-vs-read-back, one run between two words:
+//
+//     requested \n x1 -> composer \n x1     (no artifact)
+//     requested \n x2 -> composer \n x3
+//     requested \n x3 -> composer \n x5
+//     requested \n x4 -> composer \n x7     i.e. composer = 2n-1 for n >= 2
+//
+// So EVERY multi-paragraph post failed the guard and could not be published at all.
+// The inverse is applied to the READ-BACK side only, and only to the odd run lengths
+// the artifact can produce: m -> (m+1)/2 for odd m >= 3. An even run is not a shape
+// this artifact generates, so it is left alone and still fails closed — per this
+// module's rule that an unmeasured difference must refuse, never be laundered.
+function undoEmptyLineDoubling(t) {
+  return t.replace(/\n{3,}/g, (run) =>
+    run.length % 2 === 1 ? '\n'.repeat((run.length + 1) / 2) : run);
+}
+
 export function composerMatches(requested, actual) {
-  return normalizeComposerText(requested) === normalizeComposerText(actual);
+  const r = normalizeComposerText(requested);
+  const a = normalizeComposerText(actual);
+  // Asymmetric on purpose: the artifact is the editor's, so it is undone on the
+  // editor's side. Never transform what the caller asked for.
+  return r === a || r === undoEmptyLineDoubling(a);
 }
