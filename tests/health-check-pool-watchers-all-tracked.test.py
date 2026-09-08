@@ -18,6 +18,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 _spec = importlib.util.spec_from_file_location("hc", ROOT / "src" / "health-check.py")
@@ -335,6 +336,70 @@ class TheActorPrecedenceComesFromItsOwner(unittest.TestCase):
         src = (ROOT / "src" / "health-check.py").read_text()
         self.assertNotIn('"AGENT_MXID"', src,
                          "the precedence is spelled here again, so it can drift")
+
+
+class TheDarwinArgvParseIsExercisedOnAnyPlatform(unittest.TestCase):
+    """KERN_PROCARGS2's layout is parsed by hand, so the loops need a test.
+
+    On a linux runner /proc answers first and this branch never executes, so the
+    NUL-skipping and the argc bound would ship unmeasured.
+    """
+
+    @staticmethod
+    def _fake_libc(payload):
+        import ctypes
+
+        class _Libc:
+            def sysctl(self, mib, n, buf, sizep, _a, _b):
+                ctypes.memmove(buf, payload, len(payload))
+                sizep._obj.value = len(payload)
+                return 0
+
+        return _Libc()
+
+    def _vector(self, argc, exec_path, argv, pad=b"", lead=b""):
+        import ctypes
+        import ctypes.util  # noqa: F401 -- must load BEFORE CDLL is patched
+        blob = (argc.to_bytes(4, sys.byteorder) + lead + exec_path + b"\0" + pad
+                + b"\0".join(argv) + b"\0")
+        with patch.object(Path, "read_bytes", side_effect=OSError("not linux")), \
+             patch.object(ctypes, "CDLL", return_value=self._fake_libc(blob)):
+            return hc._proc_argv_vector(4242)
+
+    def test_the_exec_path_is_skipped_and_argv_returned(self):
+        self.assertEqual(
+            self._vector(2, b"/bin/bash", [b"bash", b"/repo/src/watch-tasks-stream.sh"]),
+            ["bash", "/repo/src/watch-tasks-stream.sh"])
+
+    def test_padding_nuls_between_exec_path_and_argv_are_skipped(self):
+        self.assertEqual(
+            self._vector(2, b"/bin/bash", [b"bash", b"/w/x.sh"], pad=b"\0\0\0"),
+            ["bash", "/w/x.sh"])
+
+    def test_leading_nuls_before_the_exec_path_are_skipped(self):
+        # The first skip loop only runs when the blob is padded ahead of the
+        # exec path; without a case for it the branch ships unmeasured.
+        self.assertEqual(
+            self._vector(2, b"/bin/bash", [b"bash", b"/w/y.sh"], lead=b"\0\0"),
+            ["bash", "/w/y.sh"])
+
+    def test_argc_bounds_the_result_so_envp_is_not_read_as_argv(self):
+        # argc=1, but the environment follows argv in the same blob.
+        self.assertEqual(
+            self._vector(1, b"/bin/bash", [b"bash", b"PATH=/usr/bin", b"HOME=/root"]),
+            ["bash"])
+
+    def test_a_failing_sysctl_is_None_not_a_partial_vector(self):
+        import ctypes
+        import ctypes.util  # noqa: F401 -- must load BEFORE CDLL is patched
+
+        class _Fail:
+            def sysctl(self, *a):
+                return -1
+
+        with patch.object(Path, "read_bytes", side_effect=OSError("not linux")), \
+             patch.object(ctypes, "CDLL", return_value=_Fail()):
+            self.assertIsNone(hc._proc_argv_vector(4242))
 
 
 class TheWatcherPredicateIsAShapeNotAFieldCount(unittest.TestCase):
