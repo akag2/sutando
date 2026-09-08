@@ -239,9 +239,8 @@ def test_an_absent_ledger_is_nothing_sent_not_unjudgeable() -> None:
     """
     with tempfile.TemporaryDirectory() as tmp:
         ws = _workspace(tmp)
-        # Each call is captured once: `check`'s detail argument is evaluated
-        # eagerly, so `repr(_hook(ws))` inline would run the hook a second time
-        # and spend this turn's single reminder before the assertion under test.
+        # `check`'s detail argument is eager, so an inline `repr(_hook(ws))` runs
+        # the hook again and spends this turn's one reminder before the assertion.
         first = _hook(ws)
         check("first ever stop is allowed (no boundary yet)", first == {}, repr(first))
         second = _hook(ws)
@@ -433,9 +432,8 @@ def test_an_absent_ledger_still_blocks_after_the_first_stop():
         (ws / "state").mkdir()
         assert turn_ledger.stop_gate(ws) is None, "the first stop has no boundary to measure from"
 
-        # Each turn is reset at its start in production (the UserPromptSubmit hook
-        # calls `turn-start`), so a test spanning turns must do the same or it is
-        # measuring one turn being refused twice, which the design forbids.
+        # Production resets each turn via the UserPromptSubmit hook, so a test
+        # spanning turns must too, or it measures one turn refused twice.
         turn_ledger.begin_turn(ws)
         assert turn_ledger.stop_gate(ws) is not None, (
             "a silent turn is reminded even though no ledger exists"
