@@ -37,6 +37,34 @@ def _write_state(tmp, state, kind=None, mtime=None):
         os.utime(p, (mtime, mtime))
 
 
+def _write_heartbeat(tmp, ts):
+    (tmp / csn.CORE_HEARTBEAT_FILE).write_text(str(int(ts)))
+
+
+def test_watcher_heartbeat_gates_freshness():
+    # Review should-fix #1: freshness must come from the watcher's per-tick
+    # heartbeat, not the state file's (write-on-change) mtime.
+    with tempfile.TemporaryDirectory() as d:
+        tmp = pathlib.Path(d)
+        now = time.time()
+        _write_state(tmp, "logged-out")
+        # FRESH heartbeat → trust the state even with an ancient state mtime
+        _write_state(tmp, "logged-out", mtime=now - 6 * 3600)
+        _write_heartbeat(tmp, now - 5)
+        s = _Sender()
+        csn.sweep_core_state_notices(tmp, {"!a:s"}, s, now=now)
+        assert len(s.sent) == 1, "fresh heartbeat → degraded state is a verdict"
+        # STALE heartbeat → watcher presumed dead → NO verdict (the fix)
+        tmp2 = pathlib.Path(tempfile.mkdtemp())
+        _write_state(tmp2, "logged-out")
+        _write_heartbeat(tmp2, now - csn.WATCHER_STALE_S - 1)
+        s2 = _Sender()
+        csn.sweep_core_state_notices(tmp2, {"!a:s"}, s2, now=now)
+        assert s2.sent == [], "stale heartbeat → watcher dead → no notice"
+        # a healthy sweep with a stale heartbeat also does nothing (no false recovery)
+        assert csn.read_core_state(tmp2, now) is None
+
+
 def test_no_supervisor_file_does_nothing():
     with tempfile.TemporaryDirectory() as d:
         tmp = pathlib.Path(d)
@@ -294,6 +322,7 @@ def test_suffix_names_the_surface():
 
 
 if __name__ == "__main__":
+    test_watcher_heartbeat_gates_freshness()
     test_no_supervisor_file_does_nothing()
     test_degraded_notices_once_per_room_with_cooldown()
     test_failed_send_burns_nothing_and_retries()

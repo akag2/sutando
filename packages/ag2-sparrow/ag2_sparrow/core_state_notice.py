@@ -37,6 +37,14 @@ import time
 from pathlib import Path
 
 CORE_SUPERVISOR_FILE = "core-supervisor.json"
+# Written every tick by core-input-watch (str epoch seconds); its freshness is
+# the watcher's liveness. See read_core_state for why the state file's own mtime
+# can't serve this role.
+CORE_HEARTBEAT_FILE = "core-supervisor-heartbeat"
+# Older than this → the watcher is presumed dead, so its last state is history,
+# not evidence (silent-core review 2026-09-08, should-fix #1). Generous vs the
+# watcher's ~3s tick so a brief hiccup never reads as death.
+WATCHER_STALE_S = 120
 # The gateway's ledger filename (unchanged). Every bridge sharing a workspace
 # writes its OWN ledger — discord/slack/telegram pass a distinct `ledger_name`
 # so concurrent writers never collide on one file and one surface's cooldown
@@ -96,24 +104,47 @@ def _bounded_str(v) -> str | None:
     return v[:_FIELD_MAX] if v else None
 
 
+def _watcher_alive(state_dir: Path, now: float) -> bool | None:
+    """Heartbeat freshness → True (fresh), False (stale = watcher dead), or None
+    (no heartbeat file at all). Separate from the state file's mtime on purpose:
+    core-supervisor.json is write-on-change, so its mtime tracks the last STATE
+    CHANGE, not the watcher's liveness — a genuine hours-long outage leaves it
+    arbitrarily old while the watcher is perfectly alive. The heartbeat is
+    rewritten every tick, so ITS age is the watcher's age."""
+    try:
+        ts = float((Path(state_dir) / CORE_HEARTBEAT_FILE).read_text().strip())
+        return (now - ts) <= WATCHER_STALE_S
+    except FileNotFoundError:
+        return None
+    except Exception:  # noqa: BLE001 — unreadable/garbage heartbeat proves nothing
+        return None
+
+
 def read_core_state(state_dir: Path, now: float | None = None):
     """``core-supervisor.json`` → (state, kind) or None.
 
-    None means "no verdict": file absent (standalone install), unreadable, or
-    malformed. MUST NOT raise — this runs inside the poll loop and a broken
-    side-channel must never become a delivery blocker (same contract as the
-    heartbeat's core-status read).
+    None means "no verdict": file absent (standalone install), unreadable,
+    malformed, OR the watcher's heartbeat is stale. MUST NOT raise — this runs
+    inside the poll loop and a broken side-channel must never become a delivery
+    blocker (same contract as the heartbeat's core-status read).
 
-    Deliberately NO mtime-staleness gate (live finding 2026-09-08): the
-    watcher writes ONLY on state change (core-input-watch's `sig != last_sig`
-    guard), so a stable state — including a multi-hour usage-limit outage, or
-    a week-long weekly-limit one — leaves the mtime arbitrarily old while the
-    content is perfectly current. An earlier 15-minute bound here therefore
-    reintroduced the original silent-drop for any outage longer than the
-    bound. The orphaned-file risk the bound guarded against (watcher dead,
-    last state degraded) is bounded instead by the per-(room, reason)
-    cooldown, and the watcher is supervisor-managed on real installs.
+    Freshness comes from the watcher's per-tick heartbeat, NOT the state file's
+    mtime (silent-core review 2026-09-08, should-fix #1). core-supervisor.json
+    is write-on-change, so a stable state — an hour idle, a multi-hour
+    usage-limit outage, a week-long weekly-limit one — leaves its mtime
+    arbitrarily old while the content is current; an mtime gate here therefore
+    silently dropped notices for any outage longer than the bound. Instead:
+      * heartbeat FRESH  → the watcher is alive, trust the state however old it is
+      * heartbeat STALE  → the watcher died; its last state is history, not a
+                           verdict → None (closes the "notice forever after the
+                           watcher dies mid-outage" gap)
+      * heartbeat ABSENT → a watcher predating the heartbeat; fall back to
+                           trusting the state file (the paired watcher change
+                           ships the heartbeat, so this is only old installs).
     """
+    now = now if now is not None else time.time()
+    if _watcher_alive(state_dir, now) is False:
+        return None  # watcher dead → last state is stale, not evidence
     path = Path(state_dir) / CORE_SUPERVISOR_FILE
     try:
         with open(path) as f:

@@ -504,6 +504,27 @@ def _atomic_write(path, payload):
     os.replace(tmp, path)
 
 
+# Liveness heartbeat, written EVERY tick beside core-supervisor.json — even when
+# the state is unchanged. core-supervisor.json is write-on-change (so the desktop
+# banner isn't churned), which means its mtime says nothing about whether THIS
+# watcher is still alive: a stable state (an hour idle, or a multi-hour usage
+# outage) leaves it arbitrarily old. Consumers that must distinguish "the core is
+# genuinely in state X" from "the watcher died while the last state was X" read
+# this heartbeat's freshness instead of the state file's mtime. A dead watcher
+# stops touching it, so its verdict correctly goes stale (silent-core review
+# 2026-09-08, should-fix #1). Best-effort: a heartbeat write must never take the
+# monitor down, so all errors are swallowed.
+def _write_heartbeat(out_path):
+    hb = os.path.join(os.path.dirname(out_path), "core-supervisor-heartbeat")
+    try:
+        tmp = hb + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(str(int(time.time())))
+        os.replace(tmp, hb)
+    except Exception:  # noqa: BLE001 — liveness ping is best-effort
+        pass
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--socket", required=True)
@@ -566,6 +587,7 @@ def main():
         if last_answered and time.time() - last_answered["at"] > AUTO_ANSWER_CARRY_S:
             last_answered = None
 
+        _write_heartbeat(a.out)  # every tick — liveness, independent of state change
         sig = (state, prompt, last_answered and last_answered["at"])
         if sig != last_sig:
             payload = {"state": state, "detail": detail,
