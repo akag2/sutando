@@ -45,7 +45,13 @@ export function normalizeComposerText(t) {
 // this artifact generates, so it is left alone and still fails closed — per this
 // module's rule that an unmeasured difference must refuse, never be laundered.
 function undoEmptyLineDoubling(t) {
-  return t.replace(/\n{3,}/g, (run) =>
+  // INTERIOR runs only — a non-newline on both sides. That is the boundary the
+  // table above was measured at, and the edges do NOT follow the same law:
+  // measured 2026-09-08, requested "\n\nAAA" reads back as "\n\n\n\nAAA" (four, not
+  // the interior three), and a trailing run the composer drops outright. Widening
+  // past the measured interior would launder an unmeasured difference, which is
+  // the failure this module exists to prevent.
+  return t.replace(/(?<=[^\n])\n{3,}(?=[^\n])/g, (run) =>
     run.length % 2 === 1 ? '\n'.repeat((run.length + 1) / 2) : run);
 }
 

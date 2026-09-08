@@ -43,6 +43,17 @@ check('doubling does not launder a changed word',
 check('the rule is asymmetric — requested text is never transformed',
   !composerMatches('AAA\n\n\nBBB', 'AAA\n\nBBB'));
 
+// The edges are NOT the interior law (qingyun-wu, #4040). Measured 2026-09-08:
+// requested "\n\nAAA" reads back "\n\n\n\nAAA" — four, not the interior three —
+// and a trailing run is dropped by the composer outright. So an edge run is an
+// UNMEASURED difference and must still refuse.
+check('a leading-edge run is unmeasured and refuses',
+  !composerMatches('\n\na', '\n\n\na'));
+check('a trailing-edge run is unmeasured and refuses',
+  !composerMatches('a\n\n', 'a\n\n\n'));
+check('newlines-only is unmeasured and refuses',
+  !composerMatches('\n\n', '\n\n\n'));
+
 console.log('composer read-back guard');
 
 // --- must MATCH: benign editor-side transformations -----------------------------
