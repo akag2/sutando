@@ -242,9 +242,8 @@ def stop_gate(workspace: Path | str | None = None) -> str | None:
     count against the boundary it began from.
     """
     ws = _workspace(workspace)
-    # An absent ledger is not "cannot judge" — it is "nothing has ever been sent",
-    # which is the state this gate exists to catch. Only a missing boundary below
-    # is genuinely unjudgeable, and that is the first stop on a fresh install.
+    # An absent ledger means nothing was ever sent, which is what this gate
+    # catches. Only a missing boundary below is genuinely unjudgeable.
     since = last_stop_ts(ws)
     if since is None:
         mark_stop(ws)
