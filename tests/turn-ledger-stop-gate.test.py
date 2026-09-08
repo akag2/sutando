@@ -33,6 +33,7 @@ Run: python3 tests/turn-ledger-stop-gate.test.py
 from __future__ import annotations
 
 import importlib.util
+import datetime
 import json
 import os
 import pathlib
@@ -191,22 +192,34 @@ def test_concurrent_writers_do_not_lose_or_interleave_a_line() -> None:
               f"{len(raw)} raw lines for {len(expected)} records")
 
 
-def test_an_archived_result_is_not_this_turns_message() -> None:
-    """A delivered result is archived within seconds, so it belongs to an earlier
-    boundary — and a turn that replied long ago then went silent is the case."""
+def test_an_archived_result_is_dated_not_dismissed() -> None:
+    """Archival does not establish a prior turn boundary.
+
+    The bridge archives a delivered result within seconds, independently of the
+    turn ending, so a reply made THIS turn is routinely archived before Stop
+    runs. Treating "archived" as "old" therefore blocks turns that did answer.
+    The boundary is the timestamp, not the directory.
+    """
     with tempfile.TemporaryDirectory() as tmp:
         ws = _workspace(tmp)
-        past = time.time() - 5
-        archive = ws / "results" / "archive" / "2026-09"
+        month = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m")
+        archive = ws / "results" / "archive" / month
         archive.mkdir(parents=True)
-        (archive / "task-1.txt").write_text("a delivered answer\n")
-        check("an archived result is not counted",
-              turn_ledger.delivery_after(past, ws) is None,
-              repr(turn_ledger.delivery_after(past, ws)))
-        (ws / "results" / "task-2.txt").write_text("a live answer\n")
-        check("a top-level result is counted",
-              (turn_ledger.delivery_after(past, ws) or {}).get("target") == "task-2.txt",
-              repr(turn_ledger.delivery_after(past, ws)))
+
+        boundary = time.time() - 5
+        fresh = archive / "task-this-turn.txt"
+        fresh.write_text("a delivered answer\n")
+        check("an archived result newer than the boundary IS this turn's message",
+              turn_ledger.delivery_after(boundary, ws) is not None,
+              repr(turn_ledger.delivery_after(boundary, ws)))
+
+        stale = archive / "task-last-turn.txt"
+        stale.write_text("an older answer\n")
+        os.utime(stale, (boundary - 60, boundary - 60))
+        fresh.unlink()
+        check("an archived result older than the boundary is not",
+              turn_ledger.delivery_after(boundary, ws) is None,
+              repr(turn_ledger.delivery_after(boundary, ws)))
 
 
 def test_an_absent_ledger_is_nothing_sent_not_unjudgeable() -> None:
@@ -369,7 +382,7 @@ def main() -> int:
         test_module_records_both_kinds,
         test_the_file_is_bounded_and_keeps_the_newest,
         test_concurrent_writers_do_not_lose_or_interleave_a_line,
-        test_an_archived_result_is_not_this_turns_message,
+        test_an_archived_result_is_dated_not_dismissed,
         test_an_absent_ledger_is_nothing_sent_not_unjudgeable,
         test_hook_blocks_a_silent_turn,
         test_a_recorded_send_lets_the_turn_end,

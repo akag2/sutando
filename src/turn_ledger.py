@@ -42,6 +42,9 @@ cannot fire.
 """
 from __future__ import annotations
 
+import datetime
+import contextlib
+import fcntl
 import json
 import os
 import sys
@@ -86,6 +89,32 @@ def ledger_path(workspace: Path | str | None = None) -> Path:
     return _workspace(workspace) / "state" / LEDGER_NAME
 
 
+@contextlib.contextmanager
+def _writer_lock(path: Path):
+    """One writer at a time across append and compaction, via a sidecar lock.
+
+    The lock is its own file so compaction's `os.replace` never swaps the inode
+    a holder is waiting on.
+    """
+    lock_path = path.with_name(f".{path.name}.lock")
+    fd = None
+    try:
+        fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except OSError:
+        if fd is not None:
+            os.close(fd)
+            fd = None
+    try:
+        yield
+    finally:
+        if fd is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+
 def _append(entry: dict, workspace: Path | str | None = None) -> None:
     """Append one JSON line, then bound the file. Never raises.
 
@@ -98,12 +127,15 @@ def _append(entry: dict, workspace: Path | str | None = None) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         line = json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n"
-        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
-        try:
-            os.write(fd, line.encode("utf-8"))
-        finally:
-            os.close(fd)
-        _trim(path)
+        # Append and compaction share one lock: `_trim` reads a tail then swaps
+        # the file, so an append landing in that window would be discarded.
+        with _writer_lock(path):
+            fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+            try:
+                os.write(fd, line.encode("utf-8"))
+            finally:
+                os.close(fd)
+            _trim(path)
     except OSError:
         pass
 
@@ -172,6 +204,20 @@ def last_action_after(ts: float, workspace: Path | str | None = None) -> dict | 
     return max(newer, key=lambda e: float(e["ts"])) if newer else None
 
 
+def _result_dirs(results: Path, ts: float) -> list:
+    """`results/` plus the archive partitions a turn starting at `ts` can reach.
+
+    Bounded to the months spanned by the boundary so a large archive is never
+    walked whole; a turn cannot predate its own boundary.
+    """
+    dirs = [results]
+    archive = results / "archive"
+    months = {datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%Y-%m")
+              for t in (ts, time.time())}
+    dirs.extend(archive / m for m in sorted(months))
+    return dirs
+
+
 def _result_after(ts: float, workspace: Path | str | None = None) -> dict | None:
     """A ready result file at the top of `results/` newer than `ts`, or None.
 
@@ -180,9 +226,15 @@ def _result_after(ts: float, workspace: Path | str | None = None) -> dict | None
     message, which is the same distinction the Stop hook's task check makes.
     """
     results = _workspace(workspace) / "results"
-    try:
-        entries = list(os.scandir(results))
-    except OSError:
+    # The bridge archives a delivered result immediately, independently of the
+    # turn ending, so the top level alone loses this turn's own evidence.
+    entries = []
+    for directory in _result_dirs(results, ts):
+        try:
+            entries.extend(os.scandir(directory))
+        except OSError:
+            continue
+    if not entries:
         return None
     best = None
     for item in entries:
