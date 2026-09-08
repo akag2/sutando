@@ -209,12 +209,23 @@ def test_an_archived_result_is_not_this_turns_message() -> None:
               repr(turn_ledger.delivery_after(past, ws)))
 
 
-def test_hook_is_inert_until_the_ledger_exists() -> None:
-    """The arming rule, and the reason the sibling suites stay green."""
+def test_an_absent_ledger_is_nothing_sent_not_unjudgeable() -> None:
+    """There is no arming rule, because arming defeated the gate.
+
+    It previously allowed any turn while the ledger file was absent, and only a
+    recorded send creates that file — so a turn that never sends never created
+    the thing that would catch it. Measured on the live host: five consecutive
+    silent turns all passed. Writing a result file does not create it either,
+    which is how most replies are made here, so it would have stayed inert
+    indefinitely while looking installed.
+
+    Only the FIRST stop is unjudgeable: there is no boundary to measure from.
+    """
     with tempfile.TemporaryDirectory() as tmp:
         ws = _workspace(tmp)
-        check("no ledger: an empty queue still emits {}", _hook(ws) == {}, repr(_hook(ws)))
-        check("no ledger: a second stop is still quiet", _hook(ws) == {}, repr(_hook(ws)))
+        check("first ever stop is allowed (no boundary yet)", _hook(ws) == {}, repr(_hook(ws)))
+        second = _hook(ws)
+        check("a second silent turn is refused", second != {}, repr(second))
 
 
 def test_hook_blocks_a_silent_turn() -> None:
@@ -359,7 +370,7 @@ def main() -> int:
         test_the_file_is_bounded_and_keeps_the_newest,
         test_concurrent_writers_do_not_lose_or_interleave_a_line,
         test_an_archived_result_is_not_this_turns_message,
-        test_hook_is_inert_until_the_ledger_exists,
+        test_an_absent_ledger_is_nothing_sent_not_unjudgeable,
         test_hook_blocks_a_silent_turn,
         test_a_recorded_send_lets_the_turn_end,
         test_a_recorded_no_send_lets_the_turn_end,
@@ -368,6 +379,7 @@ def main() -> int:
         test_an_unanswered_task_still_blocks_with_the_task_reason,
         test_a_gate_that_cannot_run_fails_open,
         test_room_ops_records_only_a_successful_say,
+        test_an_absent_ledger_still_blocks_after_the_first_stop,
     ):
         print(f"{fn.__name__}:")
         fn()
@@ -376,6 +388,27 @@ def main() -> int:
         return 1
     print("turn-ledger-stop-gate: PASS")
     return 0
+
+
+def test_an_absent_ledger_still_blocks_after_the_first_stop():
+    """A turn that never sends anything never creates the ledger — so treating an
+    absent ledger as unjudgeable made the gate inert for exactly the case it
+    exists to catch. Only a missing boundary (the first stop on a fresh install)
+    is genuinely unjudgeable.
+
+    Verified against the live deployment before the fix: with no ledger the gate
+    passed on every consecutive turn.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = pathlib.Path(tmp)
+        (ws / "state").mkdir()
+        assert turn_ledger.stop_gate(ws) is None, "the first stop has no boundary to measure from"
+        assert turn_ledger.stop_gate(ws) is not None, (
+            "a second turn with nothing sent must block even though no ledger exists"
+        )
+        turn_ledger.record_send("room", "!r:example.org", workspace=ws)
+        assert turn_ledger.stop_gate(ws) is None, "a recorded send lets the turn end"
+        assert turn_ledger.stop_gate(ws) is not None, "the turn after it must block again"
 
 
 if __name__ == "__main__":
