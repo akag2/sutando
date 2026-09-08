@@ -655,8 +655,8 @@ def case_l_dead_sentinel_with_live_orphan() -> list[str]:
     fails = []
     if r["status"] != "warn":
         fails.append(f"l) expected warn, got {r['status']}")
-    if "orphaned" not in r["detail"]:
-        fails.append(f"l) detail should name the orphan, got {r['detail']!r}")
+    if "ownerless" not in r["detail"] or "supervised" not in r["detail"]:
+        fails.append(f"l) detail must split roots by owner, got {r['detail']!r}")
     if "IS being drained" not in r["detail"]:
         fails.append("l) must not claim tasks/ is unattended when a watcher runs")
     return fails
@@ -667,8 +667,8 @@ def case_m_absent_sentinel_with_live_orphan() -> list[str]:
     fails = []
     if r["status"] != "warn":
         fails.append(f"m) expected warn, got {r['status']}")
-    if "orphaned" not in r["detail"]:
-        fails.append(f"m) detail should name the orphan, got {r['detail']!r}")
+    if "ownerless" not in r["detail"] or "supervised" not in r["detail"]:
+        fails.append(f"m) detail must split roots by owner, got {r['detail']!r}")
     return fails
 
 
@@ -683,7 +683,9 @@ def case_m2_fabricated_pid_ignores_the_host_process_table() -> list[str]:
         r = run_check(core_alive=True, pid_text=None, trees={"9000": {"9000"}})
     finally:
         hc._pid_parent = saved
-    if "orphaned" not in r["detail"]:
+    # run_check stubs _pid_parent from its own `parents` arg, so the lambda above
+    # is overwritten before the check runs -- 9000's parent reads None either way.
+    if "ownerless" not in r["detail"] or "9000" not in r["detail"]:
         return [f"m2) host pid table leaked into the verdict, got {r['detail']!r}"]
     return []
 

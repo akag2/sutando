@@ -164,10 +164,14 @@ class PoolHost(unittest.TestCase):
         out = hc.fix_task_watcher_sentinel({"_sentinel_restamp_pid": "4242"})
         self.assertIn("no sentinel path", out)
 
-    def test_all_sentinels_dead_with_watchers_running_keeps_the_old_verdict(self):
+    def test_all_sentinels_dead_with_watchers_running_names_and_classifies(self):
+        # "orphaned" applied to every root told an operator to stop a supervised
+        # watcher; the verdict must say which group each root is in.
         r = run({"watch-tasks-stream.pid": "100\n"}, {"777": {"777"}}, argv="")
         self.assertEqual(r["status"], "warn")
-        self.assertIn("orphaned", r["detail"])
+        self.assertIn("777", r["detail"])
+        self.assertIn("ownerless", r["detail"])
+        self.assertIn("supervised", r["detail"])
 
     def test_a_tree_whose_member_is_tracked_counts_as_tracked(self):
         """A watcher's tree holds its children; the sentinel names the root."""

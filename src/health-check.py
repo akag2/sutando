@@ -8606,6 +8606,47 @@ def _watcher_sentinel_target(state_dir, pid):
         return None
 
 
+def _ps_watcher_index(ps_output: str) -> tuple:
+    """(watcher pid -> ppid, every pid in the snapshot) from ONE ps parse.
+
+    Both the tree walk and the ownership split need this; two parses could
+    disagree about a process that exited between them.
+    """
+    me = str(os.getpid())
+    parent: dict = {}
+    live: set = set()
+    for line in ps_output.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        live.add(parts[0])
+        if parts[0] == me:
+            continue
+        # None is UNKNOWN: count it, because a missed watcher starts a second
+        # one and every task is then processed twice.
+        if _is_watcher_argv(parts[2], _as_pid(parts[0])) is False:
+            continue
+        parent[parts[0]] = parts[1]
+    return parent, live
+
+
+def _split_roots_by_owner(roots, ps_output: "str | None" = None) -> tuple:
+    """(ownerless, supervised) for the roots GIVEN, by each root's own parent.
+
+    A known parent that is not init still owns the process; advice that does not
+    separate the two tells an operator to stop somebody's live child.
+    """
+    own, sup = [], []
+    for r in roots:
+        r = str(r)
+        pp = _pid_parent(r, ps_output)
+        if pp and pp not in ("1", "0"):
+            sup.append(r)
+        else:
+            own.append(r)
+    return own, sup
+
+
 def _watcher_trees(ps_output: "str | None" = None) -> dict:
     """Map root PID -> set of PIDs for each distinct watcher TREE running.
 
@@ -8626,17 +8667,7 @@ def _watcher_trees(ps_output: "str | None" = None) -> dict:
                                        timeout=5).stdout
         except Exception:  # noqa: BLE001
             return {}
-    me = str(os.getpid())
-    parent = {}
-    for line in ps_output.splitlines():
-        parts = line.split(None, 2)
-        if len(parts) < 3 or parts[0] == me:
-            continue
-        # None is UNKNOWN: count it, because a missed watcher starts a second
-        # one and every task is then processed twice.
-        if _is_watcher_argv(parts[2], _as_pid(parts[0])) is False:
-            continue
-        parent[parts[0]] = parts[1]
+    parent, _live = _ps_watcher_index(ps_output)
     trees: dict = {}
     for pid in parent:
         root, seen = pid, set()
@@ -8697,7 +8728,7 @@ def check_task_watcher() -> dict:
             # A KNOWN parent that is not init: its spawning session still owns it.
             # Unknown parentage cannot support that claim, so it stays an orphan.
             parents = {r: _pid_parent(r, ps_out) for r in roots}
-            supervised = [r for r, pp in parents.items() if pp and pp != "1"]
+            ownerless, supervised = _split_roots_by_owner(roots, ps_out)
             if len(roots) == 1 and supervised:
                 # Its session is still its parent, so it IS supervised and there is
                 # no second tree to duplicate work. Killing it is what opens a gap.
@@ -8723,10 +8754,14 @@ def check_task_watcher() -> dict:
                                   "sentinel, so health-check cannot track it. Do NOT stop it — "
                                   "it IS draining tasks/. Re-stamp the sentinel with --fix, or "
                                   "restart cleanly only when tasks/ is empty."}
+            # Parentage was computed above and, before this, used only when there
+            # was exactly one root -- so every multi-root set was called orphaned.
             return {"name": name, "status": "warn",
-                    "detail": f"{len(roots)} orphaned watcher(s) running with no PID sentinel "
-                              f"(pids {', '.join(roots)}) — draining tasks/ unsupervised; "
-                              "stop them and restart one cleanly"}
+                    "detail": f"{len(roots)} watcher(s) running with no PID sentinel, "
+                              f"draining tasks/. "
+                              f"ownerless, safe to stop: {', '.join(ownerless) or 'none'}; "
+                              f"supervised, leave alone (a live parent owns them): "
+                              f"{', '.join(supervised) or 'none'}"}
         return {"name": name, "status": "warn",
                 "detail": "watcher not running (no PID sentinel) — tasks/ will not be drained; "
                           "restart via Monitor: bash src/watch-tasks-stream.sh"}
@@ -8761,10 +8796,13 @@ def check_task_watcher() -> dict:
         if roots:
             # A dead sentinel does NOT mean nothing drains tasks/ — restarting
             # here is what makes the duplicates.
+            own, sup = _split_roots_by_owner(roots, ps_out)
             return {"name": name, "status": "warn",
-                    "detail": f"sentinel pid {pid} is dead but {len(roots)} watcher(s) still run "
-                              f"(pids {', '.join(roots)}) — orphaned, tasks/ IS being drained; "
-                              "stop them and restart one cleanly"}
+                    "detail": f"sentinel pid {pid} is dead but {len(roots)} watcher(s) still "
+                              f"run; tasks/ IS being drained. "
+                              f"ownerless, safe to stop: {', '.join(own) or 'none'}; "
+                              f"supervised, leave alone (a live parent owns them): "
+                              f"{', '.join(sup) or 'none'}"}
         return {"name": name, "status": "warn",
                 "detail": f"watcher pid {pid} is dead (crashed — sentinel left behind); restart it"}
 
@@ -8772,10 +8810,14 @@ def check_task_watcher() -> dict:
     extras = sorted(r for r, members in trees.items() if not (members & tracked))
     if extras:
         keep = ", ".join(str(p) for p in sorted(live))
+        own, sup = _split_roots_by_owner(extras, ps_out)
         return {"name": name, "status": "warn",
                 "detail": f"{len(trees)} watcher trees running — {len(extras)} not tracked by any "
-                          f"sentinel (root pids {', '.join(extras)}); duplicates process each task "
-                          f"more than once. Keep the tracked one(s) ({keep}), stop the rest"}
+                          f"sentinel; duplicates process each task more than once. Keep the "
+                          f"tracked one(s) ({keep}). "
+                          f"ownerless, safe to stop: {', '.join(own) or 'none'}; "
+                          f"supervised, leave alone (a live parent owns them): "
+                          f"{', '.join(sup) or 'none'}"}
     alive = ", ".join(str(p) for p in sorted(live))
     # An anomaly belongs to the instance whose sentinel carries it, so a live
     # PEER is not evidence about a crashed one and must not discard its record.
