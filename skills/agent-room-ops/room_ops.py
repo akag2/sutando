@@ -222,6 +222,8 @@ def _main(argv):
                    help="disable the grant (authoritative=false); leaves other policy fields intact")
     p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
 
+    ap.add_argument("--strict", action="store_true",
+                    help="exit 1 on ok:false; must precede the subcommand (default: always 0)")
     a = ap.parse_args(argv)
     if a.cmd == "read":
         res = _read.read_room(a.room_id, a.agent_mxid, a.limit, before=a.before,
@@ -284,9 +286,11 @@ def _main(argv):
         fn = _react.react if a.cmd == "react" else _react.unreact
         res = fn(a.room_id, a.event_id, key, a.agent_mxid)
     print(json.dumps(res, indent=2))
-    # The result's own `ok` decides the exit code. Printing a failure while
-    # exiting 0 makes every `&&` chain and `set -e` caller read it as delivered.
-    return 1 if isinstance(res, dict) and res.get("ok") is False else 0
+    # Default stays 0 on a failed op: callers batch these and read `ok`.
+    # --strict is for shell callers, where exit 0 reads as delivered.
+    if a.strict and isinstance(res, dict) and res.get("ok") is False:
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
