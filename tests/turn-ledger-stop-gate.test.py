@@ -34,6 +34,8 @@ from __future__ import annotations
 
 import importlib.util
 import datetime
+import io
+import contextlib
 import json
 import os
 import pathlib
@@ -393,6 +395,9 @@ def main() -> int:
         test_a_gate_that_cannot_run_fails_open,
         test_room_ops_records_only_a_successful_say,
         test_an_absent_ledger_still_blocks_after_the_first_stop,
+        test_the_command_line_surface,
+        test_a_result_older_than_the_boundary_is_not_this_turns,
+        test_bookkeeping_never_raises_into_the_send_path,
     ):
         print(f"{fn.__name__}:")
         fn()
@@ -422,6 +427,115 @@ def test_an_absent_ledger_still_blocks_after_the_first_stop():
         turn_ledger.record_send("room", "!r:example.org", workspace=ws)
         assert turn_ledger.stop_gate(ws) is None, "a recorded send lets the turn end"
         assert turn_ledger.stop_gate(ws) is not None, "the turn after it must block again"
+
+
+def test_the_command_line_surface() -> None:
+    """The hook shells out to this, so its argv handling is production code.
+
+    Covers each verb, `--workspace` stripping, and the usage path — a wrong exit
+    code here is indistinguishable from a verdict, and the hook only treats
+    `rc == 1` with a reason as a refusal.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = _workspace(tmp)
+        buf = io.StringIO()
+
+        with contextlib.redirect_stdout(buf):
+            first = turn_ledger.main(["--workspace", str(ws), "stop-gate"])
+        check("first stop allows (rc 0)", first == 0, repr(first))
+
+        with contextlib.redirect_stdout(buf):
+            second = turn_ledger.main(["--workspace", str(ws), "stop-gate"])
+        check("a silent second stop refuses (rc 1)", second == 1, repr(second))
+        check("the refusal prints a reason", "no-send" in buf.getvalue(), repr(buf.getvalue()[:80]))
+
+        rc = turn_ledger.main(["--workspace", str(ws), "send", "room", "!r:example.org"])
+        check("send records and exits 0", rc == 0, repr(rc))
+        check("send reached the ledger",
+              any(e["target"] == "!r:example.org" for e in turn_ledger.read_entries(ws)),
+              repr(turn_ledger.read_entries(ws)[-1:]))
+
+        with contextlib.redirect_stdout(buf):
+            check("a recorded send lets the turn end",
+                  turn_ledger.main(["--workspace", str(ws), "stop-gate"]) == 0, "")
+
+        rc = turn_ledger.main(["--workspace", str(ws), "no-send", "nothing", "to", "say"])
+        check("no-send records and exits 0", rc == 0, repr(rc))
+        check("no-send keeps its whole reason",
+              any(e.get("reason") == "nothing to say" for e in turn_ledger.read_entries(ws)),
+              repr(turn_ledger.read_entries(ws)[-1:]))
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            unknown = turn_ledger.main(["--workspace", str(ws), "wat"])
+        check("an unknown verb is rc 2, never a verdict", unknown == 2, repr(unknown))
+        check("usage goes to stderr", "usage:" in err.getvalue(), repr(err.getvalue()[:60]))
+
+
+def test_a_result_older_than_the_boundary_is_not_this_turns() -> None:
+    """The filters inside the result scan: too old, and present but not ready."""
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = _workspace(tmp)
+        (ws / "results").mkdir(parents=True, exist_ok=True)
+        boundary = time.time() - 5
+
+        stale = ws / "results" / "task-old.txt"
+        stale.write_text("an older answer\n")
+        os.utime(stale, (boundary - 60, boundary - 60))
+        check("a result older than the boundary is skipped",
+              turn_ledger.delivery_after(boundary, ws) is None,
+              repr(turn_ledger.delivery_after(boundary, ws)))
+
+        (ws / "results" / "task-empty.txt").write_text("   \n")
+        check("a fresh but unready result is not a message",
+              turn_ledger.delivery_after(boundary, ws) is None,
+              repr(turn_ledger.delivery_after(boundary, ws)))
+
+
+def test_bookkeeping_never_raises_into_the_send_path() -> None:
+    """Recording happens after a message has already gone out, so a failure here
+    must never propagate — the caller has nothing left to undo.
+
+    Exercises the failure branches directly: an unwritable state directory, and
+    a ledger holding a malformed line beside a good one.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = _workspace(tmp)
+        turn_ledger.record_send("room", "!good:example.org", workspace=ws)
+
+        # A corrupt line must be skipped, not crash the reader or hide the rest.
+        with open(turn_ledger.ledger_path(ws), "a", encoding="utf-8") as fh:
+            fh.write("\n")               # a blank line is skipped, not parsed
+            fh.write("not json at all\n")
+            fh.write(json.dumps({"no_ts": True}) + "\n")
+        entries = turn_ledger.read_entries(ws)
+        check("a malformed line is skipped, the good one survives",
+              any(e.get("target") == "!good:example.org" for e in entries),
+              repr(entries))
+
+        # A state dir that was never writable: the lock file cannot even be
+        # created, which is a different failure from an existing-but-locked one.
+        with tempfile.TemporaryDirectory() as tmp2:
+            fresh = _workspace(tmp2)
+            (fresh / "state").mkdir(parents=True, exist_ok=True)
+            os.chmod(fresh / "state", 0o500)
+            try:
+                turn_ledger.record_send("room", "!never:example.org", workspace=fresh)
+                check("a state dir that was never writable does not raise", True, "")
+            finally:
+                os.chmod(fresh / "state", 0o700)
+
+        state = ws / "state"
+        mode = state.stat().st_mode
+        os.chmod(state, 0o500)
+        try:
+            turn_ledger.record_send("room", "!blocked:example.org", workspace=ws)
+            turn_ledger.record_no_send("also blocked", workspace=ws)
+            check("an unwritable state dir does not raise", True, "")
+            check("the gate still answers rather than exploding",
+                  turn_ledger.stop_gate(ws) in (None,) or isinstance(turn_ledger.stop_gate(ws), str), "")
+        finally:
+            os.chmod(state, mode)
 
 
 if __name__ == "__main__":
