@@ -52,7 +52,7 @@ mode the pool has to detect; it is the absence of a pool.
 | **launchd** | keep the processes it was given alive | decide how many there are |
 | **app / bridges** | produce intent as owner tasks; render `state/pool-status.json` | call an API into the pool or touch its state |
 
-No component does two of these. Saturation is something the core **reports**
+Saturation is something the core **reports**
 in its status line ("queue waiting, all N workers busy"); that line is an ask
 to the owner, never an act. Creating a worker is a spend decision, and it
 belongs to the core on the owner's word.
