@@ -50,6 +50,13 @@ def host_rosters(workspace) -> "list[tuple[str, Path]]":
     return out
 
 
+def _usable(row) -> bool:
+    """A row that can actually address someone. Absence and a null field are the
+    same answer here; only the merge treated them differently."""
+    return isinstance(row, dict) and bool(
+        (row.get("stand") and row.get("room")) or row.get("discord_id") or row.get("discord"))
+
+
 def roster_union(paths) -> dict:
     """(host, path) pairs, NEAREST FIRST -> merged rows.
 
@@ -68,5 +75,11 @@ def roster_union(paths) -> dict:
             if key.startswith("_") or key not in merged:
                 merged[key] = row
             elif merged[key] != row:
-                merged[f"{key}@{host or 'legacy'}"] = row
+                # Precedence is by origin EXCEPT when exactly one row is usable:
+                # `stand: null` is a row, so it won a collision like a filled one.
+                if _usable(row) and not _usable(merged[key]):
+                    merged[f"{key}@local"] = merged[key]
+                    merged[key] = row
+                else:
+                    merged[f"{key}@{host or 'legacy'}"] = row
     return merged
