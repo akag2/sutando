@@ -42,7 +42,6 @@ cannot fire.
 """
 from __future__ import annotations
 
-import datetime
 import contextlib
 import fcntl
 import json
