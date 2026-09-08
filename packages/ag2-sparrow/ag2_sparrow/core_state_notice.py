@@ -280,16 +280,21 @@ def plan_notices(state_dir, rooms, now=None, ledger_name: str = LEDGER_FILE,
 
 
 def sweep_core_state_notices(state_dir: Path, rooms, send, log=None,
-                             now: float | None = None) -> None:
+                             now: float | None = None,
+                             ledger_name: str = LEDGER_FILE,
+                             suffix: str = _NOTICE_SUFFIX) -> None:
     """One synchronous pass: notice degraded, announce recovery, persist.
 
     Thin wrapper over :func:`plan_notices` for a caller with a synchronous
-    ``send(room, body) → bool`` (the gateway bridge). ``send`` returning False
-    means not delivered, so no ledger entry is written and the next pass
-    retries; exceptions from ``send`` propagate (the caller owns auth/transport
-    policy). Async callers use ``plan_notices`` + ``NoticePlan.commit`` instead.
+    ``send(room, body) → bool`` (the gateway bridge and the slack/telegram
+    bridges — all synchronous). ``send`` returning False means not delivered,
+    so no ledger entry is written and the next pass retries; exceptions from
+    ``send`` propagate (the caller owns auth/transport policy). ``ledger_name``
+    and ``suffix`` let each surface keep its own ledger + wording (the gateway
+    keeps the defaults). Async callers (discord) use ``plan_notices`` +
+    ``NoticePlan.commit`` directly.
     """
-    plan = plan_notices(state_dir, rooms, now)
+    plan = plan_notices(state_dir, rooms, now, ledger_name, suffix)
     if plan is None:
         return
     verb = "notice" if plan.kind == "degraded" else "recovery notice"

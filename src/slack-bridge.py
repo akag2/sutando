@@ -59,6 +59,10 @@ sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+# ag2-sparrow package root — locates the shared core_state_notice module (same
+# path the gateway/discord bridges add for `import ag2_sparrow`).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "packages" / "ag2-sparrow"))
+from ag2_sparrow.core_state_notice import sweep_core_state_notices as _sweep_core_notices  # noqa: E402
 from task_priority import default_priority_for_source  # noqa: E402
 from optional_script import run_optional_script as _run_optional_script_shared  # noqa: E402
 from presenter_mode import presenter_mode_active  # noqa: E402
@@ -965,6 +969,54 @@ def _slack_context_note(event: dict) -> tuple[str, set[str]]:
         return _slack_context_unavailable_note(), set()
 
 
+# --- Core-state notices (silent-core fix), parity with gateway + discord ------
+# When the core can't answer (usage limit / logged out / crashed / wedged) the
+# bridge kept queuing messages silently; tell the channel why instead. Shared
+# dedup/cooldown/recovery logic + ledger schema live in
+# ag2_sparrow.core_state_notice; this is the (synchronous) Slack binder.
+#
+# A DISTINCT ledger file: slack, discord and the gateway share one
+# workspace/state dir, so a shared ledger would corrupt under concurrent
+# writers and let one surface's cooldown suppress another's notice.
+_CORE_NOTICE_LEDGER = "core-state-notice-slack.json"
+_CORE_NOTICE_SUFFIX = " _(automated notice)_"
+_CORE_NOTICE_RECOVERY_INTERVAL_S = 15
+
+
+def _core_notice_send(channel: str, body: str) -> bool:
+    """Post one notice to a Slack channel (top-level). True iff it reached
+    Slack. Best-effort: a failure just means the next sweep retries — it must
+    never raise into the caller (intake) or the recovery thread."""
+    try:
+        app.client.chat_postMessage(channel=channel, text=body)
+        return True
+    except Exception as e:  # noqa: BLE001 — a notice must never break delivery
+        print(f"  [core-notice] send to {channel} failed: {e}", flush=True)
+        return False
+
+
+def _core_notice_sweep(rooms) -> None:
+    """One sweep pass over the shared core-state logic, on Slack's ledger.
+    Degraded → notice the given rooms; healthy → recover any owed channels.
+    Never raises (the recovery thread and intake both depend on that)."""
+    try:
+        _sweep_core_notices(
+            STATE_DIR, rooms, _core_notice_send,
+            log=lambda m: print(f"  [core-notice] {m}", flush=True),
+            ledger_name=_CORE_NOTICE_LEDGER, suffix=_CORE_NOTICE_SUFFIX)
+    except Exception as e:  # noqa: BLE001
+        print(f"  [core-notice] sweep failed: {e}", flush=True)
+
+
+def _core_notice_recovery_loop() -> None:
+    """Announce recovery to channels owed one once the core is healthy again.
+    Degraded notices ride message intake; recovery can't (no message need
+    arrive when the core returns), so it runs on this timer."""
+    while True:
+        _core_notice_sweep(set())
+        time.sleep(_CORE_NOTICE_RECOVERY_INTERVAL_S)
+
+
 def _write_task(event: dict, prefix: str, text: str, username: str | None) -> str | None:
     """Write a task file from a Slack event. Returns task_id or None if skipped."""
     user_id = event.get("user")
@@ -1266,6 +1318,10 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
         task_processed("slack")
     except Exception:  # pragma: no cover — telemetry must never break the bridge
         pass
+    # Silent-core fix: the task is queued above; if the core can't answer right
+    # now, tell this channel why instead of leaving the sender in silence. The
+    # task stays queued regardless — the notice only explains the delay.
+    _core_notice_sweep({channel})
     return task_id
 
 
@@ -1844,6 +1900,7 @@ def main():  # pragma: no cover
         print("", flush=True)
 
     threading.Thread(target=result_watcher, name="slack-result-watcher", daemon=True).start()
+    threading.Thread(target=_core_notice_recovery_loop, name="slack-core-notice-recovery", daemon=True).start()
     threading.Thread(target=_no_events_hint_thread, name="slack-no-events-hint", daemon=True).start()
     handler = SocketModeHandler(app, APP_TOKEN)
     global _socket_handler
