@@ -84,6 +84,27 @@ def run_case(label, target, recover_at):
     return rc, exc, wrote
 
 
+def check_delay_directly():
+    """The equivalence and the edge cases the loop cases cannot reach."""
+    tmp = Path(tempfile.mkdtemp(prefix="seat-delay-"))
+    m = load_seat(tmp)
+
+    bad = []
+    for cap in (0.2, 1.0, 60.0, 3600.0, 1e6):
+        m.RETRY_MAX_S = cap
+        for n in range(1, 1024):
+            if m._backoff_delay(n) != min(2.0 ** n, cap):
+                bad.append((cap, n))
+    check(not bad, f"5 caps x n=1..1023 match min(2.0**n, cap) exactly ({len(bad)} mismatches)")
+
+    m.RETRY_MAX_S = 60.0
+    check(m._backoff_delay(1024) == 60.0, "n=1024 saturates to the cap instead of raising")
+    check(m._backoff_delay(10 ** 6) == 60.0, "n=1e6 saturates to the cap")
+
+    m.RETRY_MAX_S = 0.0
+    check(m._backoff_delay(5) == 0.0, "cap=0 returns 0 rather than a log2 domain error")
+
+
 def main() -> int:
     # 1024 is where 2.0 ** n stops being representable.
     rc, exc, wrote = run_case("long outage", target=1100, recover_at=None)
@@ -95,6 +116,8 @@ def main() -> int:
     check(exc is None, f"recovery past attempt 1024 does not raise (got {type(exc).__name__ if exc else None})")
     check(rc == 0, f"main() returns 0 after recovering (got {rc})")
     check(wrote, "the recovered answer is written")
+
+    check_delay_directly()
 
     print(("FAIL " + str(len(FAILS))) if FAILS else "PASS")
     return 1 if FAILS else 0
