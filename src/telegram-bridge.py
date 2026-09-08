@@ -294,7 +294,10 @@ def tofu_onboard(sender_id, username):
     print(f"  TOFU: auto-onboarded @{username} (id={sender_id}) as owner — wrote {ACCESS_FILE}")
     return {sender_id}
 
-def api(method, **params):
+def api(method, _timeout_s=30, **params):
+    # _timeout_s is keyword-only-ish (Telegram params never use that name); a
+    # short value keeps a slow notice send from stalling the single poll loop
+    # (review r4-followup #5).
     url = f"https://api.telegram.org/bot{TOKEN}/{method}"
     if params:
         data = json.dumps(params).encode()
@@ -302,7 +305,7 @@ def api(method, **params):
     else:
         req = urllib.request.Request(url)
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=_timeout_s) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
         body = e.read().decode()
@@ -745,7 +748,8 @@ def _core_notice_send(chat_id, body) -> bool:
     """Send one notice to a Telegram chat. True iff Telegram accepted it.
     Best-effort: a failure just means the next sweep retries — never raises."""
     try:
-        return bool(api("sendMessage", chat_id=int(chat_id), text=body).get("ok"))
+        return bool(api("sendMessage", _timeout_s=6,
+                        chat_id=int(chat_id), text=body).get("ok"))
     except Exception as e:  # noqa: BLE001 — a notice must never break delivery
         print(f"  [core-notice] send to {chat_id} failed: {e}", flush=True)
         return False
