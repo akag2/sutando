@@ -38,7 +38,7 @@ if [ -n "$UNPROCESSED" ]; then
   # Encode with a real JSON encoder. Hand-rolled escaping emitted this format
   # string's own \n as a raw newline inside a JSON string value, which is
   # illegal, so every block decision was unparseable and the guard never fired.
-  SUTANDO_HOOK_BODY="$UNPROCESSED" python3 -c 'import json,os,sys; sys.stdout.write(json.dumps({"decision":"block","reason":"Unprocessed tasks in tasks/","additionalContext":"UNPROCESSED TASKS — process these NOW:\n"+os.environ.get("SUTANDO_HOOK_BODY","")}))'
+  SUTANDO_HOOK_BODY="$UNPROCESSED" python3 -c 'import json,os,sys; sys.stdout.write(json.dumps({"decision":"block","reason":"Unprocessed tasks in tasks/","additionalContext":"UNPROCESSED TASKS — process these NOW:\n"+os.environ.get("SUTANDO_HOOK_BODY","")}, separators=(",",":"), ensure_ascii=False))'
 else
   echo '{}'
 fi

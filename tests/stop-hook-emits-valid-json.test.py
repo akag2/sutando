@@ -17,6 +17,11 @@ Also pins body fidelity. The old escaping ran `sed 's/"/\\"/g' | tr '\n' ' '`,
 which left backslashes unescaped — a task body containing one would break the
 JSON again by a different route.
 
+This asserts the SEMANTICS (the response parses). `check-pending-tasks-workspace.test.sh`
+asserts the WIRE SHAPE, matching the literal `"decision":"block"` — so the encoder must keep
+compact separators and `ensure_ascii=False`. Both properties are required; neither implies
+the other, and a first pass at this fix passed here while breaking that sibling suite.
+
 Run: python3 tests/stop-hook-emits-valid-json.test.py
 """
 from __future__ import annotations
