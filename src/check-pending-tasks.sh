@@ -53,6 +53,7 @@ if [ -n "$UNPROCESSED" ] && [ -z "$PYBIN" ]; then
   # and allow the stop: a hand-rolled JSON block is what made this guard unparseable.
   echo "check-pending-tasks: no usable interpreter; queue not reported" >&2
   echo '{}'
+  exit 0
 elif [ -n "$UNPROCESSED" ]; then
   # A real JSON encoder: hand-rolled escaping put a raw newline inside a string
   # value, so every block decision was unparseable and the guard never fired.
