@@ -8754,13 +8754,14 @@ def check_task_watcher() -> dict:
                                   "sentinel, so health-check cannot track it. Do NOT stop it — "
                                   "it IS draining tasks/. Re-stamp the sentinel with --fix, or "
                                   "restart cleanly only when tasks/ is empty."}
-            # Parentage was computed above and, before this, used only when there
-            # was exactly one root -- so every multi-root set was called orphaned.
+            # Two roots process every task twice, so a live parent does not excuse
+            # a duplicate; the split says which to stop first, not which may stay.
             return {"name": name, "status": "warn",
-                    "detail": f"{len(roots)} watcher(s) running with no PID sentinel, "
-                              f"draining tasks/. "
-                              f"ownerless, safe to stop: {', '.join(ownerless) or 'none'}; "
-                              f"supervised, leave alone (a live parent owns them): "
+                    "detail": f"{len(roots)} orphaned watcher(s) running with no PID "
+                              f"sentinel (pids {', '.join(roots)}) — draining tasks/ "
+                              "unsupervised; stop them and restart one cleanly. "
+                              f"ownerless, stop these first: {', '.join(ownerless) or 'none'}; "
+                              f"supervised, stopping one needs its launcher: "
                               f"{', '.join(supervised) or 'none'}"}
         return {"name": name, "status": "warn",
                 "detail": "watcher not running (no PID sentinel) — tasks/ will not be drained; "
