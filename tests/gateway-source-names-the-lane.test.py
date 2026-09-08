@@ -36,7 +36,7 @@ class SourceNamesLane(unittest.TestCase):
         td = tempfile.mkdtemp(prefix="srclane-")
         self.addCleanup(__import__("shutil").rmtree, td, True)
         m = _load(channel_dir, instance, td)
-        tid = m._write_task({"id": "9f2b1c", "task": "probe",
+        tid, _ = m._write_task({"id": "9f2b1c", "task": "probe",
                             "source": wire_source, "access_tier": "owner"})
         self.assertIsNotNone(tid)
         body = (Path(td) / f"{tid}.txt").read_text()

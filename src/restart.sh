@@ -4,8 +4,11 @@
 # Usage: bash src/restart.sh
 #   --stop-only    Stop without restarting
 #   --pool N       Forwarded to startup.sh: install/resize the core pool + lead
+#   --rebuild-app  Rebuild the menu-bar app (scripts/install-menu-bar-app.sh) before relaunching it
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
+REBUILD_APP=0
+[ "${1:-}" = "--rebuild-app" ] && REBUILD_APP=1
 
 # The sentinel IS the clean-exit signal, so a failed write must be visible: a
 # stub interpreter here would let a stop look successful while nothing changed.
@@ -57,6 +60,14 @@ fi
 # window as ours, not a crash, so the owner is not alerted for every restart.
 _WS="$(bash "$(dirname "$0")/../scripts/sutando-config.sh" workspace 2>/dev/null)"
 if [ -n "$_WS" ]; then mkdir -p "$_WS/state/channel-bridge-supervisor"; date +%s > "$_WS/state/channel-bridge-supervisor/deliberate-restart"; fi
+# The heartbeat sidecar outlives the core on purpose, so a restart must hand it over explicitly:
+# startup.sh only starts one when none is running, and an old writer keeps its old schema.
+# No interpreter → no handoff, said aloud; an argv sweep is never the fallback.
+if [ -n "${PY_BIN:-}" ]; then
+    "$PY_BIN" "$REPO/src/core_heartbeat.py" --stop 2>/dev/null || echo "  WARN heartbeat handoff (--stop) failed — the old writer may still be running"
+else
+    echo "  WARN no runnable python3 for the heartbeat handoff — old writer left running (startup will not replace it)"
+fi
 pkill -f "web-client.ts" 2>/dev/null
 pkill -f "dashboard.py" 2>/dev/null
 pkill -f "agent-api.py" 2>/dev/null
@@ -115,7 +126,7 @@ STOP_PATTERNS=(
     "voice-agent" "web-client.ts" "dashboard.py" "agent-api.py"
     "screen-capture-server" "telegram-bridge" "discord-bridge" "slack-bridge"
     "remote-gateway-bridge" "remote-relay-bridge" "observability/boot" "watch-tasks"
-    "conversation-server" "ngrok" "src/Sutando/Sutando"
+    "conversation-server" "ngrok" "src/Sutando/Sutando" "$REPO/src/core_heartbeat.py"
 )
 for _ in $(seq 1 30); do
     still=0
@@ -130,6 +141,18 @@ done
 # A restart is not a shutdown: a sentinel left set would make the surviving
 # core read it as one. --stop-only exits above and deliberately keeps it.
 _shutdown_state clear || true
+
+# The app is already stopped (pkill above, drained by the wait loop), so the
+# build replaces a binary nothing is running. A failed build keeps the old one.
+if [ "$REBUILD_APP" -eq 1 ]; then
+    echo "Rebuilding the menu-bar app..."
+    if bash "$REPO/scripts/install-menu-bar-app.sh" > /tmp/sutando-app-build.log 2>&1; then
+        echo "  ✓ menu-bar app rebuilt"
+    else
+        echo "  ✗ menu-bar app rebuild failed — see /tmp/sutando-app-build.log; relaunching the existing binary"
+    fi
+fi
+
 # Relaunch what line 73 killed. This belongs here, not in startup.sh: that file
 # is guarded headless (tests/startup-headless.test.sh) and owns no desktop UI.
 APP_BIN="$REPO/src/Sutando/Sutando"
