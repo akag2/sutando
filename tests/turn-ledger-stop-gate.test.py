@@ -239,9 +239,15 @@ def test_an_absent_ledger_is_nothing_sent_not_unjudgeable() -> None:
     """
     with tempfile.TemporaryDirectory() as tmp:
         ws = _workspace(tmp)
-        check("first ever stop is allowed (no boundary yet)", _hook(ws) == {}, repr(_hook(ws)))
+        # Each call is captured once: `check`'s detail argument is evaluated
+        # eagerly, so `repr(_hook(ws))` inline would run the hook a second time
+        # and spend this turn's single reminder before the assertion under test.
+        first = _hook(ws)
+        check("first ever stop is allowed (no boundary yet)", first == {}, repr(first))
         second = _hook(ws)
-        check("a second silent turn is refused", second != {}, repr(second))
+        check("a second silent turn is reminded", second != {}, repr(second))
+        third = _hook(ws)
+        check("the same turn is not reminded twice", third == {}, repr(third))
 
 
 def test_hook_blocks_a_silent_turn() -> None:
@@ -397,6 +403,9 @@ def main() -> int:
         test_room_ops_records_only_a_successful_say,
         test_an_absent_ledger_still_blocks_after_the_first_stop,
         test_the_command_line_surface,
+        test_one_reminder_per_turn_not_a_standing_refusal,
+        test_ended_on_a_message_versus_sent_then_went_quiet,
+        test_turn_start_is_reachable_from_the_command_line,
         test_record_say_contract_in_process,
         test_a_result_older_than_the_boundary_is_not_this_turns,
         test_bookkeeping_never_raises_into_the_send_path,
@@ -423,12 +432,21 @@ def test_an_absent_ledger_still_blocks_after_the_first_stop():
         ws = pathlib.Path(tmp)
         (ws / "state").mkdir()
         assert turn_ledger.stop_gate(ws) is None, "the first stop has no boundary to measure from"
+
+        # Each turn is reset at its start in production (the UserPromptSubmit hook
+        # calls `turn-start`), so a test spanning turns must do the same or it is
+        # measuring one turn being refused twice, which the design forbids.
+        turn_ledger.begin_turn(ws)
         assert turn_ledger.stop_gate(ws) is not None, (
-            "a second turn with nothing sent must block even though no ledger exists"
+            "a silent turn is reminded even though no ledger exists"
         )
+
+        turn_ledger.begin_turn(ws)
         turn_ledger.record_send("room", "!r:example.org", workspace=ws)
         assert turn_ledger.stop_gate(ws) is None, "a recorded send lets the turn end"
-        assert turn_ledger.stop_gate(ws) is not None, "the turn after it must block again"
+
+        turn_ledger.begin_turn(ws)
+        assert turn_ledger.stop_gate(ws) is not None, "the next silent turn is reminded again"
 
 
 def test_the_command_line_surface() -> None:
@@ -602,6 +620,65 @@ def test_record_say_contract_in_process() -> None:
               "!unconfirmed:ag2.space" in targets, repr(targets))
         check("a refused say records nothing", "!refused:ag2.space" not in targets, repr(targets))
         check("a non-dict result is ignored rather than raising", True, "")
+
+
+def test_one_reminder_per_turn_not_a_standing_refusal() -> None:
+    """The owner's design: nudge once, then let the turn end.
+
+    A gate that refuses repeatedly turns any mistake into a loop of duplicate
+    replies — the failure the reviewer reproduced. Nudging once bounds the cost of
+    being wrong to a single wasted prompt.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = _workspace(tmp)
+        turn_ledger.stop_gate(ws)                      # establish the boundary
+
+        turn_ledger.begin_turn(ws)
+        check("a silent turn is reminded once", turn_ledger.stop_gate(ws) is not None, "")
+        check("the same turn is NOT refused twice", turn_ledger.stop_gate(ws) is None,
+              "a second refusal is how a wrong gate becomes a loop")
+
+        turn_ledger.begin_turn(ws)
+        check("the next turn is reminded again", turn_ledger.stop_gate(ws) is not None,
+              "the reset must re-arm it")
+
+
+def test_ended_on_a_message_versus_sent_then_went_quiet() -> None:
+    """The distinction the owner corrected me on twice.
+
+    "A message was sent this turn" is not "the turn ended on a message". A turn
+    that replies, works for ten minutes, then stops silently satisfies the first
+    and violates the second — and it is the case I kept committing.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = _workspace(tmp)
+        turn_ledger.stop_gate(ws)
+
+        turn_ledger.begin_turn(ws)
+        turn_ledger.record_send("room", "!r:example.org", workspace=ws)
+        check("a message just sent ends the turn cleanly",
+              turn_ledger.stop_gate(ws) is None, "")
+
+        original = turn_ledger.ENDED_ON_A_MESSAGE_S
+        try:
+            turn_ledger.ENDED_ON_A_MESSAGE_S = 0.001   # the send is now "long ago"
+            turn_ledger.begin_turn(ws)
+            check("a turn that sent early then went quiet IS reminded",
+                  turn_ledger.stop_gate(ws) is not None,
+                  "this is the case the previous design could not see")
+        finally:
+            turn_ledger.ENDED_ON_A_MESSAGE_S = original
+
+
+def test_turn_start_is_reachable_from_the_command_line() -> None:
+    """The hook calls this; if the verb is missing the reset silently never happens."""
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = _workspace(tmp)
+        turn_ledger.spend_reminder(ws)
+        check("reminder starts spent", turn_ledger.reminder_spent(ws), "")
+        rc = turn_ledger.main(["--workspace", str(ws), "turn-start"])
+        check("turn-start exits 0", rc == 0, repr(rc))
+        check("turn-start clears the mark", not turn_ledger.reminder_spent(ws), "")
 
 
 if __name__ == "__main__":

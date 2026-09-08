@@ -65,6 +65,9 @@ __all__ = [
 
 LEDGER_NAME = "turn-ledger.jsonl"
 STOP_NAME = "turn-stop.json"
+TURN_NAME = "turn-reminder.json"
+# Below this, the message was effectively the last thing the turn did.
+ENDED_ON_A_MESSAGE_S = 20.0
 
 # An entry is ~90 bytes and the only question ever asked of this file is "since
 # the last Stop", so the cap is about unbounded growth, not retention depth.
@@ -285,6 +288,27 @@ def mark_stop(workspace: Path | str | None = None) -> float:
     return now
 
 
+def begin_turn(workspace: Path | str | None = None) -> None:
+    """A turn is starting: the reminder is unspent again.
+
+    Reset at turn start rather than when a reminder is sent, so one refusal per
+    turn is the ceiling and a turn can never be refused twice.
+    """
+    write_status(TURN_NAME, {"reminded": False, "ts": time.time()}, _workspace(workspace))
+
+
+def reminder_spent(workspace: Path | str | None = None) -> bool:
+    try:
+        return bool(json.loads(status_read_path(TURN_NAME, _workspace(workspace)).read_text())
+                    .get("reminded"))
+    except (OSError, ValueError):
+        return False
+
+
+def spend_reminder(workspace: Path | str | None = None) -> None:
+    write_status(TURN_NAME, {"reminded": True, "ts": time.time()}, _workspace(workspace))
+
+
 def stop_gate(workspace: Path | str | None = None) -> str | None:
     """None when the turn may end; otherwise the reason it must not.
 
@@ -300,14 +324,21 @@ def stop_gate(workspace: Path | str | None = None) -> str | None:
     if since is None:
         mark_stop(ws)
         return None
-    if delivery_after(since, ws) is None:
-        return ("This turn is ending without a message and without an explicit "
-                "no-send. End the turn by replying — post to the room "
-                "(`room_ops.py say`) or write the result file the task expects — "
-                "or, if silence is the right answer, record that decision: "
-                "`python3 src/turn_ledger.py no-send \"<why>\"`.")
-    mark_stop(ws)
-    return None
+    last = delivery_after(since, ws)
+    if last is not None and (time.time() - float(last["ts"])) <= ENDED_ON_A_MESSAGE_S:
+        mark_stop(ws)
+        return None
+    if reminder_spent(ws):
+        # One nudge per turn. A turn that was already reminded ends regardless:
+        # refusing twice is how a gate that is wrong becomes a loop.
+        mark_stop(ws)
+        return None
+    spend_reminder(ws)
+    return ("This turn is ending without a message and without an explicit "
+            "no-send. Reply — post to the room (`room_ops.py say`) or write the "
+            "result file the task expects — or, if silence is right, record it: "
+            "`python3 src/turn_ledger.py no-send \"<why>\"`. "
+            "This is the only reminder for this turn.")
 
 
 def main(argv: list[str]) -> int:
@@ -321,6 +352,9 @@ def main(argv: list[str]) -> int:
         ws = args[i + 1] if i + 1 < len(args) else None
         del args[i:i + 2]
     cmd = args[0] if args else ""
+    if cmd == "turn-start":
+        begin_turn(ws)
+        return 0
     if cmd == "stop-gate":
         reason = stop_gate(ws)
         if reason:
@@ -334,7 +368,8 @@ def main(argv: list[str]) -> int:
         record_no_send(" ".join(args[1:]), ws)
         return 0
     print(f"usage: {Path(__file__).name} [--workspace DIR] "
-          "stop-gate | send KIND TARGET | no-send REASON", file=sys.stderr)
+          "turn-start | stop-gate | send KIND TARGET | no-send REASON",
+          file=sys.stderr)
     return 2
 
 
