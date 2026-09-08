@@ -464,7 +464,8 @@ and loads whichever repo it reviews.
 
     The mode matters, so check it before reaching for this explanation. Driving all three
     invalidation modes through `spec_from_file_location`, same path, same size, same
-    `int(mtime)` (CPython 3.13.5 and 3.14.6 agree):
+    `int(mtime)` (CPython 3.13.5 and 3.14.6 agree), **under the interpreter's default
+    `check-hash-based-pycs` policy**:
 
     ```
     timestamp       flags=0  serves STALE bytecode   <-- the collision above
@@ -472,9 +473,21 @@ and loads whichever repo it reviews.
     unchecked-hash  flags=1  serves STALE bytecode, and needs neither condition
     ```
 
-    A `checked-hash` cache does not collide at all, so a SURVIVED under one is not explained
-    by this lesson; an `unchecked-hash` cache is worse than described, because it never
-    revalidates and so stays stale even when size and mtime both change.
+    Under that same default policy, a `checked-hash` cache does not collide at all, so a
+    SURVIVED under one is not explained by this lesson; an `unchecked-hash` cache is worse
+    than described, because it never revalidates and so stays stale even when size and mtime
+    both change. **Both statements are policy-conditional, and the flag inverts them** —
+    PEP 552's `--check-hash-based-pycs` overrides the per-file bit in either direction.
+    Measured on 3.14.6, rebuilding the cache for every row so no run inherits the previous
+    one's rewrite:
+
+    ```
+    unchecked-hash  flags=1  default -> STALE    always -> caught    never -> STALE
+    checked-hash    flags=3  default -> caught   always -> caught    never -> STALE
+    ```
+
+    So `always` rescues the mode this lesson calls hopeless, and `never` breaks the one it
+    calls safe. Read the policy before trusting either row.
     *Re-derived on `scripts/my-stale-approvals.py` (11,285 B at `fcbd3539`) + its 45-test suite.
     Mutating one line each, the five variants are 11,259 / 11,286 / 11,286 / 11,259 / 11,268 B —
     two same-size pairs, m1/m4 and m2/m3:*
