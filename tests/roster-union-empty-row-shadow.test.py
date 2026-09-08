@@ -59,6 +59,24 @@ class ShadowedByAnEmptyLocalRow(unittest.TestCase):
         u = self.m.roster_union([("local", self.local), ("peer", self.peer)])
         self.assertEqual(u["k"]["note"], "local")
 
+    def test_a_deliberate_local_REFUSAL_is_not_treated_as_a_placeholder(self):
+        """Blank stand/room PLUS refusal_basis is DO-NOT-ROUTE per schema.md, not
+        missing data. keweichen, reviewing this PR: the tie-break must not route
+        around it, or a synced peer row silently overrides an explicit refusal."""
+        self.local.write_text(json.dumps({"qingyun-wu": {
+            "stand": "", "room": "", "refusal_basis": "DO NOT ROUTE — asked off-channel"}}))
+        self.peer.write_text(json.dumps({"qingyun-wu": PEER_COMPLETE}))
+        u = self.m.roster_union([("local", self.local), ("peer", self.peer)])
+        self.assertEqual(u["qingyun-wu"].get("refusal_basis"),
+                         "DO NOT ROUTE — asked off-channel",
+                         f"the refusal lost the collision; union: {sorted(u)}")
+
+    def test_a_note_alone_also_protects_the_row(self):
+        self.local.write_text(json.dumps({"k": {"stand": None, "note": "human-only by request"}}))
+        self.peer.write_text(json.dumps({"k": {"stand": "@b:x", "room": "!b:x"}}))
+        u = self.m.roster_union([("local", self.local), ("peer", self.peer)])
+        self.assertEqual(u["k"].get("note"), "human-only by request")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

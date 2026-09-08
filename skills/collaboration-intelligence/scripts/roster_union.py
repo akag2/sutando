@@ -51,10 +51,14 @@ def host_rosters(workspace) -> "list[tuple[str, Path]]":
 
 
 def _usable(row) -> bool:
-    """A row that can actually address someone. Absence and a null field are the
-    same answer here; only the merge treated them differently."""
-    return isinstance(row, dict) and bool(
-        (row.get("stand") and row.get("room")) or row.get("discord_id") or row.get("discord"))
+    """Addressable, OR a deliberate refusal. A blank `stand` carrying
+    `refusal_basis`/`note` is DO-NOT-ROUTE and must not lose to a peer row."""
+    if not isinstance(row, dict):
+        return False
+    if any(str(row.get(k) or "").strip() for k in ("refusal_basis", "note")):
+        return True
+    return bool((row.get("stand") and row.get("room"))
+                or row.get("discord_id") or row.get("discord"))
 
 
 def roster_union(paths) -> dict:
