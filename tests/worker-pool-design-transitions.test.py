@@ -405,13 +405,20 @@ def run(order, mode="token", pending=5, runners=RUNNERS, claim_fails_once=False,
         """(P1.2 seam) act on the verdict held from an earlier step, never re-reading."""
         worker_commit(held[0])
 
-    def step_second_claimant():
-        """(P1.3 seam) a SECOND claimant, with the first left live."""
-        as_claimant("p-b", keep_live=True)
+    def step_second_claimant(name="p-b"):
+        """(P1.3 seam) ANOTHER claimant, with the previous left live.
+
+        Takes a name so a schedule can stack three -- A holds a claim, B rolls the
+        token back, C consumes it -- which is the A/B/C shape P1.3 describes.
+        """
+        as_claimant(name, keep_live=True)
+
+    def step_third_claimant():
+        step_second_claimant("p-c")
 
     steps = {"kick": kick, "sweep": sweep, "worker": worker, "event": worker, "restart": restart,
              "worker_read": step_worker_read, "worker_commit": step_worker_commit,
-             "second_claimant": step_second_claimant,
+             "second_claimant": step_second_claimant, "third_claimant": step_third_claimant,
              "crash_worker": crash_worker, "finish": finish, "wait": wait, "drift": drift,
              "other_live_claim": other_live_claim, "tear": tear,
              "contender_rename": contender_rename}
@@ -1158,6 +1165,11 @@ class TheModelCanExpressWhatTheFusedOneCouldNot(unittest.TestCase):
         split = run(["kick", "sweep", "worker_read", "worker_commit"])
         self.assertEqual(fused[:3], split[:3],
             "read-then-commit with no pause must equal the fused worker()")
+        fd, sd = fused[3], split[3]
+        for field in ("record", "claims", "live_owners", "results", "journal",
+                      "claimed_rec", "token", "spent", "request", "probation"):
+            self.assertEqual(getattr(fd, field), getattr(sd, field),
+                f"disk field {field} diverges, so the composition is not equal")
 
     def test_an_action_can_land_BETWEEN_the_read_and_the_commit(self):
         """The interleaving P1.2 describes: read, something happens, then commit."""
@@ -1173,6 +1185,12 @@ class TheModelCanExpressWhatTheFusedOneCouldNot(unittest.TestCase):
             "a restart drops the old owner; a second claimant keeps it live")
         self.assertIn("p-b", second.live_owners)
         self.assertIn("p1", second.live_owners)
+
+    def test_THREE_claimants_can_coexist_for_the_A_B_C_schedule(self):
+        """P1.3 names three parties; two was not enough to write it."""
+        _, _, _, d = run(["kick", "sweep", "worker", "second_claimant", "third_claimant"])
+        for who in ("p1", "p-b", "p-c"):
+            self.assertIn(who, d.live_owners)
 
     def test_restart_still_drops_the_previous_owner(self):
         """The existing semantics must NOT have changed -- this is a refactor."""
