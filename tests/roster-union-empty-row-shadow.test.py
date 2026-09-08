@@ -77,6 +77,15 @@ class ShadowedByAnEmptyLocalRow(unittest.TestCase):
         u = self.m.roster_union([("local", self.local), ("peer", self.peer)])
         self.assertEqual(u["k"].get("note"), "human-only by request")
 
+    def test_a_NON_DICT_row_is_never_usable(self):
+        """A roster value that is not an object (a bare string, a null) must not
+        win a collision as if it were addressable — and must not crash the merge."""
+        self.local.write_text(json.dumps({"k": "just-a-string"}))
+        self.peer.write_text(json.dumps({"k": PEER_COMPLETE}))
+        u = self.m.roster_union([("local", self.local), ("peer", self.peer)])
+        self.assertEqual(u["k"], PEER_COMPLETE,
+                         f"a non-dict local row shadowed a usable peer row; union: {sorted(u)}")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
