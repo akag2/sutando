@@ -29,7 +29,7 @@ worker".
 
 | file | role |
 |---|---|
-| `Dockerfile` | `base` target (default, ~150 MB): python:3.12-slim, non-root `sutando`, the allowlisted COPYs, HEALTHCHECK, ENTRYPOINT. `claude` target (~380 MB): adds the Claude Code CLI via its native installer, no node. |
+| `Dockerfile` | `base` target (default, 161 MiB measured at `657d633c`): python:3.12-slim, non-root `sutando`, the allowlisted COPYs, HEALTHCHECK, ENTRYPOINT. `claude` target (~380 MB): adds the Claude Code CLI via its native installer, no node. |
 | `entrypoint.sh` | validates env, writes the workspace config, starts the client and the seat runtime, exits when either dies (the restart policy relaunches). |
 | `seat-stub.py` | `stub` runtime: answers every task with `answered by <worker id>`. |
 | `seat-ag2-assistant.py` | `ag2-assistant` runtime: one ACP session per task against the AG2 Assistant sidecar, result signed `— <worker id> (ag2-assistant)`. |
