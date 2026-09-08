@@ -124,7 +124,7 @@ class DiscordOnlyRowIsNotARoute(unittest.TestCase):
 
 
 class UnionToResolveRegression(unittest.TestCase):
-    """qingyun-wu's named unblock condition on #4047: drive the PRODUCTION
+    """keweichen's named unblock condition on #4047: drive the PRODUCTION
     roster_union() -> notify_reviewers.resolve() path, not just the union."""
 
     def setUp(self):
