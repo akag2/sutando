@@ -140,6 +140,18 @@ check("boundary: 'sh' inside another word does not introduce a script",
 check("CONTROL: a real sh invocation of the same missing path warns",
       hc._cron_missing_script({"prompt": "sh scripts/does-not-exist.sh"})
       == "scripts/does-not-exist.sh")
+# Real host entries (#3672 review): both read as MISSING before the fix, and the
+# verdict tells an operator to delete a schedule that runs every hour.
+check("a *.sh extension is not an `sh` invocation, even with two substitutions",
+      hc._cron_missing_script({"prompt": 'Run: python3 "$(bash scripts/'
+       'sutando-config.sh workspace)/hosts/$(bash scripts/sutando-config.sh '
+       'host-label)/restart-watch-beat.py"'}) is None)
+check("a command that cd's elsewhere is not resolved against REPO_DIR",
+      hc._cron_missing_script({"prompt": "cd $WS/skill-repos/x/skills/zacks-check"
+       " && python3 scripts/zacks-check.py"}) is None)
+check("CONTROL: the same relative path with no cd still warns",
+      hc._cron_missing_script({"prompt": "python3 scripts/zacks-check.py"})
+      == "scripts/zacks-check.py")
 
 print()
 if failures:

@@ -7050,12 +7050,19 @@ def _cron_missing_script(entry: dict) -> Optional[str]:
     cmd = " ".join(str(entry.get(k) or "") for k in ("prompt", "prompt_skill"))
     # Only an INVOKED path counts, and only when the reference is unambiguous:
     # this verdict makes the operator delete a schedule, so doubt must read ok.
-    for m in re.finditer(r"\b(?:python3?|bash|sh|node|npx|tsx)\s+(\S+)", cmd):
+
+    # `\b` is not a token boundary: `.` is a non-word char, so `\bsh` matched the
+    # extension of any *.sh and captured a shell-expansion fragment (#3672).
+    for m in re.finditer(r"(?:^|\s)(?:python3?|bash|sh|node|npx|tsx)\s+(\S+)", cmd):
         ref = m.group(1).strip("\"'").rstrip(";&|")
         if not ref.endswith((".py", ".sh", ".ts", ".mjs")):
             continue
         # A negation before the interpreter makes this a mention, not a run.
         if _CRON_NOT_A_RUN.search(cmd[:m.start()]):
+            continue
+        # A `cd` earlier in the command moves the base a relative path resolves
+        # against, and REPO_DIR is then the wrong one: doubt must read ok.
+        if not ref.startswith("/") and re.search(r"(?:^|\s|&&|;)cd\s", cmd[:m.start()]):
             continue
         # An absolute path resolves on its own; only a repo-relative one is
         # judged against REPO_DIR, so a valid /tmp script is never "missing".
