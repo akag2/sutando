@@ -104,20 +104,29 @@ def _bounded_str(v) -> str | None:
     return v[:_FIELD_MAX] if v else None
 
 
-def _watcher_alive(state_dir: Path, now: float) -> bool | None:
-    """Heartbeat freshness → True (fresh), False (stale = watcher dead), or None
-    (no heartbeat file at all). Separate from the state file's mtime on purpose:
-    core-supervisor.json is write-on-change, so its mtime tracks the last STATE
-    CHANGE, not the watcher's liveness — a genuine hours-long outage leaves it
-    arbitrarily old while the watcher is perfectly alive. The heartbeat is
-    rewritten every tick, so ITS age is the watcher's age."""
+def _watcher_liveness(state_dir: Path, now: float) -> str:
+    """Heartbeat freshness as one of: "fresh" (watcher alive), "stale" (watcher
+    died), "absent" (no heartbeat file), "invalid" (unreadable/garbled).
+
+    Separate from the state file's mtime on purpose: core-supervisor.json is
+    write-on-change, so its mtime tracks the last STATE CHANGE, not the
+    watcher's liveness — a genuine hours-long outage leaves it arbitrarily old
+    while the watcher is perfectly alive. The heartbeat is rewritten every tick,
+    so ITS age is the watcher's age.
+
+    "absent" and "invalid" are DISTINCT (review 2026-09-08 r3): absent means an
+    old watcher that predates the heartbeat (trust the state, for compat);
+    invalid means the file is there but garbage (freshness genuinely unknown →
+    the caller withholds a verdict rather than trusting a possibly-dead watcher).
+    Writes are atomic (os.replace), so a reader never sees a torn write — an
+    invalid heartbeat is real corruption/tampering, not a benign race."""
     try:
         ts = float((Path(state_dir) / CORE_HEARTBEAT_FILE).read_text().strip())
-        return (now - ts) <= WATCHER_STALE_S
     except FileNotFoundError:
-        return None
-    except Exception:  # noqa: BLE001 — unreadable/garbage heartbeat proves nothing
-        return None
+        return "absent"
+    except Exception:  # noqa: BLE001 — present but unreadable/garbled
+        return "invalid"
+    return "fresh" if (now - ts) <= WATCHER_STALE_S else "stale"
 
 
 def read_core_state(state_dir: Path, now: float | None = None):
@@ -141,10 +150,12 @@ def read_core_state(state_dir: Path, now: float | None = None):
       * heartbeat ABSENT → a watcher predating the heartbeat; fall back to
                            trusting the state file (the paired watcher change
                            ships the heartbeat, so this is only old installs).
+      * heartbeat INVALID→ present but garbled; freshness genuinely unknown →
+                           None (do NOT trust-forever; review 2026-09-08 r3).
     """
     now = now if now is not None else time.time()
-    if _watcher_alive(state_dir, now) is False:
-        return None  # watcher dead → last state is stale, not evidence
+    if _watcher_liveness(state_dir, now) in ("stale", "invalid"):
+        return None  # watcher dead or freshness unknown → last state not evidence
     path = Path(state_dir) / CORE_SUPERVISOR_FILE
     try:
         with open(path) as f:
@@ -253,29 +264,36 @@ class NoticePlan:
     """
 
     __slots__ = ("kind", "reason", "items", "_ledger", "_now",
-                 "_state_dir", "_ledger_name")
+                 "_state_dir", "_ledger_name", "_purge")
 
-    def __init__(self, kind, reason, items, ledger, now, state_dir, ledger_name):
+    def __init__(self, kind, reason, items, ledger, now, state_dir, ledger_name,
+                 purge=()):
         self.kind, self.reason, self.items = kind, reason, items
         self._ledger, self._now = ledger, now
         self._state_dir, self._ledger_name = state_dir, ledger_name
+        # Recovery-only: active keys that failed target validation — garbage or
+        # forged destinations to DROP without sending (review 2026-09-08 r3).
+        self._purge = set(purge)
 
     def commit(self, sent_rooms) -> None:
         sent = set(sent_rooms)
-        if not sent and self.kind == "degraded":
-            return  # nothing delivered → nothing to persist (recovery still prunes)
         if self.kind == "degraded":
+            if not sent:
+                return  # nothing delivered → nothing to persist
             for room in sent:
                 self._ledger["last_sent"].setdefault(room, {})[self.reason] = self._now
                 self._ledger["active"][room] = self.reason
-        else:  # recovery: the owed notice is discharged only once delivered
-            for room in sent:
+        else:  # recovery: discharge delivered notices AND drop invalid targets
+            if not sent and not self._purge:
+                return
+            for room in sent | self._purge:
                 self._ledger["active"].pop(room, None)
         _save_ledger(self._state_dir, self._ledger, self._now, self._ledger_name)
 
 
 def plan_notices(state_dir, rooms, now=None, ledger_name: str = LEDGER_FILE,
-                 suffix: str = _NOTICE_SUFFIX) -> "NoticePlan | None":
+                 suffix: str = _NOTICE_SUFFIX,
+                 recovery_target_ok=None) -> "NoticePlan | None":
     """Read core state + ledger and decide what to send — WITHOUT sending.
 
     Returns None when there is nothing to do (feature disabled, no verdict, an
@@ -283,6 +301,15 @@ def plan_notices(state_dir, rooms, now=None, ledger_name: str = LEDGER_FILE,
     same spam bound holds regardless of caller: per room, ≤ one degraded notice
     per reason per cooldown window, and ≤ one recovery per DELIVERED notice.
     ``suffix`` lets a surface name its own transport in the notice body.
+
+    ``recovery_target_ok(room) -> bool`` (optional) validates ledger-derived
+    RECOVERY destinations against the surface's own id rules before sending
+    (review 2026-09-08 r3). Degraded targets come from the caller (authentic
+    intake ids) and are never validated here. A recovery key that fails is
+    neither sent to NOR retried — it is purged from the ledger, so a corrupt or
+    forged `active` entry can't cause repeated sends to a junk destination.
+    (Platform APIs already reject sends to chats/rooms the bot isn't in; this
+    adds shape-checking and stops garbage keys from wedging the ledger.)
     """
     if not _enabled():
         return None
@@ -305,15 +332,24 @@ def plan_notices(state_dir, rooms, now=None, ledger_name: str = LEDGER_FILE,
         return None  # unrecognized state — not proof of recovery
     if not ledger["active"]:
         return None
-    items = [(room, _recovery_body(suffix)) for room in sorted(ledger["active"])]
+    active = sorted(ledger["active"])
+    if recovery_target_ok is not None:
+        purge = {room for room in active if not recovery_target_ok(room)}
+        active = [room for room in active if room not in purge]
+    else:
+        purge = set()
+    if not active and not purge:
+        return None
+    items = [(room, _recovery_body(suffix)) for room in active]
     return NoticePlan("recovery", None, items, ledger, now,
-                      state_dir, ledger_name)
+                      state_dir, ledger_name, purge=purge)
 
 
 def sweep_core_state_notices(state_dir: Path, rooms, send, log=None,
                              now: float | None = None,
                              ledger_name: str = LEDGER_FILE,
-                             suffix: str = _NOTICE_SUFFIX) -> None:
+                             suffix: str = _NOTICE_SUFFIX,
+                             recovery_target_ok=None) -> None:
     """One synchronous pass: notice degraded, announce recovery, persist.
 
     Thin wrapper over :func:`plan_notices` for a caller with a synchronous
@@ -322,10 +358,12 @@ def sweep_core_state_notices(state_dir: Path, rooms, send, log=None,
     so no ledger entry is written and the next pass retries; exceptions from
     ``send`` propagate (the caller owns auth/transport policy). ``ledger_name``
     and ``suffix`` let each surface keep its own ledger + wording (the gateway
-    keeps the defaults). Async callers (discord) use ``plan_notices`` +
-    ``NoticePlan.commit`` directly.
+    keeps the defaults). ``recovery_target_ok`` validates ledger-derived
+    recovery destinations (see :func:`plan_notices`). Async callers (discord)
+    use ``plan_notices`` + ``NoticePlan.commit`` directly.
     """
-    plan = plan_notices(state_dir, rooms, now, ledger_name, suffix)
+    plan = plan_notices(state_dir, rooms, now, ledger_name, suffix,
+                        recovery_target_ok)
     if plan is None:
         return
     verb = "notice" if plan.kind == "degraded" else "recovery notice"

@@ -751,6 +751,14 @@ def _core_notice_send(chat_id, body) -> bool:
         return False
 
 
+def _core_notice_target_ok(room: str) -> bool:
+    """Validate a ledger-derived RECOVERY target's shape (review 2026-09-08 r3):
+    a Telegram chat id is an integer (group/channel ids are negative). Purges a
+    corrupt/forged `active` key instead of hitting the API with garbage; Telegram
+    already rejects chats the bot isn't in."""
+    return bool(re.fullmatch(r"-?\d+", room))
+
+
 def _core_notice_sweep(rooms) -> None:
     """One sweep over the shared core-state logic on Telegram's ledger.
     Degraded → notice the given chats; healthy → recover any owed chats.
@@ -759,7 +767,8 @@ def _core_notice_sweep(rooms) -> None:
         _sweep_core_notices(
             STATE_DIR, rooms, _core_notice_send,
             log=lambda m: print(f"  [core-notice] {m}", flush=True),
-            ledger_name=_CORE_NOTICE_LEDGER, suffix=_CORE_NOTICE_SUFFIX)
+            ledger_name=_CORE_NOTICE_LEDGER, suffix=_CORE_NOTICE_SUFFIX,
+            recovery_target_ok=_core_notice_target_ok)
     except Exception as e:  # noqa: BLE001
         print(f"  [core-notice] sweep failed: {e}", flush=True)
 

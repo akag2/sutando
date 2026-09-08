@@ -3396,7 +3396,12 @@ def _maybe_core_state_notices(inflight: set[str]) -> None:
             room = task_rooms.get(tid, "")
             if room and _MATRIX_ROOM_RE.match(room):
                 rooms.add(room)
-        sweep_core_state_notices(_STATE, rooms, _core_notice_send, log=_log)
+        # Validate ledger-derived recovery targets against the Matrix room shape
+        # (review 2026-09-08 r3): a corrupt/forged `active` key is purged, not
+        # POSTed to. Intake rooms above are already shape-filtered.
+        sweep_core_state_notices(
+            _STATE, rooms, _core_notice_send, log=_log,
+            recovery_target_ok=lambda r: bool(_MATRIX_ROOM_RE.match(r)))
     except urllib.error.HTTPError:
         raise
     except Exception as e:  # noqa: BLE001 — a notice must never stall delivery

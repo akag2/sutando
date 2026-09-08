@@ -1000,6 +1000,19 @@ def _core_notice_target(channel: str, thread_ts: str | None) -> str:
     return f"{channel}{_CORE_NOTICE_SEP}{thread_ts}" if thread_ts else channel
 
 
+def _core_notice_target_ok(room: str) -> bool:
+    """Validate a ledger-derived RECOVERY target's shape (review 2026-09-08 r3):
+    a Slack channel/DM id (C/D/G + alnum), optionally a thread_ts (digits.dot)
+    after the separator. Purges a corrupt/forged `active` key instead of posting
+    to it; Slack's API already rejects channels the bot isn't in."""
+    channel, sep, thread_ts = room.partition(_CORE_NOTICE_SEP)
+    if not re.fullmatch(r"[CDG][A-Z0-9]{3,}", channel):
+        return False
+    if sep and not re.fullmatch(r"\d+\.\d+", thread_ts):
+        return False
+    return True
+
+
 def _core_notice_send(room: str, body: str) -> bool:
     """Post one notice to a Slack reply target (channel, in-thread when the room
     key carries a thread_ts). True iff it reached Slack. Best-effort: a failure
@@ -1027,7 +1040,8 @@ def _core_notice_sweep(rooms) -> None:
             _sweep_core_notices(
                 STATE_DIR, rooms, _core_notice_send,
                 log=lambda m: print(f"  [core-notice] {m}", flush=True),
-                ledger_name=_CORE_NOTICE_LEDGER, suffix=_CORE_NOTICE_SUFFIX)
+                ledger_name=_CORE_NOTICE_LEDGER, suffix=_CORE_NOTICE_SUFFIX,
+                recovery_target_ok=_core_notice_target_ok)
     except Exception as e:  # noqa: BLE001
         print(f"  [core-notice] sweep failed: {e}", flush=True)
 

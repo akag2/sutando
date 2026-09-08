@@ -2781,7 +2781,10 @@ async def _core_notice_recovery_once() -> None:
         async with _core_notice_lock:  # shares the ledger with intake
             plan = _plan_core_notices(STATE_DIR, set(),
                                       ledger_name=_CORE_NOTICE_LEDGER,
-                                      suffix=_CORE_NOTICE_SUFFIX)
+                                      suffix=_CORE_NOTICE_SUFFIX,
+                                      # purge a corrupt/forged active key (non-
+                                      # snowflake) instead of resolving it (r3).
+                                      recovery_target_ok=lambda r: r.isdigit())
             if plan is None or plan.kind != "recovery":
                 return
             sent = []
@@ -4412,11 +4415,6 @@ async def _handle_discord_message(message, force=False):
     pending_replies[task_id] = message.channel
     pending_task_tiers[task_id] = access_tier
     pending_task_collab[task_id] = bool(is_collaborator)
-    # Silent-core fix: the task is durably queued above; if the core can't
-    # answer right now (usage limit / logged out / crashed / wedged), tell this
-    # channel why instead of leaving the sender staring at silence. Never blocks
-    # or fails admission — the notice only explains the delay.
-    await _core_notice_on_intake(message.channel)
     # Observability: one inbound accepted-message event.
     _emit_channel(
         "discord", "in",
@@ -4439,6 +4437,14 @@ async def _handle_discord_message(message, force=False):
     # the channel is already a Discord thread — thread context is enough.
     pending_reply_anchors[task_id] = message.id
     save_pending_replies()
+
+    # Silent-core fix: the task is durably queued AND its reply route persisted
+    # above; only now tell this channel why the core can't answer right away
+    # (usage limit / logged out / crashed / wedged). Placed after
+    # save_pending_replies (review 2026-09-08 r3, nit) so the notice's network
+    # await doesn't widen the task-written/route-unpersisted crash window. Never
+    # blocks or fails admission — the notice only explains the delay.
+    await _core_notice_on_intake(message.channel)
 
     # Typing indicator
     async with message.channel.typing():

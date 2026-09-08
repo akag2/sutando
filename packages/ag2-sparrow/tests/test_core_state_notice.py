@@ -65,6 +65,48 @@ def test_watcher_heartbeat_gates_freshness():
         assert csn.read_core_state(tmp2, now) is None
 
 
+def test_invalid_heartbeat_is_no_verdict():
+    # Review r3: an absent heartbeat (old watcher) trusts the state, but a
+    # PRESENT-but-garbled one means freshness unknown → no verdict.
+    with tempfile.TemporaryDirectory() as d:
+        tmp = pathlib.Path(d)
+        now = time.time()
+        _write_state(tmp, "logged-out")
+        (tmp / csn.CORE_HEARTBEAT_FILE).write_text("not-a-number")
+        assert csn.read_core_state(tmp, now) is None
+        s = _Sender()
+        csn.sweep_core_state_notices(tmp, {"!a:s"}, s, now=now)
+        assert s.sent == []
+
+
+def test_recovery_validates_and_purges_targets():
+    # Review r3: recovery must not send to a corrupt/forged active key; it
+    # purges invalid targets (never sends, never retries) and only recovers
+    # ones passing the surface validator.
+    with tempfile.TemporaryDirectory() as d:
+        tmp = pathlib.Path(d)
+        now = time.time()
+        _write_heartbeat(tmp, now)
+        # seed a degraded notice to a good room so `active` has a real entry
+        _write_state(tmp, "crashed")
+        good = _Sender()
+        csn.sweep_core_state_notices(tmp, {"!good:s"}, good, now=now,
+                                     recovery_target_ok=lambda r: r.startswith("!"))
+        # forge a junk active key directly in the ledger
+        import json as _json
+        led = _json.loads((tmp / csn.LEDGER_FILE).read_text())
+        led["active"]["evil-not-a-room"] = "crashed"
+        (tmp / csn.LEDGER_FILE).write_text(_json.dumps(led))
+        # go healthy → recovery: good room gets it, junk key purged (no send)
+        _write_state(tmp, "idle-ready")
+        rec = _Sender()
+        csn.sweep_core_state_notices(tmp, set(), rec, now=now + 1,
+                                     recovery_target_ok=lambda r: r.startswith("!"))
+        assert [room for room, _ in rec.sent] == ["!good:s"]
+        active = _json.loads((tmp / csn.LEDGER_FILE).read_text())["active"]
+        assert active == {}, "both the recovered and the purged key are cleared"
+
+
 def test_no_supervisor_file_does_nothing():
     with tempfile.TemporaryDirectory() as d:
         tmp = pathlib.Path(d)
@@ -323,6 +365,8 @@ def test_suffix_names_the_surface():
 
 if __name__ == "__main__":
     test_watcher_heartbeat_gates_freshness()
+    test_invalid_heartbeat_is_no_verdict()
+    test_recovery_validates_and_purges_targets()
     test_no_supervisor_file_does_nothing()
     test_degraded_notices_once_per_room_with_cooldown()
     test_failed_send_burns_nothing_and_retries()
