@@ -123,5 +123,45 @@ class DiscordOnlyRowIsNotARoute(unittest.TestCase):
         self.assertEqual(u["r"].get("refusal_basis"), "owner disabled")
 
 
+class UnionToResolveRegression(unittest.TestCase):
+    """qingyun-wu's named unblock condition on #4047: drive the PRODUCTION
+    roster_union() -> notify_reviewers.resolve() path, not just the union."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.m = _load(SRC)
+        nr = (pathlib.Path(__file__).resolve().parents[1] / "skills" /
+              "collaboration-intelligence" / "scripts" / "notify_reviewers.py")
+        s = importlib.util.spec_from_file_location("nr", nr)
+        self.nr = importlib.util.module_from_spec(s)
+        s.loader.exec_module(self.nr)
+
+    def _roster(self, name, data):
+        p = pathlib.Path(self.d, name)
+        p.write_text(json.dumps(data))
+        return p
+
+    def test_a_local_refusal_survives_the_union_and_resolve_returns_3_no_target(self):
+        # The harm measured on origin/main was at resolve(), not at the union:
+        # a synced peer row re-enabled a reviewer the local owner had disabled.
+        merged = self.m.roster_union([
+            ("local", self._roster("l.json", {"reviewer": {
+                "stand": "", "room": "", "refusal_basis": "owner disabled routing"}})),
+            ("peer", self._roster("p.json", {"reviewer": PEER_COMPLETE})),
+        ])
+        targets, rc = self.nr.resolve(["reviewer"], merged)
+        self.assertEqual(targets, [], "a disabled reviewer must get no target")
+        self.assertEqual(rc, 3, "refusal must surface as rc 3, not a silent send")
+
+    def test_the_control_a_routable_reviewer_still_resolves(self):
+        """Without this, rc 3 could come from the path being broken for everyone."""
+        merged = self.m.roster_union([
+            ("local", self._roster("l2.json", {"reviewer": PEER_COMPLETE})),
+        ])
+        targets, rc = self.nr.resolve(["reviewer"], merged)
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(targets), 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
