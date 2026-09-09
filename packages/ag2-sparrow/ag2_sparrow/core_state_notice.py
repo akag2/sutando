@@ -99,10 +99,10 @@ _REASONS = {
     "logged-out": "my AI core is logged out and needs my owner to sign in again",
     "crashed": "my core process is not running",
     "hung": "my core looks stalled and may need my owner's attention",
-    "blocked": "my core is stopped at a prompt that needs my owner",
 }
 
-# blocked-human refines by gate kind; unlisted kinds share the generic phrase.
+# blocked-human refines by gate kind; unlisted kinds produce no sender notice
+# (the "Agent needs you" escalation already announces generic gates).
 _BLOCKED_KIND_TO_REASON = {
     "session-limit": "usage-limit",
     "fable-limit-unfocused": "usage-limit",
