@@ -311,7 +311,9 @@ def compose_state(pane, base_health, gateway_alive, process=True, runtime="claud
     # "sitting at a prompt waiting for input" from the coarse health (e.g. the live
     # /login MENU, which runtime-health's needs_login markers don't match). Check it
     # first so we carry the prompt text + kind for ESCALATE / AUTO-ANSWER.
-    hit = classify(pane) if (pane and runtime != "codex") else None
+    # Allowlist, not a codex denylist: a future runtime (gemini, …) must not
+    # fall through to Claude's pane grammar either.
+    hit = classify(pane) if (pane and runtime == "claude") else None
     if hit:
         kind, excerpt = hit
         if kind in _HUMAN_GATES:
@@ -343,6 +345,13 @@ def compose_state(pane, base_health, gateway_alive, process=True, runtime="claud
         if process is None:  # no session observed = no wedge evidence; never RECOVER
             return ("unobserved", "core liveness unobserved (process probe unavailable); holding",
                     tail or None, "unknown")
+        if runtime != "claude":
+            # The only unknown→hung rescue above is Claude's idle footer, which no
+            # other runtime's pane can match — an IDLE codex core (status stale by
+            # nature) would otherwise routinely read hung. Without an idle grammar
+            # for this runtime, a stale status is not wedge evidence: hold.
+            return ("unobserved", "status stale; no idle grammar for this runtime "
+                    "to tell idle from wedged — holding", tail or None, "unknown")
         return "hung", detail, tail or None, "unknown"
     return state, detail, None, None
 
@@ -638,8 +647,13 @@ def _atomic_write(path, payload):
 
 # Liveness heartbeat written EVERY tick (core-supervisor.json is write-on-change,
 # so its mtime can't tell a stable state from a dead watcher). Best-effort (#1).
+# Filename must match ag2_sparrow.core_state_notice.CORE_HEARTBEAT_FILE — the
+# reader keys watcher liveness on it.
+_HEARTBEAT_FILENAME = "core-supervisor-heartbeat"
+
+
 def _write_heartbeat(out_path):
-    hb = os.path.join(os.path.dirname(out_path), "core-supervisor-heartbeat")
+    hb = os.path.join(os.path.dirname(out_path), _HEARTBEAT_FILENAME)
     try:
         tmp = hb + ".tmp"
         with open(tmp, "w") as f:

@@ -311,9 +311,10 @@ def test_debounce_suppresses_login_restart_flap():
     csn._DEBOUNCE.clear()
 
 
-def test_gate_overlap_suppressed():
-    # A generic human-gate ("stopped at a prompt") is the existing escalation's
-    # job — our notice must NOT fire for it (no debounce needed to see this).
+def test_generic_human_gate_still_tells_senders():
+    # An unlisted blocked-human kind must NOT mean sender silence: the owner
+    # escalation reaches only the owner's channel, so the room still gets the
+    # generic "stopped at a prompt that needs my owner" line.
     with tempfile.TemporaryDirectory() as d:
         tmp = pathlib.Path(d)
         now = time.time()
@@ -322,7 +323,65 @@ def test_gate_overlap_suppressed():
             {"state": "blocked-human", "kind": "unknown"}))
         s = _Sender()
         csn.sweep_core_state_notices(tmp, {"!a:s"}, s, now=now)
-        assert s.sent == [], "generic gate → no notice (escalation owns it)"
+        assert len(s.sent) == 1 and "needs my owner" in s.sent[0][1]
+        # A listed kind still maps to its specific reason, not the generic one.
+        assert csn.degraded_reason("blocked-human", "login") == "logged-out"
+
+
+def test_hung_needs_a_long_hold_before_senders_hear():
+    # core-status goes ~90s stale during any long work step, so "hung" must
+    # persist HUNG_NOTICE_MIN_HOLD_S before a sender-facing notice fires — a
+    # 3-minute build must NOT produce a false "stalled"/"back online" pair.
+    with tempfile.TemporaryDirectory() as d:
+        tmp = pathlib.Path(d)
+        now = time.time()
+        _write_heartbeat(tmp, now)
+        _write_state(tmp, "hung")
+        s = _Sender()
+        csn.sweep_core_state_notices(tmp, {"!a:s"}, s, now=now)
+        _write_heartbeat(tmp, now + 180)
+        csn.sweep_core_state_notices(tmp, {"!a:s"}, s, now=now + 180)
+        assert s.sent == [], "a hung state held < the min hold stays quiet"
+        late = now + csn.HUNG_NOTICE_MIN_HOLD_S + 1
+        _write_heartbeat(tmp, late)
+        csn.sweep_core_state_notices(tmp, {"!a:s"}, s, now=late)
+        assert len(s.sent) == 1 and "stalled" in s.sent[0][1]
+    csn._DEBOUNCE.clear()
+
+
+def test_blocked_known_is_not_proof_of_recovery():
+    # Not every blocked-known gate is auto-answered (folder-trust never is), so
+    # the state can hold indefinitely — it must not discharge recovery debt.
+    with tempfile.TemporaryDirectory() as d:
+        tmp = pathlib.Path(d)
+        now = time.time()
+        (tmp / csn.LEDGER_FILE).write_text(json.dumps({
+            "schema_version": 2, "active": {"!a:s": "crashed"},
+            "last_sent": {"!a:s": {"crashed": now - 10}}, "fail": {}}))
+        _write_heartbeat(tmp, now)
+        (tmp / csn.CORE_SUPERVISOR_FILE).write_text(json.dumps(
+            {"state": "blocked-known", "kind": "folder-trust"}))
+        s = _Sender()
+        csn.sweep_core_state_notices(tmp, {"!a:s"}, s, now=now)
+        assert s.sent == [], "wedged at a known gate ≠ back online"
+        _write_state(tmp, "idle-ready")
+        csn.sweep_core_state_notices(tmp, set(), s, now=now)
+        assert len(s.sent) == 1 and "back online" in s.sent[0][1]
+
+
+def test_absent_heartbeat_trust_is_age_bounded():
+    # With no heartbeat at all, a leftover state file must not notice forever:
+    # trust it only while its mtime is recent.
+    with tempfile.TemporaryDirectory() as d:
+        tmp = pathlib.Path(d)
+        now = time.time()
+        _write_state(tmp, "crashed", mtime=now - csn.ABSENT_HEARTBEAT_TRUST_S - 60)
+        s = _Sender()
+        csn.sweep_core_state_notices(tmp, {"!a:s"}, s, now=now)
+        assert s.sent == [] and csn.read_core_state(tmp, now) is None
+        _write_state(tmp, "crashed", mtime=now - 30)  # recent → still trusted
+        csn.sweep_core_state_notices(tmp, {"!a:s"}, s, now=now)
+        assert len(s.sent) == 1
 
 
 def test_no_supervisor_file_does_nothing():
@@ -340,6 +399,7 @@ def test_degraded_notices_once_per_room_with_cooldown():
         _write_state(tmp, "blocked-human", kind="session-limit")
         s = _Sender()
         now = time.time()
+        _write_heartbeat(tmp, now)  # live watcher: the long-outage path
         csn.sweep_core_state_notices(tmp, {"!a:s", "!b:s"}, s, now=now)
         assert sorted(r for r, _ in s.sent) == ["!a:s", "!b:s"]
         assert all("usage limit" in b for _, b in s.sent)
@@ -352,6 +412,7 @@ def test_degraded_notices_once_per_room_with_cooldown():
         # past the cooldown the same room re-notices (one reminder per window),
         # with the file untouched as a write-on-change watcher leaves it
         later = now + csn._cooldown_s() + 1
+        _write_heartbeat(tmp, later)  # watcher still alive, state file untouched
         csn.sweep_core_state_notices(tmp, {"!a:s"}, s, now=later)
         assert [r for r, _ in s.sent].count("!a:s") == 2
 
@@ -445,13 +506,15 @@ def test_v1_ledger_resets_cleanly():
 
 def test_old_mtime_is_still_a_verdict():
     # The watcher writes only on CHANGE, so a multi-hour outage leaves an old
-    # mtime on current content — age must not gate the verdict (live finding).
+    # mtime on current content — with a live watcher (fresh heartbeat) age must
+    # not gate the verdict (live finding). Without one, the age bound applies.
     with tempfile.TemporaryDirectory() as d:
         tmp = pathlib.Path(d)
         s = _Sender()
         now = time.time()
         _write_state(tmp, "blocked-human", kind="session-limit",
                      mtime=now - 6 * 3600)
+        _write_heartbeat(tmp, now)
         csn.sweep_core_state_notices(tmp, {"!a:s"}, s, now=now)
         assert len(s.sent) == 1 and "usage limit" in s.sent[0][1]
 
@@ -520,11 +583,11 @@ def test_read_core_state_bounds_and_shapes():
         _write_state(tmp, "x" * 1000, kind=123)
         state, kind = csn.read_core_state(tmp)
         assert len(state) == csn._FIELD_MAX and kind is None
-        # Generic gates suppressed (owned by the "Agent needs you" escalation);
-        # only resource/login kinds map to a sender-facing reason.
-        assert csn.degraded_reason("blocked-human", None) is None
-        assert csn.degraded_reason("blocked-human", "unknown") is None
-        assert csn.degraded_reason("blocked-human", "permission") is None
+        # Unlisted blocked-human kinds fall back to the generic sender-facing
+        # reason (the owner escalation never reaches these rooms).
+        assert csn.degraded_reason("blocked-human", None) == "blocked"
+        assert csn.degraded_reason("blocked-human", "unknown") == "blocked"
+        assert csn.degraded_reason("blocked-human", "permission") == "blocked"
         assert csn.degraded_reason("blocked-human", "login") == "logged-out"
         assert csn.degraded_reason("blocked-human", "fable-limit-unfocused") == "usage-limit"
         assert csn.degraded_reason("hung", None) == "hung"
@@ -583,7 +646,10 @@ def test_suffix_names_the_surface():
 if __name__ == "__main__":
     test_watcher_heartbeat_gates_freshness()
     test_debounce_suppresses_login_restart_flap()
-    test_gate_overlap_suppressed()
+    test_generic_human_gate_still_tells_senders()
+    test_hung_needs_a_long_hold_before_senders_hear()
+    test_blocked_known_is_not_proof_of_recovery()
+    test_absent_heartbeat_trust_is_age_bounded()
     test_invalid_heartbeat_is_no_verdict()
     test_recovery_validates_and_purges_targets()
     test_partial_success_committed_before_exception()

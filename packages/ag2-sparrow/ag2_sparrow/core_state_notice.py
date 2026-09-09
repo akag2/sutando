@@ -48,6 +48,12 @@ MAX_RECOVERY_ATTEMPTS = 5
 # Soft budget checked BEFORE each send (an in-flight send can overrun by its own
 # timeout): bounds how many further sends a sweep starts on the poll path (#5).
 NOTICE_BUDGET_S = 12.0
+# "hung" must hold this long before senders hear about it. The supervisor calls
+# the core hung once its status file goes ~90s stale, but the status is stamped
+# at work-step boundaries, so any single step longer than that reads as hung
+# while the core is actively working — fine for owner escalation, false for a
+# sender-facing "stalled" line. Senders only need to hear about real wedges.
+HUNG_NOTICE_MIN_HOLD_S = 600.0
 
 # Process-local overlay of accounting that couldn't persist to disk (#3), so a
 # write failure doesn't re-send every sweep; cleared once a disk write succeeds.
@@ -78,6 +84,13 @@ CORE_HEARTBEAT_FILE = "core-supervisor-heartbeat"
 # Older than this → watcher presumed dead, last state is history not evidence.
 # Generous vs the ~3s tick so a brief hiccup never reads as death.
 WATCHER_STALE_S = 120
+# With NO heartbeat at all (pre-heartbeat watcher, or a leftover state file
+# whose watcher never ran), the state file is trusted only while its mtime is
+# this young. Nothing ever deletes core-supervisor.json, so an unbounded trust
+# here notices every room forever off a stale file; the price of the bound is
+# that a pre-heartbeat watcher's outage stops noticing after this long (its
+# state file is write-on-change) — restarting onto the paired watcher fixes it.
+ABSENT_HEARTBEAT_TRUST_S = 1800
 # A heartbeat slightly ahead is clock jitter; further into the future is
 # implausible and treated as invalid rather than fresh.
 _HEARTBEAT_FUTURE_SKEW_S = 5
@@ -87,9 +100,9 @@ LEDGER_FILE = "core-state-notice.json"
 
 _FIELD_MAX = 200  # supervisor fields are another process's output — bound them
 
-# Healthy = the core can (or will imminently) pick tasks up. `blocked-known`
-# is a gate the supervisor auto-answers, so it self-clears without a human.
-_HEALTHY_STATES = frozenset({"idle-ready", "running", "blocked-known"})
+# Healthy = the core is demonstrably serving. `blocked-known` is NOT here:
+# only some known gates are auto-answered, so the state can hold indefinitely.
+_HEALTHY_STATES = frozenset({"idle-ready", "running"})
 
 # reason key → user-facing phrase. Keys are stable identifiers (they live in
 # the on-disk ledger); phrases are the only text a room ever sees.
@@ -99,10 +112,11 @@ _REASONS = {
     "logged-out": "my AI core is logged out and needs my owner to sign in again",
     "crashed": "my core process is not running",
     "hung": "my core looks stalled and may need my owner's attention",
+    "blocked": "my core is stopped at a prompt that needs my owner",
 }
 
-# blocked-human refines by gate kind; unlisted kinds produce no sender notice
-# (the "Agent needs you" escalation already announces generic gates).
+# blocked-human refines by gate kind; unlisted kinds share the generic
+# "blocked" phrase — the owner escalation reaches only the owner, not senders.
 _BLOCKED_KIND_TO_REASON = {
     "session-limit": "usage-limit",
     "fable-limit-unfocused": "usage-limit",
@@ -189,15 +203,24 @@ def read_core_state(state_dir: Path, now: float | None = None):
                            verdict → None (closes the "notice forever after the
                            watcher dies mid-outage" gap)
       * heartbeat ABSENT → a watcher predating the heartbeat; fall back to
-                           trusting the state file (the paired watcher change
-                           ships the heartbeat, so this is only old installs).
+                           trusting the state file, but only while its mtime is
+                           within ABSENT_HEARTBEAT_TRUST_S — a leftover file
+                           with no live watcher must not notice forever.
       * heartbeat INVALID→ present but garbled; freshness genuinely unknown →
                            None (do NOT trust-forever; review 2026-09-08 r3).
     """
     now = now if now is not None else time.time()
-    if _watcher_liveness(state_dir, now) in ("stale", "invalid"):
-        return None  # watcher dead or freshness unknown → last state not evidence
     path = Path(state_dir) / CORE_SUPERVISOR_FILE
+    liveness = _watcher_liveness(state_dir, now)
+    if liveness in ("stale", "invalid"):
+        return None  # watcher dead or freshness unknown → last state not evidence
+    if liveness == "absent":
+        try:
+            age = now - path.stat().st_mtime
+        except OSError:
+            return None
+        if not (-_HEARTBEAT_FUTURE_SKEW_S <= age <= ABSENT_HEARTBEAT_TRUST_S):
+            return None  # no watcher vouches for it and it isn't recent
     try:
         with open(path) as f:
             data = json.load(f)
@@ -229,12 +252,14 @@ def degraded_reason(state: str, kind: str | None) -> str | None:
     and only known-healthy states count as recovered (see sweep). Anything
     else — ``gateway-down`` (self-referential from inside the gateway), future
     states — is "no verdict", so an unrecognized value can neither spam rooms
-    nor fake a recovery.
+    nor fake a recovery. ``blocked-human`` is the one deliberate exception to
+    the unknown-means-silence rule: the STATE is recognized (a human gate is
+    holding the core, only the owner can clear it), so an unlisted KIND still
+    tells senders the generic truth rather than nothing — the "Agent needs you"
+    escalation reaches only the owner's notify channel, never these rooms.
     """
     if state == "blocked-human":
-        # Generic gates are already announced by the "Agent needs you"
-        # escalation; only resource/login kinds map to a sender reason (no dupe).
-        return _BLOCKED_KIND_TO_REASON.get(kind or "")
+        return _BLOCKED_KIND_TO_REASON.get(kind or "", "blocked")
     return _STATE_TO_REASON.get(state)
 
 
@@ -473,8 +498,11 @@ def plan_notices(state_dir, rooms, now=None, ledger_name: str = LEDGER_FILE,
     ledger = _load_ledger(state_dir, ledger_name)
     if reason is not None:
         # Debounce: don't notice a degraded state until it has persisted, so a
-        # transient gate during a login/restart flap doesn't fire.
-        if not _debounce_ok(state_dir, ledger_name, "deg:" + reason, now, debounce_s):
+        # transient gate during a login/restart flap doesn't fire. "hung" gets a
+        # much longer hold — see HUNG_NOTICE_MIN_HOLD_S.
+        eff_debounce = (max(debounce_s, HUNG_NOTICE_MIN_HOLD_S)
+                        if reason == "hung" else debounce_s)
+        if not _debounce_ok(state_dir, ledger_name, "deg:" + reason, now, eff_debounce):
             return None
         cooldown = _cooldown_s()
         items = [(room, _degraded_body(reason, suffix))
