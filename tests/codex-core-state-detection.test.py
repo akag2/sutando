@@ -49,6 +49,8 @@ class _Proc:
 def _reset_caches():
     rh._CODEX_LOGIN_CACHE[0] = 0.0
     rh._CODEX_LOGIN_CACHE[1] = None
+    rh._RUNTIME_CACHE[0] = 0.0
+    rh._RUNTIME_CACHE[1] = None
 
 
 # 1) core_runtime() reads SUTANDO_CORE_RUNTIME; defaults to claude on failure.
@@ -146,6 +148,37 @@ check("claude compose_state: still classifies the login gate",
 # 7) codex crash is runtime-neutral (offline → crashed regardless of runtime).
 check("codex crash → crashed (neutral)",
       ciw.compose_state("", "offline", True, runtime="codex")[0] == "crashed")
+
+# 8) The default install: CODEX_HOME unset in the session. tmux exits 1 for an
+#    unset var too ("unknown variable: X"), which must read as unset — NOT as
+#    an unavailable query, or `codex login status` never runs at all and codex
+#    logout detection is dead everywhere the operator didn't set CODEX_HOME.
+_reset_caches()
+with patch.object(rh, "_run", lambda cmd: (1, "unknown variable: CODEX_HOME\n")):
+    check("session env: unset var (exit 1 + 'unknown variable') → None",
+          rh._core_session_env("CODEX_HOME") is None)
+_reset_caches()
+with patch.object(rh, "_run", lambda cmd: (1, "no such session: =sutando-core\n")):
+    check("session env: real query failure → _ENV_UNAVAILABLE",
+          rh._core_session_env("CODEX_HOME") is rh._ENV_UNAVAILABLE)
+_reset_caches()
+probed = []
+with patch.object(rh, "core_runtime", lambda: "codex"), \
+        patch.object(rh, "_core_session_env", lambda v: None), \
+        patch.object(rh.subprocess, "run",
+                     lambda *a, **k: probed.append(a) or _Proc(1, "Not logged in\n")):
+    check("default install (CODEX_HOME unset): login probe RUNS and detects logout",
+          rh._login_signal() is True and len(probed) == 1)
+
+# 9) An IDLE codex core routinely has a stale core-status, and the only
+#    unknown→hung rescue is Claude's idle footer — which no codex pane matches.
+#    It must hold ("unobserved"), not read hung and page every waiting room.
+check("codex stale-status: unobserved hold, never hung",
+      ciw.compose_state("some codex pane text", "unknown", True,
+                        runtime="codex")[0] == "unobserved")
+check("claude stale-status with no idle footer still reads hung",
+      ciw.compose_state("mid-work spinner", "unknown", True,
+                        runtime="claude")[0] == "hung")
 
 if fails:
     print(f"\n{fails} FAILURE(S)")

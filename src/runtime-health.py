@@ -509,6 +509,11 @@ def _core_session_env(var):
     ran but the var is unset, or _ENV_UNAVAILABLE if the query itself failed."""
     rc, out = _run(["tmux", "-S", TMUX_SOCKET, "show-environment", "-t", "=" + SESSION, var])
     if rc != 0:
+        # tmux exits 1 BOTH for "unknown variable: X" (session fine, var unset —
+        # the normal default-install shape) and for a real failure (no such
+        # session / no server). Only the former licenses "unset".
+        if "unknown variable" in out:
+            return None
         return _ENV_UNAVAILABLE  # can't tell — caller must not guess
     for line in out.splitlines():
         if line.startswith(var + "="):
@@ -516,13 +521,23 @@ def _core_session_env(var):
     return None  # session queried, var not set
 
 
+_RUNTIME_CACHE = [0.0, None]
+
+
 def core_runtime():
     """The core's runtime ('claude' | 'codex' | …). Defaults to 'claude' so a
-    detection failure preserves existing Claude behavior."""
+    detection failure preserves existing Claude behavior. TTL-cached: callers
+    sit on ~3s loops and this value is set once at session start — re-forking
+    tmux every tick buys nothing."""
+    now = time.time()
+    if _RUNTIME_CACHE[1] is not None and now - _RUNTIME_CACHE[0] < _CODEX_LOGIN_TTL:
+        return _RUNTIME_CACHE[1]
     v = _core_session_env("SUTANDO_CORE_RUNTIME")
     if v is _ENV_UNAVAILABLE or not v:
         v = os.environ.get("SUTANDO_CORE_RUNTIME") or "claude"
-    return v.strip() or "claude"
+    v = v.strip() or "claude"
+    _RUNTIME_CACHE[0], _RUNTIME_CACHE[1] = now, v
+    return v
 
 
 def _codex_login_needed():
@@ -536,7 +551,10 @@ def _codex_login_needed():
     env = dict(os.environ)
     ch = _core_session_env("CODEX_HOME")
     if ch is _ENV_UNAVAILABLE:
-        return None  # can't identify the core's account → never probe the wrong one
+        # Can't identify the core's account → never probe the wrong one. Cache
+        # the non-verdict too, or this path re-forks tmux on every call.
+        _CODEX_LOGIN_CACHE[0], _CODEX_LOGIN_CACHE[1] = now, None
+        return None
     if ch:
         env["CODEX_HOME"] = ch  # explicit; else the session's default matches ours
     try:
