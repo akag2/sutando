@@ -89,6 +89,7 @@ def main() -> None:
             assert needle in ctx, f"task body lost its {label}"
 
     _test_broken_path_still_blocks()
+    _test_result_readiness_matches_the_delivery_owner()
     print("stop-hook-emits-valid-json: PASS")
 
 
@@ -128,6 +129,45 @@ def _test_broken_path_still_blocks() -> None:
         assert json.loads(out.stdout)["decision"] == "block", (
             f"a broken python3 on PATH defeated the configured interpreter: {out.stdout!r}"
         )
+
+
+def _test_result_readiness_matches_the_delivery_owner() -> None:
+    """Readiness is owned by src/delivery/readiness.py, the policy every delivery
+    consumer uses. A local `tr -d '[:space:]'` diverges from it under LC_ALL=C:
+    NBSP/EM SPACE and undecodable bytes read as content, so Stop succeeds on a
+    result no consumer will ever send.
+
+    LC_ALL=C is set deliberately. Under a UTF-8 locale BSD tr yields empty for
+    these inputs and coincides with the helper, so the cases cannot tell the two
+    apart — an earlier version of this test inherited UTF-8 and passed against
+    the very implementation it was written to reject.
+
+    `[no-send]` must stay ready: deliberate protocol, not an absent reply.
+    """
+    env = dict(os.environ, LC_ALL="C", LANG="C")
+    cases = [
+        (b"", True, "empty"),
+        (b"  \n\t\n", True, "ascii whitespace"),
+        ("\u00a0\u2003\n".encode(), True, "NBSP + EM SPACE"),
+        (b"\xff\xfe\n", True, "undecodable bytes"),
+        (b"[no-send]\n", False, "no-send protocol"),
+        (b"a real answer\n", False, "real reply"),
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = pathlib.Path(tmp)
+        (ws / "tasks").mkdir()
+        (ws / "results").mkdir()
+        (ws / "tasks" / "task-1.txt").write_text("id: task-1\ntask: answer me\n")
+        stub = _stub(ws)
+        for body, should_block, label in cases:
+            (ws / "results" / "task-1.txt").write_bytes(body)
+            out = subprocess.run(["/bin/bash", str(stub)], capture_output=True,
+                                 text=True, stdin=subprocess.DEVNULL, env=env)
+            assert out.returncode == 0, f"{label}: hook exited {out.returncode}"
+            blocked = json.loads(out.stdout or "{}") != {}
+            assert blocked is should_block, (
+                f"{label}: blocked={blocked}, expected {should_block}"
+            )
 
 
 if __name__ == "__main__":
