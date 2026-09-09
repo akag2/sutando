@@ -2737,7 +2737,7 @@ _CORE_NOTICE_RECOVERY_INTERVAL_S = 15
 _CORE_NOTICE_DEBOUNCE_S = 10.0  # a login/restart flap must not fire premature notices
 
 # Serialize plan→send→commit: concurrent handlers could otherwise double-send
-# for one channel, and intake races the recovery loop (#2). One loop → one lock.
+# for one channel, and intake races the recovery loop. One loop → one lock.
 _core_notice_lock = asyncio.Lock()
 _CORE_NOTICE_RESOLVE_TIMEOUT_S = 5
 
@@ -2745,7 +2745,7 @@ _CORE_NOTICE_RESOLVE_TIMEOUT_S = 5
 def _ascii_snowflake(room: str) -> bool:
     """A Discord id is bounded ASCII decimal. `str.isdigit()` is NOT enough —
     "²".isdigit() is True but int("²") raises, which would abort recovery
-    accounting (review 2026-09-08 r4, #7). Validate before any int()."""
+    accounting. Validate before any int()."""
     return bool(re.fullmatch(r"[0-9]{1,20}", room))
 
 
@@ -2764,7 +2764,7 @@ async def _send_core_notice(channel, body) -> bool:
 async def _resolve_channel(room: str):
     """id → channel, trying the cache then a BOUNDED fetch. A cache miss is NOT
     proof the channel is gone (uncached DM after a reconnect), so we attempt one
-    fetch before giving up (review 2026-09-08 r4, #8); None means unresolved
+    fetch before giving up; None means unresolved
     this pass — the sweep leaves the debt for a bounded retry rather than
     treating the miss as delivered."""
     ch = client.get_channel(int(room))
@@ -2780,13 +2780,13 @@ async def _resolve_channel(room: str):
 async def _core_notice_sweep(rooms) -> None:
     """One pass over the shared core-state logic for Discord (async): degraded →
     notice the given rooms; healthy → recover channels owed one. Serialized
-    against itself (one asyncio.Lock, #2/#4) so concurrent intakes and the
+    against itself (one asyncio.Lock) so concurrent intakes and the
     periodic loop can't double-send or race the ledger. Completed sends are
-    always committed, even if a later send raises or the batch is cancelled
-    (#2); recovery revalidates health before each send — including AFTER the
-    channel-resolution await (r4-followup #6), since the core can fail during
+    always committed, even if a later send raises or the batch is cancelled;
+    recovery revalidates health before each send — including AFTER the
+    channel-resolution await, since the core can fail during
     that await — and stops if the core degraded again. A room the batch never
-    reached (health-abort) is not charged a failure (#2). Never raises."""
+    reached (health-abort) is not charged a failure. Never raises."""
     try:
         async with _core_notice_lock:
             plan = _plan_core_notices(
@@ -2800,10 +2800,10 @@ async def _core_notice_sweep(rooms) -> None:
             try:
                 for room, body in plan.items:
                     if plan.kind == "recovery" and not _core_is_healthy(STATE_DIR):
-                        break  # core degraded again mid-batch — stale recovery (#5)
+                        break  # core degraded again mid-batch — stale recovery
                     ch = await _resolve_channel(room)
                     if plan.kind == "recovery" and not _core_is_healthy(STATE_DIR):
-                        break  # core failed DURING the resolve await (#6)
+                        break  # core failed DURING the resolve await
                     attempted.append(room)
                     if ch is not None and await _send_core_notice(ch, body):
                         sent.append(room)
@@ -2819,7 +2819,7 @@ async def _core_notice_sweep(rooms) -> None:
 def _core_notice_pending_rooms() -> set:
     """Channels of durably queued-but-unanswered tasks — so the periodic loop
     RETRIES a degraded notice whose first send failed, even if no new message
-    arrives (review 2026-09-08 r4, #4). Mirrors the gateway's in-flight scan."""
+    arrives. Mirrors the gateway's in-flight scan."""
     rooms = set()
     for tid, channel in list(pending_replies.items()):
         cid = getattr(channel, "id", None)
@@ -4448,8 +4448,8 @@ async def _handle_discord_message(message, force=False):
     pending_reply_anchors[task_id] = message.id
     save_pending_replies()
 
-    # After the task is queued AND its route persisted (r3 nit): tell this channel
-    # why. A failed send is retried by poll_core_state_recovery from pending (#4).
+    # After the task is queued AND its route persisted: tell this channel
+    # why. A failed send is retried by poll_core_state_recovery from pending.
     await _core_notice_sweep({str(message.channel.id)})
 
     # Typing indicator

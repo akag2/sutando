@@ -149,10 +149,8 @@ check("claude compose_state: still classifies the login gate",
 check("codex crash → crashed (neutral)",
       ciw.compose_state("", "offline", True, runtime="codex")[0] == "crashed")
 
-# 8) The default install: CODEX_HOME unset in the session. tmux exits 1 for an
-#    unset var too ("unknown variable: X"), which must read as unset — NOT as
-#    an unavailable query, or `codex login status` never runs at all and codex
-#    logout detection is dead everywhere the operator didn't set CODEX_HOME.
+# 8) Default install: CODEX_HOME unset → tmux exits 1 with "unknown variable",
+#    which must read as unset or codex logout detection never runs at all.
 _reset_caches()
 with patch.object(rh, "_run", lambda cmd: (1, "unknown variable: CODEX_HOME\n")):
     check("session env: unset var (exit 1 + 'unknown variable') → None",
@@ -170,9 +168,8 @@ with patch.object(rh, "core_runtime", lambda: "codex"), \
     check("default install (CODEX_HOME unset): login probe RUNS and detects logout",
           rh._login_signal() is True and len(probed) == 1)
 
-# 9) An IDLE codex core routinely has a stale core-status, and the only
-#    unknown→hung rescue is Claude's idle footer — which no codex pane matches.
-#    It must hold ("unobserved"), not read hung and page every waiting room.
+# 9) An IDLE codex core routinely has a stale core-status and can never match
+#    Claude's idle-footer rescue: it must hold ("unobserved"), not read hung.
 check("codex stale-status: unobserved hold, never hung",
       ciw.compose_state("some codex pane text", "unknown", True,
                         runtime="codex")[0] == "unobserved")

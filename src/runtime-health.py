@@ -509,9 +509,8 @@ def _core_session_env(var):
     ran but the var is unset, or _ENV_UNAVAILABLE if the query itself failed."""
     rc, out = _run(["tmux", "-S", TMUX_SOCKET, "show-environment", "-t", "=" + SESSION, var])
     if rc != 0:
-        # tmux exits 1 BOTH for "unknown variable: X" (session fine, var unset —
-        # the normal default-install shape) and for a real failure (no such
-        # session / no server). Only the former licenses "unset".
+        # tmux exits 1 BOTH for an unset var ("unknown variable: X", the normal
+        # default-install shape) and for a real failure; only the former = unset.
         if "unknown variable" in out:
             return None
         return _ENV_UNAVAILABLE  # can't tell — caller must not guess

@@ -312,9 +312,8 @@ def test_debounce_suppresses_login_restart_flap():
 
 
 def test_generic_human_gate_still_tells_senders():
-    # An unlisted blocked-human kind must NOT mean sender silence: the owner
-    # escalation reaches only the owner's channel, so the room still gets the
-    # generic "stopped at a prompt that needs my owner" line.
+    # An unlisted blocked-human kind is not sender silence: the owner
+    # escalation never reaches these rooms, so the generic line must.
     with tempfile.TemporaryDirectory() as d:
         tmp = pathlib.Path(d)
         now = time.time()
@@ -329,9 +328,8 @@ def test_generic_human_gate_still_tells_senders():
 
 
 def test_hung_needs_a_long_hold_before_senders_hear():
-    # core-status goes ~90s stale during any long work step, so "hung" must
-    # persist HUNG_NOTICE_MIN_HOLD_S before a sender-facing notice fires — a
-    # 3-minute build must NOT produce a false "stalled"/"back online" pair.
+    # "hung" must persist HUNG_NOTICE_MIN_HOLD_S before senders hear — a
+    # 3-minute build must not fire a false "stalled"/"back online" pair.
     with tempfile.TemporaryDirectory() as d:
         tmp = pathlib.Path(d)
         now = time.time()
@@ -370,8 +368,7 @@ def test_blocked_known_is_not_proof_of_recovery():
 
 
 def test_absent_heartbeat_trust_is_age_bounded():
-    # With no heartbeat at all, a leftover state file must not notice forever:
-    # trust it only while its mtime is recent.
+    # A leftover state file with no heartbeat must not notice forever.
     with tempfile.TemporaryDirectory() as d:
         tmp = pathlib.Path(d)
         now = time.time()
@@ -505,9 +502,8 @@ def test_v1_ledger_resets_cleanly():
 
 
 def test_old_mtime_is_still_a_verdict():
-    # The watcher writes only on CHANGE, so a multi-hour outage leaves an old
-    # mtime on current content — with a live watcher (fresh heartbeat) age must
-    # not gate the verdict (live finding). Without one, the age bound applies.
+    # Write-on-change leaves an old mtime on current content: with a live
+    # watcher (fresh heartbeat) age must not gate the verdict.
     with tempfile.TemporaryDirectory() as d:
         tmp = pathlib.Path(d)
         s = _Sender()

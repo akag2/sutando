@@ -296,7 +296,7 @@ def tofu_onboard(sender_id, username):
 
 def api(method, _timeout_s=30, **params):
     # _timeout_s (Telegram params never use that name): a short value stops a
-    # slow notice send from stalling the single poll loop (#5).
+    # slow notice send from stalling the single poll loop.
     url = f"https://api.telegram.org/bot{TOKEN}/{method}"
     if params:
         data = json.dumps(params).encode()
@@ -753,7 +753,7 @@ def _core_notice_send(chat_id, body) -> bool:
 
 
 def _core_notice_target_ok(room: str) -> bool:
-    """Validate a ledger-derived RECOVERY target's shape (review 2026-09-08 r3):
+    """Validate a ledger-derived RECOVERY target's shape:
     a Telegram chat id is an integer (group/channel ids are negative). Purges a
     corrupt/forged `active` key instead of hitting the API with garbage; Telegram
     already rejects chats the bot isn't in."""
@@ -1081,9 +1081,8 @@ def main():  # pragma: no cover
                     pass
                 task_file.write_text(_task_content)
                 pending_replies[task_id] = chat_id
-                # No inline core-state sweep here: the end-of-iteration sweep
-                # already sees this chat via pending_replies, and synchronous
-                # sends on the intake path would stall this single-threaded loop.
+                # No inline core-state sweep: the end-of-iteration sweep sees
+                # this chat via pending_replies; inline sends stall the loop.
                 pending_task_tiers[task_id] = "owner"  # telegram is owner-only (allowlist-gated); enables progress streaming
                 pending_task_private[task_id] = chat_is_private  # audience, not sender: gates the step text
                 # Observability: one inbound accepted-message event. Source the
@@ -1291,7 +1290,7 @@ def main():  # pragma: no cover
                 archive_file(task_file, "tasks", task_id)
 
         # After result draining: notice pending unanswered chats if degraded,
-        # else recover owed chats (#4). Single loop → no lock; cooldown dedups.
+        # else recover owed chats. Single loop → no lock; cooldown dedups.
         _pending_chats = {str(cid) for tid, cid in pending_replies.items()
                           if not (RESULTS_DIR / f"{tid}.txt").exists()}
         _core_notice_sweep(_pending_chats)

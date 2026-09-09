@@ -978,10 +978,10 @@ _CORE_NOTICE_SUFFIX = " _(automated notice)_"
 _CORE_NOTICE_DEBOUNCE_S = 10.0  # a login/restart flap must not fire premature notices
 
 # All sends run on ONE background thread (not slack_bolt's handler pool), so a
-# slow notice can't stall handlers; single sender → no lock needed (#1).
+# slow notice can't stall handlers; single sender → no lock needed.
 _CORE_NOTICE_INTERVAL_S = 5
 # Notice "room" = the reply TARGET: a channel @mention threads its notice, so we
-# encode channel[+thread_ts] (sep outside Slack's alphabets); per-conversation (#3).
+# encode channel[+thread_ts] (sep outside Slack's alphabets); per-conversation.
 _CORE_NOTICE_SEP = "\x1f"
 
 
@@ -990,7 +990,7 @@ def _core_notice_target(channel: str, thread_ts: str | None) -> str:
 
 
 def _core_notice_target_ok(room: str) -> bool:
-    """Validate a ledger-derived RECOVERY target's shape (review 2026-09-08 r3):
+    """Validate a ledger-derived RECOVERY target's shape:
     a Slack channel/DM id (C/D/G + alnum), optionally a thread_ts (digits.dot)
     after the separator. Purges a corrupt/forged `active` key instead of posting
     to it; Slack's API already rejects channels the bot isn't in."""
@@ -1023,7 +1023,7 @@ def _core_notice_pending_rooms() -> set:
     """Reply targets of queued-but-unanswered tasks — the degraded-notice
     candidates. Deriving these every tick means a task admitted while the core
     was healthy still gets a notice if the core later dies, and a first notice
-    whose send failed is retried, without a new message (review r4, #4).
+    whose send failed is retried, without a new message.
     The shared cooldown keeps this to one notice per (target, reason)."""
     rooms = set()
     with pending_replies_lock:
@@ -1056,13 +1056,12 @@ def _core_notice_sweep(rooms) -> None:
 def _core_notice_loop() -> None:
     """The sole notice sender: every tick, notice pending-unanswered targets if
     the core is degraded, and announce recovery to owed targets once it's
-    healthy. Keeping every send here (not on intake) is the #1 stall fix.
+    healthy. Keeping every send here (not on intake) is the main stall fix.
 
     The WHOLE iteration — pending-room collection included — is inside the
     try, because _core_notice_pending_rooms() does filesystem reads that can
     raise (a transient EACCES on a result path): an uncaught raise here would
-    kill this one-and-only sender thread for the rest of the process
-    (review r4-followup #4)."""
+    kill this one-and-only sender thread for the rest of the process."""
     while True:
         try:
             _core_notice_sweep(_core_notice_pending_rooms())
@@ -1373,7 +1372,7 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     except Exception:  # pragma: no cover — telemetry must never break the bridge
         pass
     # Task is queued (pending_replies); the notice is sent by _core_notice_loop
-    # from pending tasks — intake does NOT post inline, so it never stalls (#1).
+    # from pending tasks — intake does NOT post inline, so it never stalls.
     return task_id
 
 

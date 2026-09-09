@@ -2966,7 +2966,7 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
         tmp.unlink(missing_ok=True)
         _log(f"media sidecar FAILED for {tid} — not queued, not acked")
         return None
-    # Room sidecar BEFORE publish (#2), else a crash could queue a task the
+    # Room sidecar BEFORE publish, else a crash could queue a task the
     # notice sweep can't route. Best-effort/advisory — never vetoes the ack.
     _record_task_room(tid, str(task.get("channel_id") or ""))
     if not _publish_staged(tmp, dest):  # atomic publish: never a partial file
@@ -3545,8 +3545,8 @@ def _maybe_core_state_notices(inflight: set[str]) -> None:
             room = task_rooms.get(tid, "")
             if room and _MATRIX_ROOM_RE.match(room):
                 rooms.add(room)
-        # Validate ledger-derived recovery targets against the Matrix room shape
-        # (#r3): a corrupt/forged `active` key is purged, not POSTed to.
+        # Validate ledger-derived recovery targets against the Matrix room
+        # shape, so a corrupt/forged `active` key is purged, not POSTed to.
         sweep_core_state_notices(
             _STATE, rooms, _core_notice_send, log=_log,
             # Instance-suffix the ledger like every other gateway state file, so

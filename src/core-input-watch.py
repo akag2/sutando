@@ -346,10 +346,8 @@ def compose_state(pane, base_health, gateway_alive, process=True, runtime="claud
             return ("unobserved", "core liveness unobserved (process probe unavailable); holding",
                     tail or None, "unknown")
         if runtime != "claude":
-            # The only unknown→hung rescue above is Claude's idle footer, which no
-            # other runtime's pane can match — an IDLE codex core (status stale by
-            # nature) would otherwise routinely read hung. Without an idle grammar
-            # for this runtime, a stale status is not wedge evidence: hold.
+            # Only Claude's idle footer rescues unknown→hung; without an idle
+            # grammar for this runtime a stale status is not wedge evidence.
             return ("unobserved", "status stale; no idle grammar for this runtime "
                     "to tell idle from wedged — holding", tail or None, "unknown")
         return "hung", detail, tail or None, "unknown"
@@ -645,10 +643,8 @@ def _atomic_write(path, payload):
     os.replace(tmp, path)
 
 
-# Liveness heartbeat written EVERY tick (core-supervisor.json is write-on-change,
-# so its mtime can't tell a stable state from a dead watcher). Best-effort (#1).
-# Filename must match ag2_sparrow.core_state_notice.CORE_HEARTBEAT_FILE — the
-# reader keys watcher liveness on it.
+# Written EVERY tick (state file is write-on-change); best-effort. Must match
+# ag2_sparrow.core_state_notice.CORE_HEARTBEAT_FILE — the reader keys on it.
 _HEARTBEAT_FILENAME = "core-supervisor-heartbeat"
 
 
