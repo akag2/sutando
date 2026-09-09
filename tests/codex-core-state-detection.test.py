@@ -149,15 +149,20 @@ check("claude compose_state: still classifies the login gate",
 check("codex crash → crashed (neutral)",
       ciw.compose_state("", "offline", True, runtime="codex")[0] == "crashed")
 
-# 8) Default install: CODEX_HOME unset → tmux exits 1 with "unknown variable",
-#    which must read as unset or codex logout detection never runs at all.
+# 8) Default install: CODEX_HOME unset. Stubs mirror MEASURED listing-form
+#    emissions (rc=0 + stdout when the session answers; errors are stderr-only).
+_listing = "SUTANDO_CORE_RUNTIME=codex\nSSH_AUTH_SOCK=/tmp/x\n-REMOVED_VAR\n"
 _reset_caches()
-with patch.object(rh, "_run", lambda cmd: (1, "unknown variable: CODEX_HOME\n")):
-    check("session env: unset var (exit 1 + 'unknown variable') → None",
+with patch.object(rh, "_run", lambda cmd: (0, _listing)):
+    check("session env: var absent from listing → None (unset)",
           rh._core_session_env("CODEX_HOME") is None)
+    check("session env: set var parsed from listing",
+          rh._core_session_env("SUTANDO_CORE_RUNTIME") == "codex")
+    check("session env: '-VAR' removed marker → None (unset)",
+          rh._core_session_env("REMOVED_VAR") is None)
 _reset_caches()
-with patch.object(rh, "_run", lambda cmd: (1, "no such session: =sutando-core\n")):
-    check("session env: real query failure → _ENV_UNAVAILABLE",
+with patch.object(rh, "_run", lambda cmd: (1, "")):
+    check("session env: real query failure (rc!=0, stderr-only) → _ENV_UNAVAILABLE",
           rh._core_session_env("CODEX_HOME") is rh._ENV_UNAVAILABLE)
 _reset_caches()
 probed = []
@@ -176,6 +181,36 @@ check("codex stale-status: unobserved hold, never hung",
 check("claude stale-status with no idle footer still reads hung",
       ciw.compose_state("mid-work spinner", "unknown", True,
                         runtime="claude")[0] == "hung")
+
+# 10) The same three verdicts against a REAL throwaway tmux server (never the
+#     live core's socket) — fixture-vs-reality is how this bug shipped twice.
+import shutil
+import subprocess
+import tempfile
+if shutil.which("tmux"):
+    _reset_caches()
+    _tdir = tempfile.mkdtemp()
+    _sock = os.path.join(_tdir, "test-tmux.sock")
+    try:
+        subprocess.run(["tmux", "-S", _sock, "new-session", "-d", "-s",
+                        "envtest", "sleep", "30"], check=True, timeout=10)
+        subprocess.run(["tmux", "-S", _sock, "set-environment", "-t", "envtest",
+                        "SUTANDO_CORE_RUNTIME", "codex"], check=True, timeout=10)
+        with patch.object(rh, "TMUX_SOCKET", _sock), \
+                patch.object(rh, "SESSION", "envtest"):
+            check("real tmux: set var read back",
+                  rh._core_session_env("SUTANDO_CORE_RUNTIME") == "codex")
+            check("real tmux: unset var → None (the shipped-twice case)",
+                  rh._core_session_env("CODEX_HOME") is None)
+        with patch.object(rh, "TMUX_SOCKET", _sock), \
+                patch.object(rh, "SESSION", "no-such-session"):
+            check("real tmux: missing session → _ENV_UNAVAILABLE",
+                  rh._core_session_env("CODEX_HOME") is rh._ENV_UNAVAILABLE)
+    finally:
+        subprocess.run(["tmux", "-S", _sock, "kill-server"],
+                       capture_output=True, timeout=10)
+else:
+    print("  skip real-tmux integration (tmux not installed)")
 
 if fails:
     print(f"\n{fails} FAILURE(S)")

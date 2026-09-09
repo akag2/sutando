@@ -505,19 +505,24 @@ def _codex_says_logged_out(text: str) -> bool:
 
 def _core_session_env(var):
     """An env var from the core's tmux session (start-cli.sh exports
-    SUTANDO_CORE_RUNTIME / CODEX_HOME). Returns the value, None if the session
-    ran but the var is unset, or _ENV_UNAVAILABLE if the query itself failed."""
-    rc, out = _run(["tmux", "-S", TMUX_SOCKET, "show-environment", "-t", "=" + SESSION, var])
+    SUTANDO_CORE_RUNTIME). Returns the value, None if the session ran but the
+    var is unset, or _ENV_UNAVAILABLE if the query itself failed.
+
+    Deliberately the NO-ARGUMENT listing form: naming the var makes tmux exit 1
+    for unset-var and query-failure alike, reporting unset only on stderr
+    ("unknown variable", measured on tmux 3.5a/3.7) — which _run discards, so
+    the two cases were indistinguishable and unset (the default install, since
+    nothing exports CODEX_HOME) read as failure. The listing exits 0 whenever
+    the session answered, on stdout, so absence from it IS the unset verdict."""
+    rc, out = _run(["tmux", "-S", TMUX_SOCKET, "show-environment", "-t", "=" + SESSION])
     if rc != 0:
-        # tmux exits 1 BOTH for an unset var ("unknown variable: X", the normal
-        # default-install shape) and for a real failure; only the former = unset.
-        if "unknown variable" in out:
-            return None
         return _ENV_UNAVAILABLE  # can't tell — caller must not guess
     for line in out.splitlines():
         if line.startswith(var + "="):
             return line[len(var) + 1:]
-    return None  # session queried, var not set
+        if line == "-" + var:
+            return None  # explicitly removed from the session env
+    return None  # session answered, var not listed → unset
 
 
 _RUNTIME_CACHE = [0.0, None]
