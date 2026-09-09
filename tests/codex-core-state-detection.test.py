@@ -89,6 +89,20 @@ with patch.object(rh, "core_runtime", lambda: "codex"), \
         patch.object(rh.subprocess, "run", lambda *a, **k: _Proc(127, "", "node: command not found\n")):
     check("codex exit 127 (no node): _codex_login_needed None", rh._codex_login_needed() is None)
 
+# 4b) FINDING 2 — a config error that QUOTES "not logged in" mid-line is NOT a
+#     logout (must match a full status line, not a substring).
+_reset_caches()
+_cfg_err = 'Error loading configuration: mode "not logged in" is not valid\n'
+with patch.object(rh, "core_runtime", lambda: "codex"), \
+        patch.object(rh, "_core_session_env", lambda v: None), \
+        patch.object(rh.subprocess, "run", lambda *a, **k: _Proc(1, "", _cfg_err)):
+    check("codex config error quoting the phrase: None (not a logout)",
+          rh._codex_login_needed() is None)
+check("logout matcher: bullet-prefixed status line matches",
+      rh._codex_says_logged_out("· Not logged in\n") is True)
+check("logout matcher: mid-sentence quote does NOT match",
+      rh._codex_says_logged_out('config error: "not logged in" invalid') is False)
+
 # 5) probe can't even start → unknown → not a logout.
 _reset_caches()
 with patch.object(rh, "core_runtime", lambda: "codex"), \

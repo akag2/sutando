@@ -492,8 +492,15 @@ _CODEX_LOGIN_TTL = 30.0
 # _ENV_UNAVAILABLE: the tmux query itself failed (distinct from "var unset").
 _ENV_UNAVAILABLE = object()
 
-# Genuine-logout marker; other non-zero exits (config error / no-node) are NOT.
-_CODEX_LOGGED_OUT_RE = re.compile(r"not logged in|not authenticated|run .?codex login", re.I)
+# A logout STATUS LINE — a line that IS the phrase, not text that merely quotes
+# it (a config error saying `... "not logged in" ...` is not an auth verdict).
+_CODEX_LOGGED_OUT_RE = re.compile(r"^[\s·\-*•]*(not logged in|not authenticated)\b", re.I)
+
+
+def _codex_says_logged_out(text: str) -> bool:
+    """True only if some output LINE is the unauthenticated status (matched at
+    line start, after stripping bullet/whitespace) — never a mid-sentence quote."""
+    return any(_CODEX_LOGGED_OUT_RE.match(ln) for ln in (text or "").splitlines())
 
 
 def _core_session_env(var):
@@ -541,8 +548,8 @@ def _codex_login_needed():
         text = (p.stdout or "") + (p.stderr or "")
         if p.returncode == 0:
             needed = False  # authoritative signed-in (startup/verify rely on this)
-        elif _CODEX_LOGGED_OUT_RE.search(text):
-            needed = True  # explicit unauthenticated message
+        elif _codex_says_logged_out(text):
+            needed = True  # a status LINE says unauthenticated
         else:
             needed = None  # non-zero for some OTHER reason (config/interpreter) → unknown
     _CODEX_LOGIN_CACHE[0], _CODEX_LOGIN_CACHE[1] = now, needed
