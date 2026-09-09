@@ -3546,7 +3546,8 @@ def _maybe_core_state_notices(inflight: set[str]) -> None:
             # Instance-suffix the ledger like every other gateway state file, so
             # a named + default instance on one workspace don't collide.
             ledger_name=f"core-state-notice{_INST_SUFFIX}.json",
-            recovery_target_ok=lambda r: bool(_MATRIX_ROOM_RE.match(r)))
+            recovery_target_ok=lambda r: bool(_MATRIX_ROOM_RE.match(r)),
+            debounce_s=10.0)  # a login/restart flap must not fire premature notices
     except urllib.error.HTTPError:
         raise
     except Exception as e:  # noqa: BLE001 — a notice must never stall delivery

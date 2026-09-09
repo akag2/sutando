@@ -73,6 +73,7 @@ def main():
     mod = _load_module()
     state_dir = Path(tempfile.mkdtemp(prefix="slcsn-"))
     mod.STATE_DIR = state_dir
+    mod._CORE_NOTICE_DEBOUNCE_S = 0  # test one-shot behavior, no debounce wait
     ledger = state_dir / mod._CORE_NOTICE_LEDGER
     sent: list[dict] = []
 

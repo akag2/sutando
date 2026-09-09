@@ -279,6 +279,52 @@ def test_numeric_guards():
         assert csn.read_core_state(tmp, now) is None
 
 
+def test_debounce_suppresses_login_restart_flap():
+    # A logout→login→restart flaps the core; a debounce must suppress the
+    # premature recovery and only notice/recover once stable for debounce_s.
+    csn._DEBOUNCE.clear()
+    with tempfile.TemporaryDirectory() as d:
+        tmp = pathlib.Path(d)
+        now = time.time()
+        _write_heartbeat(tmp, now)
+        _write_state(tmp, "crashed")
+        s = _Sender()
+        # t0: degraded seen but not yet stable → no notice
+        csn.sweep_core_state_notices(tmp, {"!a:s"}, s, now=now, debounce_s=10)
+        assert s.sent == [], "degraded not yet stable → no notice"
+        # t+11: still degraded, now stable → one notice
+        csn.sweep_core_state_notices(tmp, {"!a:s"}, s, now=now + 11, debounce_s=10)
+        assert len(s.sent) == 1, "stable degraded → notice fires"
+        # brief healthy blip (t+13) → does NOT fire recovery (not stable)
+        _write_state(tmp, "idle-ready")
+        csn.sweep_core_state_notices(tmp, set(), s, now=now + 13, debounce_s=10)
+        assert len(s.sent) == 1, "healthy blip < debounce → no premature recovery"
+        # flap back to degraded (t+15) → recovery timer reset, still no recovery
+        _write_state(tmp, "crashed")
+        csn.sweep_core_state_notices(tmp, {"!a:s"}, s, now=now + 15, debounce_s=10)
+        # genuinely, stably healthy (t+30) → exactly one recovery
+        _write_state(tmp, "idle-ready")
+        csn.sweep_core_state_notices(tmp, set(), s, now=now + 20, debounce_s=10)  # healthy first seen
+        assert all("back online" not in b for _, b in s.sent), "healthy not stable yet"
+        csn.sweep_core_state_notices(tmp, set(), s, now=now + 31, debounce_s=10)  # stable 11s
+        assert sum("back online" in b for _, b in s.sent) == 1, "exactly one recovery once stable"
+    csn._DEBOUNCE.clear()
+
+
+def test_gate_overlap_suppressed():
+    # A generic human-gate ("stopped at a prompt") is the existing escalation's
+    # job — our notice must NOT fire for it (no debounce needed to see this).
+    with tempfile.TemporaryDirectory() as d:
+        tmp = pathlib.Path(d)
+        now = time.time()
+        _write_heartbeat(tmp, now)
+        (tmp / csn.CORE_SUPERVISOR_FILE).write_text(json.dumps(
+            {"state": "blocked-human", "kind": "unknown"}))
+        s = _Sender()
+        csn.sweep_core_state_notices(tmp, {"!a:s"}, s, now=now)
+        assert s.sent == [], "generic gate → no notice (escalation owns it)"
+
+
 def test_no_supervisor_file_does_nothing():
     with tempfile.TemporaryDirectory() as d:
         tmp = pathlib.Path(d)
@@ -474,7 +520,11 @@ def test_read_core_state_bounds_and_shapes():
         _write_state(tmp, "x" * 1000, kind=123)
         state, kind = csn.read_core_state(tmp)
         assert len(state) == csn._FIELD_MAX and kind is None
-        assert csn.degraded_reason("blocked-human", None) == "blocked"
+        # Generic gates suppressed (owned by the "Agent needs you" escalation);
+        # only resource/login kinds map to a sender-facing reason.
+        assert csn.degraded_reason("blocked-human", None) is None
+        assert csn.degraded_reason("blocked-human", "unknown") is None
+        assert csn.degraded_reason("blocked-human", "permission") is None
         assert csn.degraded_reason("blocked-human", "login") == "logged-out"
         assert csn.degraded_reason("blocked-human", "fable-limit-unfocused") == "usage-limit"
         assert csn.degraded_reason("hung", None) == "hung"
@@ -532,6 +582,8 @@ def test_suffix_names_the_surface():
 
 if __name__ == "__main__":
     test_watcher_heartbeat_gates_freshness()
+    test_debounce_suppresses_login_restart_flap()
+    test_gate_overlap_suppressed()
     test_invalid_heartbeat_is_no_verdict()
     test_recovery_validates_and_purges_targets()
     test_partial_success_committed_before_exception()

@@ -232,8 +232,28 @@ def degraded_reason(state: str, kind: str | None) -> str | None:
     nor fake a recovery.
     """
     if state == "blocked-human":
-        return _BLOCKED_KIND_TO_REASON.get(kind or "", "blocked")
+        # Generic gates are already announced by the "Agent needs you"
+        # escalation; only resource/login kinds map to a sender reason (no dupe).
+        return _BLOCKED_KIND_TO_REASON.get(kind or "")
     return _STATE_TO_REASON.get(state)
+
+
+# Debounce: a state must hold this long before we notice/recover, so a login/
+# restart flap fires no premature recovery or transient-gate notice.
+_DEBOUNCE: dict = {}
+
+
+def _debounce_ok(state_dir, ledger_name, condition, now, debounce_s):
+    """True once `condition` has held continuously for >= debounce_s; resets its
+    timer whenever the condition changes (a brief flap never clears it)."""
+    if debounce_s <= 0:
+        return True
+    key = (str(state_dir), ledger_name)
+    prev = _DEBOUNCE.get(key)
+    if prev is None or prev[0] != condition:
+        _DEBOUNCE[key] = (condition, now)
+        return False
+    return now - prev[1] >= debounce_s
 
 
 _DEFAULT_COOLDOWN_S = 1800.0
@@ -424,7 +444,7 @@ class NoticePlan:
 
 def plan_notices(state_dir, rooms, now=None, ledger_name: str = LEDGER_FILE,
                  suffix: str = _NOTICE_SUFFIX,
-                 recovery_target_ok=None) -> "NoticePlan | None":
+                 recovery_target_ok=None, debounce_s=0.0) -> "NoticePlan | None":
     """Read core state + ledger and decide what to send — WITHOUT sending.
 
     Returns None when there is nothing to do (feature disabled, no verdict, an
@@ -452,6 +472,10 @@ def plan_notices(state_dir, rooms, now=None, ledger_name: str = LEDGER_FILE,
     reason = degraded_reason(state, kind)
     ledger = _load_ledger(state_dir, ledger_name)
     if reason is not None:
+        # Debounce: don't notice a degraded state until it has persisted, so a
+        # transient gate during a login/restart flap doesn't fire.
+        if not _debounce_ok(state_dir, ledger_name, "deg:" + reason, now, debounce_s):
+            return None
         cooldown = _cooldown_s()
         items = [(room, _degraded_body(reason, suffix))
                  for room in sorted(set(rooms))
@@ -465,6 +489,9 @@ def plan_notices(state_dir, rooms, now=None, ledger_name: str = LEDGER_FILE,
                           ledger, now, state_dir, ledger_name, rr_key=rr_key)
     if state not in _HEALTHY_STATES:
         return None  # unrecognized state — not proof of recovery
+    # Debounce: recover only once STABLY healthy (no premature "back online").
+    if not _debounce_ok(state_dir, ledger_name, "healthy", now, debounce_s):
+        return None
     if not ledger["active"]:
         return None
     active = sorted(ledger["active"])
@@ -488,7 +515,7 @@ def sweep_core_state_notices(state_dir: Path, rooms, send, log=None,
                              now: float | None = None,
                              ledger_name: str = LEDGER_FILE,
                              suffix: str = _NOTICE_SUFFIX,
-                             recovery_target_ok=None) -> None:
+                             recovery_target_ok=None, debounce_s=0.0) -> None:
     """One synchronous pass: notice degraded, announce recovery, persist.
 
     Thin wrapper over :func:`plan_notices` for a caller with a synchronous
@@ -515,7 +542,7 @@ def sweep_core_state_notices(state_dir: Path, rooms, send, log=None,
     are NOT charged a failure — only rooms actually attempted are (#2).
     """
     plan = plan_notices(state_dir, rooms, now, ledger_name, suffix,
-                        recovery_target_ok)
+                        recovery_target_ok, debounce_s)
     if plan is None:
         return
     verb = "notice" if plan.kind == "degraded" else "recovery notice"

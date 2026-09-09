@@ -118,6 +118,7 @@ def main():
     try:
         bridge = load_bridge(tmp_home)
         bridge.STATE_DIR = state_dir  # redirect ledger + supervisor reads
+        bridge._CORE_NOTICE_DEBOUNCE_S = 0
         bridge.RESULTS_DIR = state_dir  # pending-rooms result check reads here
         ledger = state_dir / bridge._CORE_NOTICE_LEDGER
 

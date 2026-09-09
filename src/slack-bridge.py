@@ -975,6 +975,8 @@ def _slack_context_note(event: dict) -> tuple[str, set[str]]:
 # (synchronous) binder. Distinct ledger file: no cross-surface collision.
 _CORE_NOTICE_LEDGER = "core-state-notice-slack.json"
 _CORE_NOTICE_SUFFIX = " _(automated notice)_"
+_CORE_NOTICE_DEBOUNCE_S = 10.0  # a login/restart flap must not fire premature notices
+
 # All sends run on ONE background thread (not slack_bolt's handler pool), so a
 # slow notice can't stall handlers; single sender → no lock needed (#1).
 _CORE_NOTICE_INTERVAL_S = 5
@@ -1045,7 +1047,8 @@ def _core_notice_sweep(rooms) -> None:
             STATE_DIR, rooms, _core_notice_send,
             log=lambda m: print(f"  [core-notice] {m}", flush=True),
             ledger_name=_CORE_NOTICE_LEDGER, suffix=_CORE_NOTICE_SUFFIX,
-            recovery_target_ok=_core_notice_target_ok)
+            recovery_target_ok=_core_notice_target_ok,
+            debounce_s=_CORE_NOTICE_DEBOUNCE_S)
     except Exception as e:  # noqa: BLE001
         print(f"  [core-notice] sweep failed: {e}", flush=True)
 

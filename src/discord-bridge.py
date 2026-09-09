@@ -2734,6 +2734,8 @@ async def _supervise_loop(coro_fn, name):
 _CORE_NOTICE_LEDGER = "core-state-notice-discord.json"
 _CORE_NOTICE_SUFFIX = " _(automated notice)_"
 _CORE_NOTICE_RECOVERY_INTERVAL_S = 15
+_CORE_NOTICE_DEBOUNCE_S = 10.0  # a login/restart flap must not fire premature notices
+
 # Serialize plan→send→commit: concurrent handlers could otherwise double-send
 # for one channel, and intake races the recovery loop (#2). One loop → one lock.
 _core_notice_lock = asyncio.Lock()
@@ -2790,7 +2792,8 @@ async def _core_notice_sweep(rooms) -> None:
             plan = _plan_core_notices(
                 STATE_DIR, {str(r) for r in rooms},
                 ledger_name=_CORE_NOTICE_LEDGER, suffix=_CORE_NOTICE_SUFFIX,
-                recovery_target_ok=_ascii_snowflake)
+                recovery_target_ok=_ascii_snowflake,
+                debounce_s=_CORE_NOTICE_DEBOUNCE_S)
             if plan is None:
                 return
             sent, attempted = [], []

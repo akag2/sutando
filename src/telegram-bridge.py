@@ -738,6 +738,7 @@ def log_privacy_setting(get_me):
 # Distinct ledger file (no cross-surface collision); PLAIN suffix (no parse_mode).
 _CORE_NOTICE_LEDGER = "core-state-notice-telegram.json"
 _CORE_NOTICE_SUFFIX = " (automated notice)"
+_CORE_NOTICE_DEBOUNCE_S = 10.0  # a login/restart flap must not fire premature notices
 
 
 def _core_notice_send(chat_id, body) -> bool:
@@ -768,7 +769,8 @@ def _core_notice_sweep(rooms) -> None:
             STATE_DIR, rooms, _core_notice_send,
             log=lambda m: print(f"  [core-notice] {m}", flush=True),
             ledger_name=_CORE_NOTICE_LEDGER, suffix=_CORE_NOTICE_SUFFIX,
-            recovery_target_ok=_core_notice_target_ok)
+            recovery_target_ok=_core_notice_target_ok,
+            debounce_s=_CORE_NOTICE_DEBOUNCE_S)
     except Exception as e:  # noqa: BLE001
         print(f"  [core-notice] sweep failed: {e}", flush=True)
 

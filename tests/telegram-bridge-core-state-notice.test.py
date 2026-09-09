@@ -64,6 +64,7 @@ def main():
     bridge = _load_bridge()
     state_dir = Path(tempfile.mkdtemp(prefix="tgcsn-"))
     bridge.STATE_DIR = state_dir
+    bridge._CORE_NOTICE_DEBOUNCE_S = 0  # test one-shot behavior, no debounce wait
     ledger = state_dir / bridge._CORE_NOTICE_LEDGER
     sent: list[tuple] = []
 
