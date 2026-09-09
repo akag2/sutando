@@ -1081,9 +1081,9 @@ def main():  # pragma: no cover
                     pass
                 task_file.write_text(_task_content)
                 pending_replies[task_id] = chat_id
-                # Silent-core fix: task is queued above; if the core can't
-                # answer now, tell this chat why instead of going silent.
-                _core_notice_sweep({str(chat_id)})
+                # No inline core-state sweep here: the end-of-iteration sweep
+                # already sees this chat via pending_replies, and synchronous
+                # sends on the intake path would stall this single-threaded loop.
                 pending_task_tiers[task_id] = "owner"  # telegram is owner-only (allowlist-gated); enables progress streaming
                 pending_task_private[task_id] = chat_is_private  # audience, not sender: gates the step text
                 # Observability: one inbound accepted-message event. Source the

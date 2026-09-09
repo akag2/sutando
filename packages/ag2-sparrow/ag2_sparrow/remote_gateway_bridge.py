@@ -3495,17 +3495,23 @@ def _post_proactive() -> None:
 
 
 def _core_notice_send(room: str, body: str) -> bool:
-    """One best-effort room message for a core-state notice. True = the POST
-    reached the gateway (2xx); a notice is informational, so unlike results it
-    takes no confirmation/outbox machinery — a False here just means the sweep
-    retries on a later pass. 401/403 propagate: the poll loop owns auth. Short
-    timeout: a notice runs on the poll loop's thread, so one slow send must not
-    hold it long (the sweep's overall NOTICE_BUDGET_S bounds the batch; this
-    bounds a single request within it — review r4-followup #5)."""
+    """One best-effort room message for a core-state notice. True = the gateway
+    confirmed the send (`ok`/`event_id`) — a bare 2xx is NOT delivery: the room
+    op returns 200 with ``{ok: false}`` for a failed send (kicked from the room,
+    unroutable id), and recording that as delivered would put the room in
+    `active` to later get a "back online" for a notice that never landed. A
+    notice is informational, so unlike results it takes no confirmation/outbox
+    machinery — False just means the sweep retries on a later pass. 401/403
+    propagate: the poll loop owns auth. Short timeout: a notice runs on the poll
+    loop's thread, so one slow send must not hold it long (the sweep's overall
+    NOTICE_BUDGET_S bounds the batch; this bounds a single request within it)."""
     try:
-        _req("POST", "/v1/room",
-             {"op": "message", "room_id": room, "body": body}, timeout=6)
-        return True
+        answer = _req("POST", "/v1/room",
+                      {"op": "message", "room_id": room, "body": body}, timeout=6)
+        ok = isinstance(answer, dict) and bool(answer.get("ok") or answer.get("event_id"))
+        if not ok:
+            _log(f"core-state notice to {room} not confirmed by gateway")
+        return ok
     except urllib.error.HTTPError as e:
         if e.code in (401, 403):
             raise
