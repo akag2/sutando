@@ -87,6 +87,27 @@ class TestHookRegistration(unittest.TestCase):
         self.assertIn("2 NOT registered", out["detail"])
         self.assertNotIn("Stop:", out["detail"], "a registered hook must not be reported missing")
 
+    def test_remedy_omits_the_archive_hook_when_other_hooks_are_missing(self):
+        # The bare installer registers the transcript archiver. Anyone repairing an unrelated
+        # missing hook by following this text would enable an egress the owner has not opted into.
+        h = self._all_registered()
+        del h["Stop"]
+        self._settings(h)
+        out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
+        self.assertEqual(out["status"], "warn")
+        self.assertIn("SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1", out["detail"])
+
+    def test_remedy_does_not_prescribe_a_repair_when_only_the_archiver_is_missing(self):
+        # --fix already refuses this case; the text used to prescribe the bare command anyway.
+        h = self._all_registered()
+        h["PreCompact"] = [{"hooks": [{"command": f"bash {self.repo}/src/session-handoff.sh"}]}]
+        self._settings(h)
+        out = self.hc.check_claude_hook_registration(repo_dir=self.repo)
+        self.assertEqual(out["status"], "warn")
+        self.assertIn("explicit opt-in", out["detail"])
+        self.assertIn("only if you intend", out["detail"])
+        self.assertNotIn("re-run", out["detail"], "an opt-in is not a repair instruction")
+
     def test_registered_but_pointing_at_ANOTHER_checkout_warns(self):
         # The failure that looks healthiest: present, so an existence check passes,
         # but aimed at a stale copy — this host ran a 5-day-old script for days.
