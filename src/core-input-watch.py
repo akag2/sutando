@@ -512,16 +512,8 @@ def _atomic_write(path, payload):
     os.replace(tmp, path)
 
 
-# Liveness heartbeat, written EVERY tick beside core-supervisor.json — even when
-# the state is unchanged. core-supervisor.json is write-on-change (so the desktop
-# banner isn't churned), which means its mtime says nothing about whether THIS
-# watcher is still alive: a stable state (an hour idle, or a multi-hour usage
-# outage) leaves it arbitrarily old. Consumers that must distinguish "the core is
-# genuinely in state X" from "the watcher died while the last state was X" read
-# this heartbeat's freshness instead of the state file's mtime. A dead watcher
-# stops touching it, so its verdict correctly goes stale (silent-core review
-# 2026-09-08, should-fix #1). Best-effort: a heartbeat write must never take the
-# monitor down, so all errors are swallowed.
+# Liveness heartbeat written EVERY tick (core-supervisor.json is write-on-change,
+# so its mtime can't tell a stable state from a dead watcher). Best-effort (#1).
 def _write_heartbeat(out_path):
     hb = os.path.join(os.path.dirname(out_path), "core-supervisor-heartbeat")
     try:

@@ -295,9 +295,8 @@ def tofu_onboard(sender_id, username):
     return {sender_id}
 
 def api(method, _timeout_s=30, **params):
-    # _timeout_s is keyword-only-ish (Telegram params never use that name); a
-    # short value keeps a slow notice send from stalling the single poll loop
-    # (review r4-followup #5).
+    # _timeout_s (Telegram params never use that name): a short value stops a
+    # slow notice send from stalling the single poll loop (#5).
     url = f"https://api.telegram.org/bot{TOKEN}/{method}"
     if params:
         data = json.dumps(params).encode()
@@ -734,12 +733,9 @@ def log_privacy_setting(get_me):
 
 
 # --- Core-state notices (silent-core fix), parity with gateway/discord/slack --
-# When the core can't answer (usage limit / logged out / crashed / wedged), tell
-# the chat why instead of dropping the message silently. Shared dedup/cooldown/
-# recovery logic + ledger schema live in ag2_sparrow.core_state_notice; this is
-# the (synchronous) Telegram binder. A DISTINCT ledger file keeps telegram's
-# cooldown state from colliding with the other bridges' in the shared state dir.
-# Suffix is PLAIN (no markdown) — these sendMessage calls use no parse_mode.
+
+# Telegram's (synchronous) binder over the shared core_state_notice logic.
+# Distinct ledger file (no cross-surface collision); PLAIN suffix (no parse_mode).
 _CORE_NOTICE_LEDGER = "core-state-notice-telegram.json"
 _CORE_NOTICE_SUFFIX = " (automated notice)"
 
@@ -1292,11 +1288,8 @@ def main():  # pragma: no cover
                 task_file = find_task_file(TASKS_DIR, task_id) or TASKS_DIR / f"{task_id}.txt"
                 archive_file(task_file, "tasks", task_id)
 
-        # Silent-core fix (after result draining, review r4 ordering): if the
-        # core is degraded, notice the chats of still-pending unanswered tasks
-        # (retries a failed first notice without a new message, #4); if it's
-        # healthy, announce recovery to any chat owed one. Single-threaded loop,
-        # so no lock; the shared cooldown keeps it to one notice per chat/reason.
+        # After result draining: notice pending unanswered chats if degraded,
+        # else recover owed chats (#4). Single loop → no lock; cooldown dedups.
         _pending_chats = {str(cid) for tid, cid in pending_replies.items()
                           if not (RESULTS_DIR / f"{tid}.txt").exists()}
         _core_notice_sweep(_pending_chats)

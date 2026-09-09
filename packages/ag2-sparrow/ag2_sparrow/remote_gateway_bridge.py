@@ -2823,14 +2823,8 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
         tmp.unlink(missing_ok=True)
         _log(f"media sidecar FAILED for {tid} — not queued, not acked")
         return None
-    # Room sidecar BEFORE publish too (review 2026-09-07, should-fix #2): the
-    # core-state notice sweep resolves a queued task's room through this map,
-    # and its target case is a task queued moments before/during a core
-    # outage — recording after publish left a crash window where exactly that
-    # task queued room-less and lost its notice. Still best-effort (unlike
-    # media): the map only feeds advisory paths, so a failed write must not
-    # veto the queue/ack of a deliverable task. A dangling entry from a
-    # publish that then fails is inert — sweeps key off in-flight ids.
+    # Room sidecar BEFORE publish (#2), else a crash could queue a task the
+    # notice sweep can't route. Best-effort/advisory — never vetoes the ack.
     _record_task_room(tid, str(task.get("channel_id") or ""))
     if not _publish_staged(tmp, dest):  # atomic publish: never a partial file
         tmp.unlink(missing_ok=True)
@@ -3400,15 +3394,11 @@ def _maybe_core_state_notices(inflight: set[str]) -> None:
             if room and _MATRIX_ROOM_RE.match(room):
                 rooms.add(room)
         # Validate ledger-derived recovery targets against the Matrix room shape
-        # (review 2026-09-08 r3): a corrupt/forged `active` key is purged, not
-        # POSTed to. Intake rooms above are already shape-filtered.
+        # (#r3): a corrupt/forged `active` key is purged, not POSTed to.
         sweep_core_state_notices(
             _STATE, rooms, _core_notice_send, log=_log,
-            # Instance-suffix the ledger like every other gateway state file
-            # (gateway-status{_INST_SUFFIX}.json, remote-task-inflight…): a
-            # named instance (e.g. dev) sharing this workspace/state dir with the
-            # default instance would otherwise collide on one notice ledger and
-            # cross-suppress each other's cooldowns (silent-core follow-up).
+            # Instance-suffix the ledger like every other gateway state file, so
+            # a named + default instance on one workspace don't collide.
             ledger_name=f"core-state-notice{_INST_SUFFIX}.json",
             recovery_target_ok=lambda r: bool(_MATRIX_ROOM_RE.match(r)))
     except urllib.error.HTTPError:

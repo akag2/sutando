@@ -483,16 +483,16 @@ def needs_login(pane_text):
     return any(m in low for m in _LOGIN_MARKERS)
 
 
-# --- Runtime awareness (silent-core coverage for non-Claude cores) -----------
-# Claude's logout is scraped from its auth prompt (needs_login). Codex shows
-# different text but ships `codex login status`, so we ask it directly. All
-# gated on the runtime; the Claude path is unchanged.
-_CODEX_LOGIN_CACHE = [0.0, None]  # [ts, needs_login: True|False|None]
-_CODEX_LOGIN_TTL = 30.0           # the probe spawns node — don't run it per-tick
-# Sentinel: the tmux query itself could not run (distinct from "var is unset").
+# Runtime-aware logout: Claude scrapes its prompt (needs_login), Codex asks
+# `codex login status`. Gated on runtime; the Claude path is unchanged.
+
+_CODEX_LOGIN_CACHE = [0.0, None]  # [ts, needs_login True|False|None]; probe spawns node
+_CODEX_LOGIN_TTL = 30.0
+
+# _ENV_UNAVAILABLE: the tmux query itself failed (distinct from "var unset").
 _ENV_UNAVAILABLE = object()
-# `codex login status` prints this when the account is genuinely unauthenticated;
-# other non-zero exits (config error, exit 127 no-node) are NOT logout.
+
+# Genuine-logout marker; other non-zero exits (config error / no-node) are NOT.
 _CODEX_LOGGED_OUT_RE = re.compile(r"not logged in|not authenticated|run .?codex login", re.I)
 
 

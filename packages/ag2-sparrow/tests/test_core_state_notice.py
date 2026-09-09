@@ -80,9 +80,8 @@ def test_invalid_heartbeat_is_no_verdict():
 
 
 def test_recovery_validates_and_purges_targets():
-    # Review r3: recovery must not send to a corrupt/forged active key; it
-    # purges invalid targets (never sends, never retries) and only recovers
-    # ones passing the surface validator.
+    # r3: recovery purges a corrupt/forged active key (never sends/retries) and
+    # only recovers ones passing the surface validator.
     with tempfile.TemporaryDirectory() as d:
         tmp = pathlib.Path(d)
         now = time.time()
@@ -134,9 +133,8 @@ def test_partial_success_committed_before_exception():
 
 
 def test_recovery_persistence_failure_does_not_resurrect():
-    # r4-followup #1: degraded persists (disk active has A); recovery send
-    # succeeds but its persist fails → the memory snapshot (active empty) is
-    # authoritative, so the next pass must NOT re-send recovery.
+    # r4-followup #1: recovery send succeeds but its persist fails → the memory
+    # snapshot (active empty) is authoritative, so the next pass must NOT re-send.
     import unittest.mock as mock
     csn._MEM_LEDGERS.clear()
     with tempfile.TemporaryDirectory() as d:
@@ -174,12 +172,9 @@ def test_unattempted_rooms_not_charged_a_failure():
                 raise RuntimeError("A raises, aborting before B")
             return True
 
-        # ONE pass: A (sorted first) raises before B is reached. In THIS pass B
-        # was never attempted, so it must accrue no failure and keep its debt —
-        # the bug charged every planned item, purging B without a send. (Rotation
-        # then gives B its turn on a later pass; that's the #3 anti-starvation
-        # behavior, tested separately.)
-        csn._RR_CURSORS.clear()  # ensure A sorts first this pass
+        # ONE pass: A (sorted first) raises before B is reached, so B must accrue
+        # no failure and keep its debt (the bug charged every planned item) (#2).
+        csn._RR_CURSORS.clear()
         try:
             csn.sweep_core_state_notices(tmp, set(), raising_send, now=now + 1)
         except RuntimeError:
@@ -218,9 +213,8 @@ def test_batch_cap_rotation_reaches_all_rooms():
 
 
 def test_budget_truncation_does_not_starve():
-    # r4-followup-2: 3 rooms (< the count cap), but the TIME budget truncates
-    # each pass after 2 slow sends. Rotation must still advance by ACTUAL
-    # attempts so the 3rd room is eventually reached — not just when len > cap.
+    # r4-followup-2: 3 rooms (< count cap) but the TIME budget truncates each
+    # pass; rotation must advance by ACTUAL attempts so the 3rd is reached.
     import unittest.mock as mock
     csn._MEM_LEDGERS.clear()
     csn._RR_CURSORS.clear()
@@ -309,9 +303,8 @@ def test_degraded_notices_once_per_room_with_cooldown():
         # a NEW room mid-outage still gets its notice
         csn.sweep_core_state_notices(tmp, {"!a:s", "!c:s"}, s, now=now + 61)
         assert [r for r, _ in s.sent].count("!c:s") == 1
-        # past the cooldown the same room re-notices (long outage: one
-        # reminder per window, not one per message) — with the file untouched
-        # since the outage began, as a write-on-change watcher leaves it
+        # past the cooldown the same room re-notices (one reminder per window),
+        # with the file untouched as a write-on-change watcher leaves it
         later = now + csn._cooldown_s() + 1
         csn.sweep_core_state_notices(tmp, {"!a:s"}, s, now=later)
         assert [r for r, _ in s.sent].count("!a:s") == 2
@@ -358,9 +351,8 @@ def test_recovery_announced_once_and_flap_stays_bounded():
         # healthy again → nothing more
         csn.sweep_core_state_notices(tmp, set(), s, now=now + 6)
         assert len(s.sent) == 2
-        # degraded/healthy FLAP (review should-fix #1): recovery must NOT
-        # clear the cooldown — the same reason inside the window stays silent,
-        # and with no notice delivered, no second recovery is owed either
+        # degraded/healthy FLAP (#1): recovery must NOT clear the cooldown —
+        # same reason inside the window stays silent, no second recovery owed
         _write_state(tmp, "blocked-human", kind="session-limit")
         csn.sweep_core_state_notices(tmp, {"!a:s"}, s, now=now + 7)
         _write_state(tmp, "idle-ready")
@@ -406,10 +398,8 @@ def test_v1_ledger_resets_cleanly():
 
 
 def test_old_mtime_is_still_a_verdict():
-    # The watcher writes only on CHANGE (core-input-watch `sig != last_sig`),
-    # so a multi-hour outage leaves an old mtime on perfectly current content.
-    # An mtime-staleness gate here silently dropped notices for any outage
-    # longer than the bound (live finding 2026-09-08) — age must not matter.
+    # The watcher writes only on CHANGE, so a multi-hour outage leaves an old
+    # mtime on current content — age must not gate the verdict (live finding).
     with tempfile.TemporaryDirectory() as d:
         tmp = pathlib.Path(d)
         s = _Sender()
@@ -493,9 +483,8 @@ def test_read_core_state_bounds_and_shapes():
 
 
 def test_plan_commit_seam_for_async_callers():
-    # The plan/commit split lets an await-based caller (discord/slack/telegram)
-    # reuse the exact ledger + cooldown logic: plan → send each item however
-    # you like → commit only the rooms that succeeded.
+    # The plan/commit split lets an await-based caller (discord) reuse the exact
+    # ledger + cooldown logic: plan → send → commit only what succeeded.
     with tempfile.TemporaryDirectory() as d:
         tmp = pathlib.Path(d)
         _write_state(tmp, "logged-out")

@@ -970,29 +970,16 @@ def _slack_context_note(event: dict) -> tuple[str, set[str]]:
 
 
 # --- Core-state notices (silent-core fix), parity with gateway + discord ------
-# When the core can't answer (usage limit / logged out / crashed / wedged) the
-# bridge kept queuing messages silently; tell the channel why instead. Shared
-# dedup/cooldown/recovery logic + ledger schema live in
-# ag2_sparrow.core_state_notice; this is the (synchronous) Slack binder.
-#
-# A DISTINCT ledger file: slack, discord and the gateway share one
-# workspace/state dir, so a shared ledger would corrupt under concurrent
-# writers and let one surface's cooldown suppress another's notice.
+
+# Shared dedup/cooldown/recovery live in core_state_notice; this is Slack's
+# (synchronous) binder. Distinct ledger file: no cross-surface collision.
 _CORE_NOTICE_LEDGER = "core-state-notice-slack.json"
 _CORE_NOTICE_SUFFIX = " _(automated notice)_"
-# All notice sends run on ONE background thread (see _core_notice_loop), NOT on
-# slack_bolt's event-handler thread pool (review 2026-09-08 r4, #1): intake no
-# longer posts inline, so a slow notice can't hold a lock across the network and
-# stall other handlers / exhaust the worker pool. A single sender also needs no
-# lock at all (nothing else touches the ledger). The tick is short so the first
-# "you're offline" line is still prompt.
+# All sends run on ONE background thread (not slack_bolt's handler pool), so a
+# slow notice can't stall handlers; single sender → no lock needed (#1).
 _CORE_NOTICE_INTERVAL_S = 5
-# The notice "room" is the reply TARGET, not just the channel: a channel
-# @mention is answered in-thread, so its notice must thread too (review
-# should-fix #3) — else the outage line lands top-level in a busy channel,
-# detached from the ask. We encode channel[+thread_ts] into the ledger key with
-# a separator outside Slack's id/ts alphabets; recovery decodes it to thread the
-# "back online" line into the same place. Dedup is thus per-conversation.
+# Notice "room" = the reply TARGET: a channel @mention threads its notice, so we
+# encode channel[+thread_ts] (sep outside Slack's alphabets); per-conversation (#3).
 _CORE_NOTICE_SEP = "\x1f"
 
 
@@ -1382,10 +1369,8 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
         task_processed("slack")
     except Exception:  # pragma: no cover — telemetry must never break the bridge
         pass
-    # Silent-core fix: the task is queued above (pending_replies). The notice —
-    # if the core can't answer right now — is sent by the single _core_notice_loop
-    # thread, which derives its targets from pending unanswered tasks; intake does
-    # NOT post inline, so a slow notice never stalls this handler (review r4, #1).
+    # Task is queued (pending_replies); the notice is sent by _core_notice_loop
+    # from pending tasks — intake does NOT post inline, so it never stalls (#1).
     return task_id
 
 

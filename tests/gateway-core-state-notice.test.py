@@ -53,11 +53,11 @@ class RoomSelection(unittest.TestCase):
         return self.captured[-1]
 
     def test_only_pending_matrix_rooms_reach_the_sweep(self):
+        # t3 empty / t4 non-Matrix id → no room op; t5 has a ready result;
+        # task-dev~t6 is a valid named-instance id. Only real pending rooms pass.
         rooms = self._rooms_for(
             {"t1": "!a:server", "t2": "!b:server", "t3": "",
-             "t4": "C0FOREIGN",          # a discord/slack channel id — no room op
-             "t5": "!c:server",          # result ready — silence ends on its own
-             "task-dev~t6": "!d:server"},  # named-instance local id is valid
+             "t4": "C0FOREIGN", "t5": "!c:server", "task-dev~t6": "!d:server"},
             ["t1", "t2", "t3", "t4", "t5", "task-dev~t6",
              "../evil", "t-unmapped"],
             results=["t5"])
@@ -70,10 +70,8 @@ class RoomSelection(unittest.TestCase):
 
 class RoomSidecarOrdering(unittest.TestCase):
     def test_room_recorded_before_task_publish(self):
-        # Review should-fix #2: the room sidecar must commit BEFORE the task
-        # publishes — a crash between the two left a queued task the notice
-        # sweep could not route, which is exactly the message-during-outage
-        # case this feature exists for.
+        # #2: the room sidecar must commit BEFORE the task publishes, else a
+        # crash between them queues a task the notice sweep can't route.
         order = []
         saved = {n: getattr(gw, n) for n in
                  ("_record_task_room", "_publish_staged", "_record_task_media",

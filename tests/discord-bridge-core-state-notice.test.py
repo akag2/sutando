@@ -221,7 +221,29 @@ def main():
         expect(json.loads(ledger.read_text()).get("active") == {},
                "unresolved room purged after bounded retries, not stuck forever")
 
-        # 8. #4 — pending unanswered tasks feed the periodic retry set
+        # 8. #6 — core crashes DURING the resolve await → no stale recovery
+        # (fetch resolves the channel but flips the supervisor to crashed first).
+        reset()
+        _write_state(state_dir, "crashed")
+        race = _Channel(555000000000000013)
+        registry[race.id] = race
+        sweep({str(race.id)})              # seed active (degraded notice)
+        del registry[race.id]
+
+        async def _fetch_then_crash(cid):
+            _write_state(state_dir, "crashed")  # core dies during the await
+            return registry.get(("fetch", cid))
+        registry[("fetch", race.id)] = race
+        bridge.client.fetch_channel = _fetch_then_crash
+        _write_state(state_dir, "idle-ready")  # healthy at the pre-resolve check
+        race.sent.clear()
+        sweep(set())
+        expect(all("back online" not in b for b in race.sent),
+               "no stale recovery when the core crashed during channel resolution")
+        # restore the plain fetch for any later use
+        bridge.client.fetch_channel = _fetch
+
+        # 9. #4 — pending unanswered tasks feed the periodic retry set
         bridge.pending_replies = {"task-x": _Channel(555000000000000012),
                                   "task-done": _Channel(999)}
         (state_dir / "task-done.txt").write_text("answered")

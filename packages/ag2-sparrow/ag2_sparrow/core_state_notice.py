@@ -39,34 +39,22 @@ import os
 import time
 from pathlib import Path
 
-# Cap notices sent per sweep so one pass can't run an unbounded sequence of slow
-# network requests inline on a bridge's hot path (review 2026-09-08 r4, #1).
-# Uncapped rooms simply carry to the next sweep — degraded ones re-plan (still
-# no cooldown), recovery ones stay in `active`.
+# Cap notices per sweep so one pass can't run an unbounded run of slow inline
+# sends (#1); overflow carries to the next sweep.
 MAX_NOTICES_PER_SWEEP = 8
 # A recovery target that keeps failing to deliver is purged after this many
 # attempts, so a room the bot lost access to can't be retried forever (#6).
 MAX_RECOVERY_ATTEMPTS = 5
-# Soft wall-clock budget for one sweep's sends. It is checked BEFORE each send,
-# not enforced mid-flight, so a send already in progress can overrun it by up to
-# that request's own timeout — the budget bounds how many further sends a sweep
-# STARTS, not the hard wall-clock (review r4-followup-2 nit). Paired with short
-# per-request notice timeouts (gateway/telegram 6s) it keeps notice IO on a
-# bridge's main poll path from stacking many slow sends. Rooms past the deadline
-# carry to the next sweep (and the cursor advances, so they aren't starved).
+# Soft budget checked BEFORE each send (an in-flight send can overrun by its own
+# timeout): bounds how many further sends a sweep starts on the poll path (#5).
 NOTICE_BUDGET_S = 12.0
 
-# Process-local ledger overlay, keyed by (state_dir, ledger_name). Holds
-# successful-send accounting that could NOT be persisted to disk (#3), so a
-# transient ledger-write failure doesn't make this process re-send every sweep.
-# Cleared for a key once a disk write for it succeeds (disk is then canonical).
+# Process-local overlay of accounting that couldn't persist to disk (#3), so a
+# write failure doesn't re-send every sweep; cleared once a disk write succeeds.
 _MEM_LEDGERS: dict = {}
 
-# Round-robin cursors, keyed by (state_dir, ledger_name, kind). When more rooms
-# are eligible than MAX_NOTICES_PER_SWEEP, the window advances each pass so a
-# handful of always-failing rooms (which never earn a cooldown) can't occupy
-# every capped batch and starve a reachable room behind them (review r4-followup
-# #3). Process-local: fairness need not survive restart.
+# Round-robin cursors so an always-failing prefix (rooms that earn no cooldown)
+# can't occupy every capped batch and starve rooms behind them (r4-followup #3).
 _RR_CURSORS: dict = {}
 
 
@@ -84,21 +72,17 @@ def _rotate(seq, key, size):
     return (seq + seq)[cur:cur + n]
 
 CORE_SUPERVISOR_FILE = "core-supervisor.json"
-# Written every tick by core-input-watch (str epoch seconds); its freshness is
-# the watcher's liveness. See read_core_state for why the state file's own mtime
-# can't serve this role.
+# Written every tick by core-input-watch; its freshness is the watcher's
+# liveness (the state file's write-on-change mtime can't serve this role).
 CORE_HEARTBEAT_FILE = "core-supervisor-heartbeat"
-# Older than this → the watcher is presumed dead, so its last state is history,
-# not evidence. Generous vs the watcher's ~3s tick so a brief hiccup never reads
-# as death.
+# Older than this → watcher presumed dead, last state is history not evidence.
+# Generous vs the ~3s tick so a brief hiccup never reads as death.
 WATCHER_STALE_S = 120
-# A heartbeat timestamped slightly ahead of us is fine (clock jitter); further
-# into the future is implausible and treated as invalid rather than fresh.
+# A heartbeat slightly ahead is clock jitter; further into the future is
+# implausible and treated as invalid rather than fresh.
 _HEARTBEAT_FUTURE_SKEW_S = 5
-# The gateway's ledger filename (unchanged). Every bridge sharing a workspace
-# writes its OWN ledger — discord/slack/telegram pass a distinct `ledger_name`
-# so concurrent writers never collide on one file and one surface's cooldown
-# can't suppress another's notice. Room-id namespaces differ per surface too.
+# Gateway's ledger name; each surface passes its own `ledger_name` so bridges
+# sharing a workspace never collide on one file or cross-suppress cooldowns.
 LEDGER_FILE = "core-state-notice.json"
 
 _FIELD_MAX = 200  # supervisor fields are another process's output — bound them
@@ -176,9 +160,8 @@ def _watcher_liveness(state_dir: Path, now: float) -> str:
         return "absent"
     except Exception:  # noqa: BLE001 — present but unreadable/garbled
         return "invalid"
-    # A non-finite ts (inf/nan from "1e999") or one implausibly in the future
-    # (a forged/rolled-back clock) would otherwise read "fresh" forever and
-    # trust a dead watcher's state indefinitely (review 2026-09-08 r4, #9).
+    # A non-finite ts (inf/nan) or an implausibly-future one would read "fresh"
+    # forever and trust a dead watcher (#9).
     if not math.isfinite(ts):
         return "invalid"
     age = now - ts
@@ -411,11 +394,8 @@ class NoticePlan:
         sent = set(sent_rooms)
         attempted = ({room for room, _ in self.items}
                      if attempted_rooms is None else set(attempted_rooms))
-        # Advance the round-robin cursor by what we ACTUALLY attempted, so a
-        # pass cut short by the time budget / health-abort resumes past those
-        # rooms next sweep — even when nothing was delivered (every send failed).
-        # Doing this before any early return is what stops a small always-failing
-        # batch from replaying the same prefix forever (review r4-followup-2).
+        # Advance the cursor by what we ACTUALLY attempted, before any early
+        # return, so a batch cut short (budget/health/all-failed) resumes (#3).
         if self._rr_key is not None and attempted:
             _RR_CURSORS[self._rr_key] = _RR_CURSORS.get(self._rr_key, 0) + len(attempted)
         if self.kind == "degraded":
@@ -429,9 +409,8 @@ class NoticePlan:
             fail = self._ledger.setdefault("fail", {})
             purge = set(self._purge)
             for room in failed:
-                # A target that keeps refusing delivery (bot lost access, target
-                # gone) is retried a bounded number of times, then given up on —
-                # a recovery line is benign to drop (review 2026-09-08 r4, #6).
+                # A target that keeps failing delivery is retried a bounded
+                # number of times then dropped — a recovery line is benign (#6).
                 fail[room] = fail.get(room, 0) + 1
                 if fail[room] >= MAX_RECOVERY_ATTEMPTS:
                     purge.add(room)
@@ -555,7 +534,6 @@ def sweep_core_state_notices(state_dir: Path, rooms, send, log=None,
                     extra = f" ({plan.reason})" if plan.kind == "degraded" else ""
                     log(f"core-state {verb}{extra} sent to {room}")
     finally:
-        # Record completed sends even if a later send raised (#2); charge
-        # failures only to rooms we actually attempted, never the ones the
-        # budget/health-abort skipped (r4-followup #2).
+        # Commit completed sends even if a later one raised (#2); charge failures
+        # only to rooms actually attempted, not budget/health-skipped ones.
         plan.commit(sent, attempted_rooms=attempted)

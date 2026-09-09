@@ -2719,25 +2719,14 @@ async def _supervise_loop(coro_fn, name):
 
 
 # --- Core-state notices (silent-core fix), parity with the gateway bridge -----
-# When the Claude core can't answer — usage limit hit, logged out, crashed, or
-# wedged at a prompt — the bridge kept queuing messages but never told the
-# sender, so a Discord user saw only silence (owner report 2026-09-07). The
-# detection (state/core-supervisor.json, written by core-input-watch) and the
-# dedup/cooldown/recovery logic are shared with the gateway in
-# ag2_sparrow.core_state_notice; this is the async binder for Discord.
-#
-# A DISTINCT ledger file: discord and the gateway share one workspace/state dir,
-# so a shared ledger would mean two processes writing one file (corruption) and
-# one surface's cooldown suppressing the other's notice.
+
+# Shared detection + dedup/cooldown/recovery live in core_state_notice; this is
+# Discord's async binder. Distinct ledger file: no cross-surface collision.
 _CORE_NOTICE_LEDGER = "core-state-notice-discord.json"
 _CORE_NOTICE_SUFFIX = " _(automated notice)_"
 _CORE_NOTICE_RECOVERY_INTERVAL_S = 15
-# Serialize plan→send→commit (review 2026-09-08, should-fix #2): discord
-# dispatches on_message handlers concurrently, so two messages for the same
-# channel during an outage could both plan (each seeing no cooldown yet), both
-# send, then both commit — a duplicate notice. This lock also serializes intake
-# against the recovery loop, since they share the ledger. One event loop, so one
-# asyncio.Lock suffices.
+# Serialize plan→send→commit: concurrent handlers could otherwise double-send
+# for one channel, and intake races the recovery loop (#2). One loop → one lock.
 _core_notice_lock = asyncio.Lock()
 _CORE_NOTICE_RESOLVE_TIMEOUT_S = 5
 
@@ -4464,13 +4453,8 @@ async def _handle_discord_message(message, force=False):
     pending_reply_anchors[task_id] = message.id
     save_pending_replies()
 
-    # Silent-core fix: the task is durably queued AND its reply route persisted
-    # above; only now tell this channel why the core can't answer right away
-    # (usage limit / logged out / crashed / wedged). Placed after
-    # save_pending_replies (review r3, nit) so the notice's network await doesn't
-    # widen the task-written/route-unpersisted crash window. A failed send here
-    # is retried by poll_core_state_recovery from the pending-task set (r4, #4).
-    # Never blocks or fails admission — the notice only explains the delay.
+    # After the task is queued AND its route persisted (r3 nit): tell this channel
+    # why. A failed send is retried by poll_core_state_recovery from pending (#4).
     await _core_notice_sweep({str(message.channel.id)})
 
     # Typing indicator
