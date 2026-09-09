@@ -146,3 +146,4 @@ coverage-summary.md
 
 # Built locally from a GAIA copy; carries the answer key -- never commit.
 benchmarks/gaia-100.json
+skills/ops-triage/config.env

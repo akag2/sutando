@@ -296,7 +296,8 @@ from . import local_task_protocol
 from .result_markers import parse_markers, render_skill_prelude
 from . import undelivered_quarantine
 from .team_guardrail import (team_guardrail_lines, engage_rulebook,
-                             AG2SPACE_PROVENANCE, sandboxed_delegation_lines)
+                             AG2SPACE_PROVENANCE, sandboxed_delegation_lines,
+                             ops_alert_evidence_lines)
 from . import team_result_guard
 from .outbox import DeliveryOutcome, record_delivered
 from .outbox_adapter import classify_response
@@ -1746,6 +1747,16 @@ LOCAL_TIER = local_task_protocol.canonical_access_tier(
 if LOCAL_TIER not in ("owner", "team", "guest"):
     LOCAL_TIER = "guest"
 
+# Ops-alert evidence lane: guest tasks with sender AND room both allowlisted
+# get the fixed read-only evidence step; either list empty = lane off.
+def _csv_env(name: str) -> frozenset:
+    return frozenset(
+        s.strip() for s in (os.environ.get(name) or "").split(",") if s.strip())
+
+
+OPS_ALERT_SENDERS = _csv_env("OPS_ALERT_SENDERS")
+OPS_ALERT_ROOMS = _csv_env("OPS_ALERT_ROOMS")
+
 
 # A local per-sender map can only cap the broker tier; unlisted senders use LOCAL_TIER.
 # Cache identity includes mtime, size, and inode so revocations take effect promptly.
@@ -2942,10 +2953,18 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
         if isinstance(task.get("signal"), dict):
             lines.extend(_signal_task_media_lines(str(RESULTS_DIR / tid)))
     if sender_tier == "guest":
-        lines.extend(sandboxed_delegation_lines(
-            "AG2 Space", "GUEST tier", f"results/{tid}.txt",
-            "Research, inspect, explain, and draft only. Do not modify files or external systems.",
-        ))
+        _ops_sender = str(task.get("user_id") or "")
+        _ops_room = str(task.get("channel_id") or "")
+        if _ops_sender in OPS_ALERT_SENDERS and _ops_room in OPS_ALERT_ROOMS:
+            lines.extend(ops_alert_evidence_lines(
+                "AG2 Space", f"results/{tid}.txt",
+                "skills/ops-triage/collect-evidence.sh",
+                f"results/.evidence-{tid}.txt"))
+        else:
+            lines.extend(sandboxed_delegation_lines(
+                "AG2 Space", "GUEST tier", f"results/{tid}.txt",
+                "Research, inspect, explain, and draft only. Do not modify files or external systems.",
+            ))
     # ===SKILL INSTRUCTIONS=== (owner-tier only): prose/numbered lines only, no
     # header-shaped lines, so appending after access_tier keeps it the last one.
     if sender_tier == "owner":
