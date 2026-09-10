@@ -209,8 +209,12 @@ if shutil.which("tmux"):
     finally:
         subprocess.run(["tmux", "-S", _sock, "kill-server"],
                        capture_output=True, timeout=10)
+elif os.environ.get("CI"):
+    # The only arm that discriminates must not silently skip where it matters:
+    # a guard that can decline to run is a guard whose absence looks like a pass.
+    check("real-tmux integration RAN (tmux must be installed under CI)", False)
 else:
-    print("  skip real-tmux integration (tmux not installed)")
+    print("  skip real-tmux integration (tmux not installed; a red check under CI)")
 
 if fails:
     print(f"\n{fails} FAILURE(S)")
