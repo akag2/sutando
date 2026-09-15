@@ -6,10 +6,16 @@ The voice agent calls http://localhost:7845/capture to get instant screenshots.
 
 Usage: python3 src/screen-capture-server.py
 (Run in a terminal window — NOT as a launchd daemon)
+
+Backends: macOS `screencapture` (displays via -D<n>, video via -v, resize via
+sips) or Linux X11 (scrot / ImageMagick `import` on $DISPLAY, video via ffmpeg
+x11grab, resize via ImageMagick). The HTTP contract is identical on both.
 """
 
 import http.server
+import shutil
 import subprocess
+import sys
 import json
 import os
 import secrets
@@ -19,6 +25,64 @@ import threading
 import urllib.request
 import os as _os
 from datetime import datetime
+
+IS_DARWIN = sys.platform == "darwin"
+
+
+def linux_screenshot_tool() -> "str | None":
+    """First screenshot tool on PATH, in the same order scripts/platform.sh uses."""
+    for tool in ("scrot", "import", "gnome-screenshot"):
+        if shutil.which(tool):
+            return tool
+    return None
+
+
+def linux_capture_cmd(path: str, tool: "str | None" = None) -> "list[str] | None":
+    """argv that writes a full-screen capture of $DISPLAY to `path`, or None."""
+    tool = tool or linux_screenshot_tool()
+    if tool == "scrot":
+        return ["scrot", "-o", path]
+    if tool == "import":
+        return ["import", "-window", "root", path]
+    if tool == "gnome-screenshot":
+        return ["gnome-screenshot", "-f", path]
+    return None
+
+
+def linux_downscale_cmd(path: str, maxdim: "int | None", quality: "int | None") -> "list[str] | None":
+    """ImageMagick in-place resize/recompress, the sips twin. None when unavailable."""
+    if not shutil.which("mogrify"):
+        return None
+    cmd = ["mogrify"]
+    if maxdim:
+        cmd += ["-resize", f"{maxdim}x{maxdim}>"]
+    if quality:
+        cmd += ["-quality", str(quality)]
+    cmd.append(path)
+    return cmd
+
+
+def linux_record_cmd(path: str, audio: bool, display: "str | None" = None) -> list:
+    """ffmpeg x11grab argv recording $DISPLAY until SIGINT; audio via PulseAudio."""
+    disp = display or os.environ.get("DISPLAY", ":0")
+    cmd = ["ffmpeg", "-loglevel", "error", "-y", "-f", "x11grab", "-framerate", "15", "-i", disp]
+    if audio and shutil.which("pactl"):
+        cmd += ["-f", "pulse", "-i", "default"]
+    cmd += ["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", path]
+    return cmd
+
+
+def linux_display_size() -> "tuple[int, int]":
+    """Width/height of $DISPLAY from xdpyinfo, (0, 0) when unknown."""
+    try:
+        out = subprocess.run(["xdpyinfo"], capture_output=True, text=True, timeout=5).stdout
+        for line in out.splitlines():
+            if "dimensions:" in line:
+                dims = line.split()[1].split("x")
+                return int(dims[0]), int(dims[1])
+    except Exception:
+        pass
+    return 0, 0
 
 PORT = 7845
 # Per-user temp dir — same treatment as browser.mjs in this PR: a shared
@@ -75,6 +139,8 @@ def screen_capture_permitted():
     prompt and would make a capture request user-visible.
     """
     global _PREFLIGHT
+    if not IS_DARWIN:
+        return None
     if _PREFLIGHT == "unset":
         try:
             import ctypes
@@ -119,6 +185,8 @@ def _post_recording_state(on: bool):
     Clip 🔴 without polling (Susan 2026-07-22: the server KNOWS when recording
     starts/stops — push, don't poll). Covers ⌃R toggles, watcher-started
     sessions, and the watchdog auto-stop uniformly. Fire-and-forget."""
+    if not IS_DARWIN:
+        return
     try:
         subprocess.Popen(["notifyutil", "-p",
                           "com.sutando.recording." + ("on" if on else "off")])
@@ -151,12 +219,14 @@ def _notify_capture_blocking():
     avoid notification-center spam during describe_screen loops."""
     try:
         import subprocess as _sp
-        _sp.run(
-            ["osascript", "-e",
-             'display notification "Captured screen" with title "Sutando"'],
-            timeout=1.0,
-            capture_output=True,
-        )
+        if IS_DARWIN:
+            cmd = ["osascript", "-e",
+                   'display notification "Captured screen" with title "Sutando"']
+        elif shutil.which("notify-send"):
+            cmd = ["notify-send", "Sutando", "Captured screen"]
+        else:
+            return
+        _sp.run(cmd, timeout=1.0, capture_output=True)
     except Exception:
         pass  # Best-effort; notification absence is never critical.
 
@@ -174,13 +244,18 @@ def _downscale_frame(path: str, maxdim: int | None, quality: int | None) -> bool
     only ever touches the already-shrunk file. Returns False when the frame
     could not be brought under budget (sips failed AND the original exceeds
     DOWNSCALE_FAIL_MAX_BYTES) — the caller must error, not pass it through."""
-    cmd = ["sips"]
-    if maxdim:
-        cmd += ["--resampleHeightWidthMax", str(maxdim)]
-    if quality:
-        cmd += ["-s", "format", "jpeg", "-s", "formatOptions", str(quality)]
-    cmd.append(path)
+    if IS_DARWIN:
+        cmd = ["sips"]
+        if maxdim:
+            cmd += ["--resampleHeightWidthMax", str(maxdim)]
+        if quality:
+            cmd += ["-s", "format", "jpeg", "-s", "formatOptions", str(quality)]
+        cmd.append(path)
+    else:
+        cmd = linux_downscale_cmd(path, maxdim, quality)
     try:
+        if cmd is None:
+            raise RuntimeError("no downscale tool")
         subprocess.run(cmd, timeout=10, capture_output=True, check=True)
         return True
     except Exception:
@@ -267,6 +342,11 @@ def list_displays() -> list[dict]:
     The probe is authoritative for `index` because that is the argument the
     capture routes take; profiler names are best-effort decoration.
     """
+    if not IS_DARWIN:
+        # One X screen per $DISPLAY; a virtual desktop has exactly one.
+        w, h = linux_display_size()
+        return [{"index": 1, "width": w, "height": h,
+                 "name": os.environ.get("DISPLAY", ":0"), "is_main": True}]
     names = _profiler_display_names()
     used: set[int] = set()
     displays: list[dict] = []
@@ -419,7 +499,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         quality_raw = query.get("quality", [None])[0]
         quality = int(quality_raw) if quality_raw and quality_raw.isdigit() and 10 <= int(quality_raw) <= 100 else None
         try:
-            if capture_all:
+            if not IS_DARWIN:
+                # Single X screen: every display selector resolves to it.
+                path = f"{DIR}/screen-{ts}.{ext}"
+                paths = [path]
+                cmd = linux_capture_cmd(path)
+                if cmd is None:
+                    raise RuntimeError("no screenshot tool on PATH (install scrot or imagemagick)")
+                subprocess.run(cmd, timeout=10, check=True, capture_output=True)
+                if not (os.path.exists(path) and os.path.getsize(path) > 0):
+                    raise RuntimeError(f"{cmd[0]} produced no file — is $DISPLAY ({os.environ.get('DISPLAY', 'unset')}) reachable?")
+            elif capture_all:
                 # Capture all displays separately
                 paths = []
                 for d in range(1, 5):  # up to 4 displays
@@ -510,7 +600,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             display_raw = query.get("display", [None])[0]
             display = int(display_raw) if display_raw and display_raw.isdigit() and 1 <= int(display_raw) <= 9 else None
             suffix = f"-d{display}" if display else ""
-            path = f"{DIR}/clip-{ts}{suffix}.mov"
+            path = f"{DIR}/clip-{ts}{suffix}.{'mov' if IS_DARWIN else 'mp4'}"
             with _recording_lock:
                 if _active_recording:
                     self._send_json(200, {"status": "already_recording", "path": _active_recording["path"]})
@@ -522,12 +612,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # system input; ?audio=off mutes, ?device=<id> pins one via -G.
                 audio = query.get("audio", ["on"])[0]
                 device = query.get("device", [None])[0]
-                cmd = ["screencapture", "-v", "-x"]  # no -V → records until SIGINT
-                if audio != "off":
-                    cmd.append(f"-G{device}" if device else "-g")
-                if display:
-                    cmd.append(f"-D{display}")
-                cmd.append(path)
+                if IS_DARWIN:
+                    cmd = ["screencapture", "-v", "-x"]  # no -V → records until SIGINT
+                    if audio != "off":
+                        cmd.append(f"-G{device}" if device else "-g")
+                    if display:
+                        cmd.append(f"-D{display}")
+                    cmd.append(path)
+                else:
+                    cmd = linux_record_cmd(path, audio != "off")  # SIGINT finalizes the mp4
                 try:
                     proc = subprocess.Popen(cmd)
                 except Exception as e:
@@ -571,7 +664,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
 if __name__ == "__main__":
     server = http.server.HTTPServer(("127.0.0.1", PORT), Handler)
     print(f"Screen capture server → http://localhost:{PORT}/capture")
-    print("Keep this terminal open — it has Screen Recording permission.")
+    if IS_DARWIN:
+        print("Keep this terminal open — it has Screen Recording permission.")
+    else:
+        print(f"Capturing $DISPLAY={os.environ.get('DISPLAY', 'unset')} via {linux_screenshot_tool() or 'NO TOOL (install scrot)'}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

@@ -10,7 +10,11 @@ pass() { echo "  ✓ $1"; PASS=$((PASS+1)); }
 fail() { echo "  ✗ $1"; FAIL=$((FAIL+1)); }
 warn() { echo "  ~ $1"; WARN=$((WARN+1)); }
 
-echo "Sutando Setup Verification"
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../scripts/platform.sh
+. "$REPO/scripts/platform.sh"
+
+echo "Sutando Setup Verification ($(sutando_os))"
 echo "========================================"
 
 # 1. Prerequisites
@@ -26,10 +30,9 @@ if command -v node &>/dev/null; then
     fail "Node.js $NODE_VER (need 22+)"
   fi
 else
-  fail "Node.js not found (brew install node)"
+  fail "Node.js not found ($(sutando_install_hint node))"
 fi
 
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CORE_RUNTIME="$(bash "$REPO/scripts/sutando-config.sh" core-runtime 2>/dev/null || echo claude)"
 if command -v "$CORE_RUNTIME" &>/dev/null; then
   if [ "$CORE_RUNTIME" = "codex" ] && ! codex login status >/dev/null 2>&1; then
@@ -44,13 +47,20 @@ fi
 if command -v fswatch &>/dev/null; then
   pass "fswatch"
 else
-  fail "fswatch not found (brew install fswatch)"
+  fail "fswatch not found ($(sutando_install_hint fswatch))"
 fi
 
 if command -v python3 &>/dev/null; then
   pass "Python3 $(python3 --version 2>&1 | sed 's/Python //')"
 else
-  fail "Python3 not found"
+  fail "Python3 not found ($(sutando_install_hint python3))"
+fi
+
+# Every port guard in startup.sh is `lsof -i`; Debian does not ship it.
+if command -v lsof &>/dev/null; then
+  pass "lsof"
+else
+  fail "lsof not found ($(sutando_install_hint lsof))"
 fi
 
 # 2. Configuration
@@ -150,14 +160,30 @@ for port_name in "9900:voice-agent" "8080:web-client" "7844:dashboard" "7843:age
   fi
 done
 
-# 7. macOS permissions
+# 7. Desktop permissions / tools
 echo ""
-echo "macOS permissions:"
-
-if sqlite3 ~/Library/Application\ Support/com.apple.TCC/TCC.db "SELECT client FROM access WHERE service='kTCCServiceScreenCapture'" 2>/dev/null | grep -qi "claude\|node\|terminal\|iterm\|warp"; then
-  pass "Screen Recording permission granted"
+if sutando_is_darwin; then
+  echo "macOS permissions:"
+  if sqlite3 ~/Library/Application\ Support/com.apple.TCC/TCC.db "SELECT client FROM access WHERE service='kTCCServiceScreenCapture'" 2>/dev/null | grep -qi "claude\|node\|terminal\|iterm\|warp"; then
+    pass "Screen Recording permission granted"
+  else
+    warn "Screen Recording — may need to grant in System Settings → Privacy"
+  fi
 else
-  warn "Screen Recording — may need to grant in System Settings → Privacy"
+  echo "Linux desktop:"
+  if sutando_has_display; then
+    pass "display ${DISPLAY:-$WAYLAND_DISPLAY}"
+  else
+    warn "no \$DISPLAY — screen capture + input control off (see docs/linux.md, scripts/linux/install-headless-desktop.sh)"
+  fi
+  if _shot="$(sutando_linux_screenshot_tool)"; then
+    pass "screenshot tool ($_shot)"
+  else
+    warn "no screenshot tool ($(sutando_install_hint scrot))"
+  fi
+  for _t in xdotool xclip xdg-open; do
+    if command -v "$_t" &>/dev/null; then pass "$_t"; else warn "$_t missing ($(sutando_install_hint "$_t"))"; fi
+  done
 fi
 
 # Summary

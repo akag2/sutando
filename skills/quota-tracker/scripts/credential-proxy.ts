@@ -3,7 +3,7 @@
  *
  * Based on nanoclaw's credential-proxy.ts approach:
  * - Runs as a local HTTP proxy between Claude Code and api.anthropic.com
- * - Injects OAuth credentials from macOS keychain
+ * - Injects OAuth credentials from the macOS keychain (or Claude Code's .credentials.json on Linux)
  * - Reads `anthropic-ratelimit-unified-*` headers from responses
  * - Writes quota state to <workspace>/state/quota-state.json for the dashboard
  *
@@ -15,8 +15,9 @@
 import { createServer, type RequestOptions } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { execFileSync } from 'node:child_process';
-import { writeFileSync, mkdirSync, readFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { writeFileSync, mkdirSync, readFileSync, renameSync, chmodSync, existsSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { homedir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { statusPath } from '../../../src/workspace_default.js';
 
@@ -113,24 +114,59 @@ export function keychainServiceCandidates(configDir = process.env.CLAUDE_CONFIG_
 	return [...new Set(services)];
 }
 
-// Read the full cred object from one keychain service (not just accessToken).
-function readCredFromService(service: string): StoredClaudeOAuth | null {
+// Linux (and any non-darwin host): Claude Code keeps the same
+// `{claudeAiOauth: {...}}` document in `<config dir>/.credentials.json`
+// instead of the keychain. A "service" is then that file's absolute path —
+// scoped config dir first, the default home second, mirroring the keychain
+// candidate order above.
+export function credentialFileCandidates(
+	configDir = process.env.CLAUDE_CONFIG_DIR,
+	home = homedir(),
+): string[] {
+	const dir = (configDir ?? '').trim();
+	const files = [dir ? join(dir, '.credentials.json') : null, join(home, '.claude', '.credentials.json')]
+		.filter(Boolean) as string[];
+	return [...new Set(files)];
+}
+
+const USE_KEYCHAIN = process.platform === 'darwin';
+
+// The credential sources for THIS host, in preference order.
+export function credentialSourceCandidates(): string[] {
+	return USE_KEYCHAIN ? keychainServiceCandidates() : credentialFileCandidates();
+}
+
+function parseCredDocument(raw: string, service: string): StoredClaudeOAuth | null {
+	const parsed = JSON.parse(raw);
+	const oauth = parsed?.claudeAiOauth;
+	return oauth && typeof oauth.accessToken === 'string' ? { service, oauth: oauth as ClaudeOAuth } : null;
+}
+
+export function readCredFromFile(path: string): StoredClaudeOAuth | null {
 	try {
-		const raw = execFileSync('security', ['find-generic-password', '-s', service, '-w'], {
-			encoding: 'utf-8',
-			timeout: 5000,
-		}).trim();
-		const parsed = JSON.parse(raw);
-		const oauth = parsed?.claudeAiOauth;
-		return oauth && typeof oauth.accessToken === 'string' ? { service, oauth: oauth as ClaudeOAuth } : null;
+		return parseCredDocument(readFileSync(path, 'utf-8'), path);
 	} catch {
 		return null;
 	}
 }
 
-// All keychain candidates that currently hold a credential, scoped item first.
+// Read the full cred object from one credential source (not just accessToken).
+function readCredFromService(service: string): StoredClaudeOAuth | null {
+	if (!USE_KEYCHAIN) return readCredFromFile(service);
+	try {
+		const raw = execFileSync('security', ['find-generic-password', '-s', service, '-w'], {
+			encoding: 'utf-8',
+			timeout: 5000,
+		}).trim();
+		return parseCredDocument(raw, service);
+	} catch {
+		return null;
+	}
+}
+
+// All credential candidates that currently hold a credential, scoped source first.
 function readCredCandidates(): StoredClaudeOAuth[] {
-	return keychainServiceCandidates()
+	return credentialSourceCandidates()
 		.map(readCredFromService)
 		.filter((s): s is StoredClaudeOAuth => s !== null);
 }
@@ -170,7 +206,33 @@ function keychainAccount(service: string): string | null {
 	}
 }
 
+// File twin of the keychain write: merge into the existing document (other
+// keys are Claude Code's, keep them), write beside it, rename over, 0600,
+// then read back — the same rotation-lockout guard as the keychain path.
+export function writeCredToFile(path: string, oauth: ClaudeOAuth): boolean {
+	try {
+		let doc: Record<string, unknown> = {};
+		if (existsSync(path)) {
+			try {
+				const parsed = JSON.parse(readFileSync(path, 'utf-8'));
+				if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) doc = parsed;
+			} catch {}
+		}
+		doc.claudeAiOauth = oauth;
+		mkdirSync(dirname(path), { recursive: true });
+		const tmp = `${path}.${process.pid}.tmp`;
+		writeFileSync(tmp, JSON.stringify(doc, null, 2), { mode: 0o600 });
+		renameSync(tmp, path);
+		chmodSync(path, 0o600);
+		return readCredFromFile(path)?.oauth.accessToken === oauth.accessToken;
+	} catch (e) {
+		console.error(`${ts()} [Proxy] credential file write FAILED:`, (e as Error).message);
+		return false;
+	}
+}
+
 function writeCred(service: string, oauth: ClaudeOAuth): boolean {
+	if (!USE_KEYCHAIN) return writeCredToFile(service, oauth);
 	try {
 		const acct = keychainAccount(service);
 		if (!acct) { console.error(`${ts()} [Proxy] keychain write: account not found`); return false; }
@@ -736,10 +798,11 @@ if (isMain) {
 	// Verify token exists at startup
 	const initToken = getOAuthToken();
 	if (!initToken) {
-		console.error('No OAuth token found in macOS keychain. Is Claude Code logged in?');
+		const where = USE_KEYCHAIN ? 'macOS keychain' : `credential file (${credentialFileCandidates().join(' or ')})`;
+		console.error(`No OAuth token found in ${where}. Is Claude Code logged in?`);
 		process.exit(1);
 	}
-	console.log(`${ts()} [Proxy] OAuth token loaded from keychain (will re-read on each request)`);
+	console.log(`${ts()} [Proxy] OAuth token loaded from ${USE_KEYCHAIN ? 'keychain' : 'credential file'} (will re-read on each request)`);
 
 	createProxyServer().listen(PORT, '127.0.0.1', () => {
 		console.log(`${ts()} [Proxy] Credential proxy → http://localhost:${PORT}`);

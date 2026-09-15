@@ -1023,6 +1023,9 @@ def check_port(port: int, name: str, probe: bool = False,
 
 def check_launchd(label: str) -> dict:
     """Check if a launchd job is loaded and running."""
+    if sys.platform != "darwin":
+        # No launchd here; the job cannot be loaded, which is what the caller asks.
+        return {"name": label, "status": "not_loaded", "detail": "launchd not available on this platform"}
     try:
         result = subprocess.run(
             ["/bin/launchctl", "list"],

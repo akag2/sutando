@@ -41,9 +41,13 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { GeminiBatchSTTProvider, VoiceSession } from 'bodhi-realtime-agent';
 import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
-function assertMacOS() {
-	if (process.platform !== 'darwin' && process.env.SUTANDO_TEST_MODE !== '1') {
-		console.error('Sutando requires macOS');
+import { unsupportedPlatformMessage } from './platform.js';
+function assertSupportedPlatform() {
+	// darwin and linux are the hosts Sutando runs on; the decision itself lives
+	// in src/platform.ts so it is testable without exiting a process.
+	const refusal = unsupportedPlatformMessage();
+	if (refusal) {
+		console.error(refusal);
 		process.exit(1);
 	}
 }
@@ -835,7 +839,7 @@ function bootstrapMemoryDir(): void {
 }
 
 async function main() {
-	assertMacOS();
+	assertSupportedPlatform();
 	bootstrapMemoryDir();
 	// Refuse to start when another voice-agent already owns this workspace.
 	// Runs BEFORE any side effects (port binds, watchers, session construction)

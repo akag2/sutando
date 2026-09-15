@@ -93,7 +93,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`init.sh`** — Sutando init — idempotent first-run + every-start bootstrap.
 - **`inject-delivery.ts`** — Shared session-delivery control flow for live agent runtimes.
 - **`inject-framing.ts`** — Shared inject-framing for live agent sessions (webUI, phone, and the MatrixRTC conversation daemon).
-- **`inline-tools.ts`** — Inline tools — lightweight macOS actions that execute instantly without going through the core agent.
+- **`inline-tools.ts`** — Inline tools — lightweight desktop actions (macOS + Linux) that execute instantly without going through the core agent.
 - **`install-channel-bridge-launchd.sh`** — Install / uninstall / inspect a launchd-supervised channel bridge.
 - **`install-claude-hooks.sh`** — install-claude-hooks.sh — idempotent install of Sutando-owned project-level Claude Code hooks (PreCompact + Stop).
 - **`install-credential-proxy-launchd.sh`** — Install / uninstall the launchd-supervised credential-proxy job.
@@ -126,6 +126,8 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`pending_questions_md.py`** — Locating the `# Resolved` divider in pending-questions.md — one definition.
 - **`pending_questions_triage.py`** — Triage-queue policy for pending-questions.md: ranking, re-check verdict, dismissal.
 - **`personal-claude-compact-hint.sh`** — SessionStart(compact) hook — re-inject PERSONAL_CLAUDE.md after context compaction.
+- **`platform-desktop.ts`** — Desktop-automation backend for the inline tools: open a file, activate an app, press a key, type/paste text, read/write the clipboard, set volume.
+- **`platform.ts`** — Host-platform identity for the TypeScript services — the one place that answers "is this a platform Sutando can run on" and "which desktop backend do the inline tools use here".
 - **`presenter-mode.ts`** — Provider-neutral presenter-mode sentinel policy — TS twin of src/presenter_mode.py (#2501).
 - **`presenter_mode.py`** — Provider-neutral presenter-mode sentinel policy.
 - **`proactive_claim_fence.py`** — Proactive claim lifecycle on the outbox ClaimBackend seam.
@@ -176,6 +178,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`slack_owner.py`** — Slack owner-recipient resolution helpers.
 - **`slack_proactive_receipts.py`** — Durable idempotency receipts for Slack proactive-result delivery.
 - **`sparrowd.py`** — sparrowd launcher — the adapter edge that names concrete workers.
+- **`startup-platform.sh`** — Platform-conditional steps of src/startup.sh, extracted so each one is a function a test can drive with $OSTYPE pinned and fake tools on PATH.
 - **`startup-runtime.sh`** — Runtime/credential decisions shared by startup and behavior-level tests.
 - **`startup.sh`** — Sutando startup — starts available services + the selected core CLI.
 - **`stop.sh`** — Stop all Sutando services (shortcut for restart.sh --stop-only)

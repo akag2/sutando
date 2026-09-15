@@ -36,6 +36,12 @@ done
 # executing it raises a ~19 GB modal that no exit-code check or 2>/dev/null can
 # suppress. An actionable message beats that dialog.
 . "$REPO/scripts/python-binary.sh"
+# Platform identity + the four Darwin-only boot steps as functions (Linux
+# has equivalents for each; see src/startup-platform.sh).
+# shellcheck source=../scripts/platform.sh
+. "$REPO/scripts/platform.sh"
+# shellcheck source=startup-platform.sh
+. "$REPO/src/startup-platform.sh"
 PY="$(resolve_python "$REPO")"
 
 if [ -z "$PY" ]; then
@@ -49,7 +55,7 @@ if [ -z "$PY" ]; then
     echo "  system python3 — on a Mac without the developer tools that is the"
     echo "  Xcode-CLT stub, and running it raises the install dialog rather"
     echo "  than returning an error."
-    echo "  Fix: brew install python — or set \$SUTANDO_PY to an interpreter."
+    echo "  Fix: $(sutando_install_hint python3) — or set \$SUTANDO_PY to an interpreter."
   } >&2
   exit 1
 fi
@@ -532,10 +538,14 @@ fi
 # intentionally absent (bare-node runtime, dist-first services) — skip both.
 missing=0
 if [ "$BUNDLED_MODE" != "1" ]; then
-  if ! command -v node > /dev/null 2>&1; then echo "  ✗ node not found — brew install node"; missing=1; fi
+  if ! command -v node > /dev/null 2>&1; then echo "  ✗ node not found — $(sutando_install_hint node)"; missing=1; fi
   if ! command -v npx > /dev/null 2>&1; then echo "  ✗ npx not found — comes with node"; missing=1; fi
 fi
-if ! command -v python3 > /dev/null 2>&1; then echo "  ✗ python3 not found"; missing=1; fi
+if ! command -v python3 > /dev/null 2>&1; then echo "  ✗ python3 not found — $(sutando_install_hint python3)"; missing=1; fi
+# Every port guard below is `lsof -i :<port>`. macOS ships it; Debian does not
+# install it by default, and without it every service reads as "not running"
+# and gets started twice.
+if ! command -v lsof > /dev/null 2>&1; then echo "  ✗ lsof not found — $(sutando_install_hint lsof)"; missing=1; fi
 # sutando-config.sh REQUIRES python and exits 1 without it. Under `set -e` a
 # bare command substitution here aborted the whole startup — after we had
 # just printed that Python-backed services would be skipped (CR #2599,
@@ -545,80 +555,20 @@ if ! command -v "$core_runtime" > /dev/null 2>&1; then
   echo "  ✗ $core_runtime CLI not found — required by core.runtime"
   missing=1
 fi
-if ! command -v fswatch > /dev/null 2>&1; then
-  if command -v brew > /dev/null 2>&1; then
-    echo "  ⚠ fswatch not found — installing via Homebrew..."
-    brew install fswatch
-    if command -v fswatch > /dev/null 2>&1; then
-      echo "  ✓ fswatch installed"
-    else
-      echo "  ✗ fswatch installation failed"; missing=1
-    fi
-  else
-    echo "  ✗ fswatch not found — brew install fswatch"; missing=1
-  fi
-fi
+startup_fswatch_check || missing=1
 
 if [ $missing -eq 1 ]; then echo ""; echo "Fix the above and try again."; exit 1; fi
 
-# Check macOS permissions (can't grant programmatically, just warn)
-# Prevent display sleep (important for always-on Mac Mini — Zoom/summon fails on lock screen)
-if ! pgrep -q caffeinate; then
-  caffeinate -d -i -s &
-  echo "  ✓ caffeinate started (prevents display sleep)"
-else
-  echo "  ✓ caffeinate already running"
-fi
+# Platform checks (can't grant permissions programmatically, just warn).
+# Each step is a function in src/startup-platform.sh with a Darwin branch
+# (unchanged behaviour) and a Linux branch that probes the equivalent.
+startup_inhibit_sleep
 
 echo "Checking permissions..."
-# macOS 15+ silently writes a tiny PNG when Screen Recording is denied (exit 0).
-# Discriminator: real captures are hundreds-of-KB to MB; denied artifacts <2KB.
-# An all-black 5120x2880 PNG compresses to ~43KB (PNG handles flat colors well),
-# so 5KB is the safe floor — well above any denied output, well below any real
-# capture even on a locked / dark / blank desktop.
+# Sets PERM_OK — consumed by the screen-capture server launch + verify below.
 PERM_OK=1
-screencapture -x /tmp/sutando-permcheck.png 2>/dev/null || PERM_OK=0
-if [ "$PERM_OK" -eq 1 ]; then
-  # wc -c is portable across BSD (macOS) and GNU coreutils (Homebrew may override).
-  permcheck_size=$(wc -c < /tmp/sutando-permcheck.png 2>/dev/null | tr -d ' ' || echo 0)
-  if [ "${permcheck_size:-0}" -lt 5000 ]; then PERM_OK=0; fi
-fi
-rm -f /tmp/sutando-permcheck.png
-if [ "$PERM_OK" -eq 0 ]; then
-  echo "  ⚠ Screen Recording not granted (or stale)"
-  echo "    → System Settings → Privacy & Security → Screen & System Audio Recording"
-  echo "    → Add the app running this terminal (Terminal.app / iTerm2 / Warp / VS Code / Cursor / etc.)"
-  echo "    → Fully Quit the terminal app, then re-open. macOS caches the perm until process restart."
-  if lsof -i :7845 > /dev/null 2>&1; then
-    echo "    → A screen-capture server is already running on :7845 with the old (denied) perm."
-    echo "      Kill it before re-running: lsof -ti:7845 | xargs kill"
-  fi
-else
-  echo "  ✓ Screen Recording"
-fi
-
-# Check Accessibility (needed for context drop shortcut)
-# $REPO is overridable, so fall back to alongside this script: an unguarded
-# source under `set -e` aborts the whole run.
-__probe="$REPO/src/accessibility_probe.sh"
-[ -f "$__probe" ] || __probe="$(cd "$(dirname "$0")" && pwd)/accessibility_probe.sh"
-# 125 = could not check. NOT 0: a missing probe would otherwise print
-# "✓ Accessibility", asserting a grant on a run where nothing was probed.
-acc_rc=125
-if [ -f "$__probe" ]; then
-  # `|| rc=$?` keeps this exempt from `set -e`; a bare non-zero call aborts.
-  source "$__probe"
-  acc_rc=0; accessibility_probe || acc_rc=$?
-fi
-case $acc_rc in
-  0)   echo "  ✓ Accessibility" ;;
-  125) echo "  ⚠ Accessibility UNKNOWN — probe unavailable, nothing was checked" ;;
-  124) echo "  ⚠ Accessibility UNKNOWN — probe timed out after ${ACCESSIBILITY_PROBE_TIMEOUT_S}s"
-       echo "    This session cannot answer the prompt (headless/SSH); the grant may be fine." ;;
-  *)   echo "  ⚠ Accessibility not granted"
-       echo "    → System Settings → Privacy & Security → Accessibility"
-       echo "    → Add Terminal.app or Shortcuts.app" ;;
-esac
+startup_screen_capture_check
+startup_accessibility_check "$REPO"
 echo ""
 
 # Install Claude Code skills (runs every startup, idempotent)
@@ -732,7 +682,7 @@ fi
 # or if the install fails for any reason.
 _PROXY_LABEL="com.sutando.credential-proxy"
 _PROXY_INSTALLER="$REPO/src/install-credential-proxy-launchd.sh"
-if [ -f "$_PROXY_INSTALLER" ] && [ -f "$REPO/src/launchd/$_PROXY_LABEL.plist" ]; then
+if sutando_has_launchd && [ -f "$_PROXY_INSTALLER" ] && [ -f "$REPO/src/launchd/$_PROXY_LABEL.plist" ]; then
   # An already-loaded job may carry a plist generated before the current pins existed;
   # the installer owns that comparison because it owns what the plist renders.
   if bash "$_PROXY_INSTALLER" is-current > /dev/null 2>&1; then
@@ -850,7 +800,7 @@ else
   # the guarded voice-lock.py takeover (startup-runtime.sh, amendment T4) —
   # identity mismatch means nothing is signaled.
   reap_wedged_voice_agent 9900
-  if launchctl print "gui/$(id -u)/com.sutando.voice-agent" > /dev/null 2>&1; then
+  if sutando_has_launchd && launchctl print "gui/$(id -u)/com.sutando.voice-agent" > /dev/null 2>&1; then
     if ! lsof -i :9900 > /dev/null 2>&1; then
       launchctl kickstart "gui/$(id -u)/com.sutando.voice-agent" > /dev/null 2>&1 || true
       # Poll up to 5s — kickstart is known to silently no-op (restart-voice-agent.sh §4)
@@ -891,7 +841,7 @@ WEB_CLIENT_PORT="${CLIENT_PORT:-8080}"
 reap_wedged_listener "$WEB_CLIENT_PORT" web-client
 # Same launchd-deconflict guard as voice-agent above for the launchd-owned
 # default port. A custom CLIENT_PORT remains a directly managed opt-in.
-if [ "$WEB_CLIENT_PORT" = "8080" ] && launchctl print "gui/$(id -u)/com.sutando.web-client" > /dev/null 2>&1; then
+if [ "$WEB_CLIENT_PORT" = "8080" ] && sutando_has_launchd && launchctl print "gui/$(id -u)/com.sutando.web-client" > /dev/null 2>&1; then
   if ! lsof -i :"$WEB_CLIENT_PORT" > /dev/null 2>&1; then
     launchctl kickstart "gui/$(id -u)/com.sutando.web-client" > /dev/null 2>&1 || true
     _wc_waited=0
@@ -1032,6 +982,8 @@ channel_bridge_supervised() {
   local template="$REPO/src/launchd/com.sutando.channel-bridge.plist"
   local pattern="src/$channel-bridge\\.py$"
 
+  # launchd is Darwin's supervisor; on Linux the bridges run directly (below).
+  sutando_has_launchd || return 1
   [ -f "$installer" ] && [ -f "$template" ] || return 1
   if launchctl print "$service" >/dev/null 2>&1; then
     if pgrep -f "$pattern" >/dev/null 2>&1; then

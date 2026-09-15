@@ -1,5 +1,5 @@
 /**
- * Inline tools — lightweight macOS actions that execute instantly without going through the core agent.
+ * Inline tools — lightweight desktop actions (macOS + Linux) that execute instantly without going through the core agent.
  * Shared between voice-agent.ts and phone conversation-server.ts.
  *
  * Add new tools here and they auto-appear in both voice and phone agents.
@@ -40,6 +40,10 @@ const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 // Re-export recording/screen/browser tools from browser-tools
 export { describeScreenTool, clickTool, scrollAndDescribeTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, switchTabTool, closeTabTool, scrollTool, openUrlTool } from './browser-tools.js';
 import { keystrokeOutcome } from './osascript-setup-hint.js';
+import {
+	activateAppByTitlePlan, activateAppPlan, clipboardReadPlan, clipboardWritePlan, currentPlatform,
+	openPathPlan, pressKeyPlan, runOpen, runPlan, typeTextPlan, volumePlan, type Modifier,
+} from './platform-desktop.js';
 import { describeScreenTool, clickTool, pointAtTool, scrollAndDescribeTool, screenRecordTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, switchTabTool, closeTabTool, scrollTool, openUrlTool } from './browser-tools.js';
 
 // Vision: one-shot frame + start/stop live screen-to-Gemini video.
@@ -110,18 +114,25 @@ export const openFileTool: ToolDefinition = {
 			// Contextual inference (rule 2 from issue) is the model's job — Gemini
 			// reads the conversation and decides whether to pass `app`. The tool
 			// only honors what it's told.
-			const openArgs = app ? ['-a', app, filePath] : [filePath];
-			execFileSync('open', openArgs, { timeout: 5_000 });
+			// Platform backend: `open [-a app]` on macOS, `xdg-open` (or the named
+			// command) on Linux — see src/platform-desktop.ts.
+			const platform = currentPlatform();
+			runOpen(openPathPlan(filePath, app, platform));
 			if (fullscreen) {
 				// Brief delay so the just-opened app becomes frontmost before
 				// the keystroke lands. Cmd+Ctrl+F is the macOS native-fullscreen
 				// toggle — every app that supports fullscreen handles it (QT
 				// enters Present mode, Preview/Chrome/Pages all enter fullscreen).
-				// No app-specific logic — open_file is generic.
+				// Linux desktops and browsers use F11. No app-specific logic.
 				await new Promise(r => setTimeout(r, 1500));
 				try {
-					execFileSync('/usr/bin/osascript', ['-e', 'tell application "System Events" to keystroke "f" using {command down, control down}'], { timeout: 3_000 });
-					console.log(`${ts()} [OpenFile] fullscreen keystroke sent (Cmd+Ctrl+F)`);
+					if (platform === 'darwin') {
+						execFileSync('/usr/bin/osascript', ['-e', 'tell application "System Events" to keystroke "f" using {command down, control down}'], { timeout: 3_000 });
+						console.log(`${ts()} [OpenFile] fullscreen keystroke sent (Cmd+Ctrl+F)`);
+					} else {
+						runPlan(pressKeyPlan('F11', [], platform));
+						console.log(`${ts()} [OpenFile] fullscreen keystroke sent (F11)`);
+					}
 				} catch (err) {
 					console.log(`${ts()} [OpenFile] fullscreen keystroke failed (non-fatal): ${err}`);
 				}
@@ -183,48 +194,26 @@ export const pressKeyTool: ToolDefinition = {
 	}),
 	execution: 'inline',
 	async execute(args) {
-		const { key, modifiers = [], app } = args as { key: string; modifiers?: string[]; app?: string };
-		// Activate target app if specified. Escape `app` before embedding
-		// in the AppleScript string literal — without this, a value like
-		// `"; do shell script "rm -rf ~"; tell application "Finder` would
-		// break out of `tell application "..."` and run arbitrary
-		// AppleScript (and AppleScript can `do shell script`, so this is
-		// arbitrary code execution from a tool-call argument). Same
-		// escape pattern as `safeKey` below and `safeApp` in switchAppTool.
+		const { key, modifiers = [], app } = args as { key: string; modifiers?: Modifier[]; app?: string };
+		const platform = currentPlatform();
+		// Activate target app if specified. The darwin plan escapes `app` before
+		// embedding it in the AppleScript string literal — without this, a value
+		// like `"; do shell script "rm -rf ~"; tell application "Finder` would
+		// break out of `tell application "..."` and run arbitrary AppleScript
+		// (arbitrary code execution from a tool-call argument). xdotool takes the
+		// name as a literal argv entry, so no escaping layer exists on linux.
 		if (app) {
-			const safeApp = app.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-			try { execFileSync('osascript', ['-e', `tell application "${safeApp}" to activate`], { timeout: 3_000 }); await new Promise(r => setTimeout(r, 300)); } catch {}
+			try {
+				runPlan(activateAppPlan(app, PROCESS_NAMES[app] ?? app, platform));
+				await new Promise(r => setTimeout(r, 300));
+			} catch {}
 		}
-		const keyMap: Record<string, number> = {
-			'enter': 36, 'return': 36, 'escape': 53, 'esc': 53, 'tab': 48,
-			'delete': 51, 'backspace': 51, 'space': 49,
-			'up': 126, 'down': 125, 'left': 123, 'right': 124,
-			// Common voice-spoken aliases — without these, the fallthrough to
-			// `keystroke "<key>"` types the literal string into the focused
-			// field instead of pressing the arrow. Observed 2026-05-13 voice
-			// call: Gemini called press_key(key="downarrow"); nothing scrolled.
-			'uparrow': 126, 'downarrow': 125, 'leftarrow': 123, 'rightarrow': 124,
-			'arrowup': 126, 'arrowdown': 125, 'arrowleft': 123, 'arrowright': 124,
-			'a': 0, 'c': 8, 'v': 9, 'x': 7, 'z': 6, 'f': 3, 's': 1, 'w': 13, 'q': 12,
-		};
-		const keyCode = keyMap[key.toLowerCase()];
-		if (keyCode === undefined) {
-			// Use keystroke for unknown keys
-			const modStr = modifiers.length ? ` using {${modifiers.map(m => m + ' down').join(', ')}}` : '';
-			// Escape for AppleScript string literal — no shell layer needed with execFileSync.
-			const safeKey = key.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-			try {
-				execFileSync('osascript', ['-e', `tell application "System Events" to keystroke "${safeKey}"${modStr}`], { timeout: 3_000 });
-			} catch (err) {
-				return keystrokeOutcome('press_key', err instanceof Error ? err.message : String(err));
-			}
-		} else {
-			const modStr = modifiers.length ? ` using {${modifiers.map(m => m + ' down').join(', ')}}` : '';
-			try {
-				execFileSync('osascript', ['-e', `tell application "System Events" to key code ${keyCode}${modStr}`], { timeout: 3_000 });
-			} catch (err) {
-				return keystrokeOutcome('press_key', err instanceof Error ? err.message : String(err));
-			}
+		// Key-code table (darwin) / keysym table (linux) live in the backend:
+		// voice-spoken aliases such as "downarrow" resolve there on both.
+		try {
+			runPlan(pressKeyPlan(key, modifiers, platform));
+		} catch (err) {
+			return keystrokeOutcome('press_key', err instanceof Error ? err.message : String(err));
 		}
 		console.log(`${ts()} [PressKey] ${app ? `(${app}) ` : ''}${modifiers.length ? modifiers.join('+') + '+' : ''}${key}`);
 		return { status: 'pressed', key, modifiers, app };
@@ -264,14 +253,17 @@ export const switchAppTool: ToolDefinition = {
 	async execute(args) {
 		let { app } = args as { app: string };
 		app = APP_ALIASES[app.toLowerCase()] ?? app;
-		// Escape for AppleScript string literals — no shell layer needed with execFileSync.
-		const safeApp = app.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-		const processName = (PROCESS_NAMES[app] ?? app).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+		// AppleScript escaping happens inside the darwin plan; the linux plan
+		// hands xdotool the name as a literal argv entry.
+		const platform = currentPlatform();
 		try {
-			execFileSync('osascript', [
-				'-e', `tell application "${safeApp}" to activate`,
-				'-e', `tell application "System Events" to set frontmost of process "${processName}" to true`,
-			], { timeout: 10_000 });
+			try {
+				runPlan(activateAppPlan(app, PROCESS_NAMES[app] ?? app, platform));
+			} catch (err) {
+				// xdotool matched no WM_CLASS — retry by window title before failing.
+				if (platform !== 'linux') throw err;
+				runPlan(activateAppByTitlePlan(app));
+			}
 			console.log(`${ts()} [SwitchApp] activated: ${app}`);
 			return { status: 'switched', app };
 		} catch (err) {
@@ -345,7 +337,10 @@ export const typeTextTool: ToolDefinition = {
 		// which preserves bytes. Per Chi 2026-05-13 frustration with emoji corruption.
 		// Gemini sends literal \n (two chars backslash+n), not actual newlines.
 		const hasNonAscii = /[^\x00-\x7f]/.test(text);
-		const needsPaste = text.includes('\n') || text.includes('\r') || /\\n/.test(text) || text.length > 80 || hasNonAscii;
+		const platform = currentPlatform();
+		// xdotool types Unicode directly, so on linux only multi-line / long text
+		// takes the paste route (typing 500 chars at 12ms each is slow).
+		const needsPaste = text.includes('\n') || text.includes('\r') || /\\n/.test(text) || text.length > 80 || (platform === 'darwin' && hasNonAscii);
 		if (needsPaste) {
 			try {
 				// Force UTF-8 locale for the child shell — voice-agent runs under
@@ -356,26 +351,27 @@ export const typeTextTool: ToolDefinition = {
 				// to bypass shell redirection entirely. Per Chi 2026-05-13 (PR #660
 				// follow-up: the first fix routed emoji to paste-branch but
 				// pbcopy still mangled bytes in launchd context).
-				const utf8Env = { ...process.env, LANG: 'en_US.UTF-8', LC_ALL: 'en_US.UTF-8' };
+				const utf8Env = { LANG: 'en_US.UTF-8', LC_ALL: 'en_US.UTF-8' };
 				let savedClipboard = '';
-				try { savedClipboard = execFileSync('pbpaste', [], { encoding: 'utf-8', timeout: 2_000, env: utf8Env }); } catch {}
+				try { savedClipboard = runPlan(clipboardReadPlan(platform), utf8Env); } catch {}
 				// Convert literal \n to actual newlines
 				const pasteText = text.replace(/\\n/g, '\n').replace(/\\t/g, '\t');
-				execFileSync('pbcopy', [], { input: pasteText, encoding: 'utf-8', timeout: 2_000, env: utf8Env });
+				runPlan(clipboardWritePlan(pasteText, platform), utf8Env);
 				// replace_all: emit Cmd+A first so the subsequent Cmd+V replaces the
 				// entire field content (closes the selection-state ambiguity that
 				// 'replace' default had — relied on caller to have selected).
 				// append: collapse selection to its end via Right-arrow before Cmd+V.
 				// at_caret (default): paste at current caret / replace current selection per macOS Cmd+V semantics.
+				// The "command" modifier maps to Ctrl on linux inside the backend.
 				if (mode === 'replace_all') {
-					execFileSync('osascript', ['-e', 'tell application "System Events" to keystroke "a" using command down'], { timeout: 3_000, env: utf8Env });
+					runPlan(pressKeyPlan('a', ['command'], platform), utf8Env);
 				} else if (mode === 'append') {
-					execFileSync('osascript', ['-e', 'tell application "System Events" to key code 124'], { timeout: 3_000, env: utf8Env });
+					runPlan(pressKeyPlan('right', [], platform), utf8Env);
 				}
-				execFileSync('osascript', ['-e', 'tell application "System Events" to keystroke "v" using command down'], { timeout: 5_000, env: utf8Env });
+				runPlan(pressKeyPlan('v', ['command'], platform), utf8Env);
 				execFileSync('sleep', ['0.3']);
 				if (savedClipboard) {
-					execFileSync('pbcopy', [], { input: savedClipboard, encoding: 'utf-8', timeout: 2_000, env: utf8Env });
+					runPlan(clipboardWritePlan(savedClipboard, platform), utf8Env);
 				}
 				console.log(`${ts()} [TypeText] pasted (multi-line, mode=${mode}): ${text.slice(0, 40)}...`);
 				return { status: 'typed', text };
@@ -383,19 +379,18 @@ export const typeTextTool: ToolDefinition = {
 				return keystrokeOutcome('Paste', err instanceof Error ? err.message : String(err));
 			}
 		}
-		// Single-line short text: use keystroke
-		// Escape for AppleScript string literal only — no shell layer needed with execFileSync.
-		const safeText = text.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+		// Single-line short text: use keystroke (AppleScript escaping is inside the
+		// darwin plan; xdotool receives the literal string).
 		try {
 			// replace_all: Cmd+A first so the keystroke replaces the entire field.
 			// append: collapse selection to its end via Right-arrow before typing.
 			// at_caret (default): keystroke at caret / replaces current selection per System Events behavior.
 			if (mode === 'replace_all') {
-				execFileSync('osascript', ['-e', 'tell application "System Events" to keystroke "a" using command down'], { timeout: 3_000 });
+				runPlan(pressKeyPlan('a', ['command'], platform));
 			} else if (mode === 'append') {
-				execFileSync('osascript', ['-e', 'tell application "System Events" to key code 124'], { timeout: 3_000 });
+				runPlan(pressKeyPlan('right', [], platform));
 			}
-			execFileSync('osascript', ['-e', `tell application "System Events" to keystroke "${safeText}"`], { timeout: 5_000 });
+			runPlan(typeTextPlan(text, platform));
 			console.log(`${ts()} [TypeText] typed (mode=${mode}): ${text.slice(0, 40)}`);
 			return { status: 'typed', text };
 		} catch (err) {
@@ -415,21 +410,22 @@ export const volumeTool: ToolDefinition = {
 	execution: 'inline',
 	async execute(args) {
 		const { level, mute } = args as { level?: number; mute?: boolean };
+		const platform = currentPlatform();
 		try {
 			if (mute === true) {
-				execFileSync('osascript', ['-e', 'set volume with output muted'], { timeout: 5_000 });
+				runPlan(volumePlan({ mute: true }, platform));
 				console.log(`${ts()} [Volume] muted`);
 				return { status: 'muted' };
 			}
 			if (mute === false) {
-				execFileSync('osascript', ['-e', 'set volume without output muted'], { timeout: 5_000 });
+				runPlan(volumePlan({ mute: false }, platform));
 				console.log(`${ts()} [Volume] unmuted`);
 				return { status: 'unmuted' };
 			}
 			if (level !== undefined) {
 				// Gemini sometimes passes 0-1 instead of 0-100 — normalize
 				const normalizedLevel = level <= 1 && level > 0 ? Math.round(level * 100) : Math.round(level);
-				execFileSync('osascript', ['-e', `set volume output volume ${normalizedLevel}`], { timeout: 5_000 });
+				runPlan(volumePlan({ level: normalizedLevel }, platform));
 				console.log(`${ts()} [Volume] set to ${normalizedLevel}%`);
 				return { status: 'set', level: normalizedLevel };
 			}
@@ -604,12 +600,12 @@ export const clipboardTool: ToolDefinition = {
 		const { action, text } = args as { action: 'read' | 'write'; text?: string };
 		try {
 			if (action === 'read') {
-				const content = execFileSync('pbpaste', [], { encoding: 'utf-8', timeout: 5_000 });
+				const content = runPlan(clipboardReadPlan(currentPlatform()));
 				console.log(`${ts()} [Clipboard] read: ${content.slice(0, 40)}`);
 				return { status: 'read', content };
 			} else {
 				if (!text) return { error: 'No text provided to write' };
-				execFileSync('pbcopy', [], { input: text, timeout: 5_000 });
+				runPlan(clipboardWritePlan(text, currentPlatform()));
 				console.log(`${ts()} [Clipboard] wrote: ${text.slice(0, 40)}`);
 				return { status: 'written', text };
 			}

@@ -12,6 +12,12 @@ set -e
 
 REPO="${SUTANDO_REPO:-$(cd "$(dirname "$0")/.." && pwd)}"
 MODE="${1:-full}"
+# Platform identity for the preflight hints. $REPO is overridable (tests point
+# it at a scratch dir), so fall back to the checkout this script lives in.
+_PLATFORM_SH="$REPO/scripts/platform.sh"
+[ -f "$_PLATFORM_SH" ] || _PLATFORM_SH="$(cd "$(dirname "$0")/.." && pwd)/scripts/platform.sh"
+# shellcheck source=../scripts/platform.sh
+. "$_PLATFORM_SH"
 
 # Validate mode BEFORE workspace resolution so a usage error doesn't get
 # masked by a workspace-resolution failure (which would surface a less
@@ -364,46 +370,61 @@ preflight() {
     fi
   done
 
-  # macOS permissions — non-fatal, just a hint.
-  # macOS 15+ silently writes a tiny PNG when perm is denied (exit 0).
-  # Denied artifacts are <2KB; real captures are hundreds-of-KB to MB.
-  # Black 5120x2880 PNG compresses to ~43KB, so 5KB is the safe floor.
+  # Desktop permissions — non-fatal, just a hint. Platform identity from
+  # scripts/platform.sh (sourced at the top); a Linux host has no TCC, so the
+  # equivalent question is "is there a display and a screenshot tool".
   local perms_warn=0
   local permcheck_ok=1
-  screencapture -x /tmp/sutando-permcheck.png 2>/dev/null || permcheck_ok=0
-  if [ "$permcheck_ok" -eq 1 ]; then
-    # wc -c is portable across BSD (macOS) and GNU coreutils (Homebrew may override).
-    local permcheck_size
-    permcheck_size=$(wc -c < /tmp/sutando-permcheck.png 2>/dev/null | tr -d ' ' || echo 0)
-    if [ "${permcheck_size:-0}" -lt 5000 ]; then permcheck_ok=0; fi
-  fi
-  rm -f /tmp/sutando-permcheck.png
-  if [ "$permcheck_ok" -eq 0 ]; then
-    log "  ⚠ Screen Recording not granted (System Settings → Privacy → Screen Recording → grant the app running this terminal, then quit + relaunch it)"
+  if sutando_is_darwin; then
+    # macOS 15+ silently writes a tiny PNG when perm is denied (exit 0).
+    # Denied artifacts are <2KB; real captures are hundreds-of-KB to MB.
+    # Black 5120x2880 PNG compresses to ~43KB, so 5KB is the safe floor.
+    screencapture -x /tmp/sutando-permcheck.png 2>/dev/null || permcheck_ok=0
+    if [ "$permcheck_ok" -eq 1 ]; then
+      # wc -c is portable across BSD (macOS) and GNU coreutils (Homebrew may override).
+      local permcheck_size
+      permcheck_size=$(wc -c < /tmp/sutando-permcheck.png 2>/dev/null | tr -d ' ' || echo 0)
+      if [ "${permcheck_size:-0}" -lt 5000 ]; then permcheck_ok=0; fi
+    fi
+    rm -f /tmp/sutando-permcheck.png
+    if [ "$permcheck_ok" -eq 0 ]; then
+      log "  ⚠ Screen Recording not granted (System Settings → Privacy → Screen Recording → grant the app running this terminal, then quit + relaunch it)"
+      perms_warn=1
+    fi
+  elif ! sutando_has_display; then
+    log "  ⚠ No \$DISPLAY — screen capture and input control are off (headless; see docs/linux.md)"
+    perms_warn=1
+  elif ! sutando_linux_screenshot_tool >/dev/null; then
+    log "  ⚠ No screenshot tool — $(sutando_install_hint scrot)"
     perms_warn=1
   fi
-  # $REPO is overridable (tests point it at a scratch dir), so fall back to
-  # alongside this script — an unguarded source under `set -e` aborts the run.
-  local __probe="$REPO/src/accessibility_probe.sh"
-  [ -f "$__probe" ] || __probe="$(cd "$(dirname "$0")" && pwd)/accessibility_probe.sh"
-  # 125 = could not check. acc_rc=0 here would BE the granted verdict, which
-  # is exactly the invention the old comment claimed to avoid.
-  local acc_rc=125
-  if [ -f "$__probe" ]; then
-    # `|| rc=$?` keeps this exempt from `set -e`: a bare non-zero call would
-    # abort init.sh before it ever emits its [Preflight] summary.
-    source "$__probe"
-    acc_rc=0; accessibility_probe || acc_rc=$?
+  if sutando_is_darwin; then
+    # $REPO is overridable (tests point it at a scratch dir), so fall back to
+    # alongside this script — an unguarded source under `set -e` aborts the run.
+    local __probe="$REPO/src/accessibility_probe.sh"
+    [ -f "$__probe" ] || __probe="$(cd "$(dirname "$0")" && pwd)/accessibility_probe.sh"
+    # 125 = could not check. acc_rc=0 here would BE the granted verdict, which
+    # is exactly the invention the old comment claimed to avoid.
+    local acc_rc=125
+    if [ -f "$__probe" ]; then
+      # `|| rc=$?` keeps this exempt from `set -e`: a bare non-zero call would
+      # abort init.sh before it ever emits its [Preflight] summary.
+      source "$__probe"
+      acc_rc=0; accessibility_probe || acc_rc=$?
+    fi
+    case $acc_rc in
+      0)   : ;;
+      125) log "  ⚠ Accessibility UNKNOWN — probe unavailable, nothing was checked"
+           perms_warn=1 ;;
+      124) log "  ⚠ Accessibility UNKNOWN — probe timed out (headless session cannot answer)"
+           perms_warn=1 ;;
+      *)   log "  ⚠ Accessibility not granted (System Settings → Privacy → Accessibility)"
+           perms_warn=1 ;;
+    esac
+  elif sutando_has_display && ! command -v xdotool >/dev/null 2>&1; then
+    log "  ⚠ xdotool missing — keystrokes/clicks are off ($(sutando_install_hint xdotool))"
+    perms_warn=1
   fi
-  case $acc_rc in
-    0)   : ;;
-    125) log "  ⚠ Accessibility UNKNOWN — probe unavailable, nothing was checked"
-         perms_warn=1 ;;
-    124) log "  ⚠ Accessibility UNKNOWN — probe timed out (headless session cannot answer)"
-         perms_warn=1 ;;
-    *)   log "  ⚠ Accessibility not granted (System Settings → Privacy → Accessibility)"
-         perms_warn=1 ;;
-  esac
 
   # One-line summary regardless of mode (this is the value-add)
   local cli_str="all-ok"

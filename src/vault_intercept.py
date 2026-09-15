@@ -37,6 +37,7 @@ must not write to the owner's Keychain.
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -151,7 +152,39 @@ class InterceptResult(NamedTuple):
     failed: list[str]  # keys that could NOT be stored (secret still redacted)
 
 
+# Linux backend: libsecret's `secret-tool` (a running Secret Service such as
+# gnome-keyring). Same account/service attributes so items are findable.
+_LINUX_SECRET_ATTRS = ["account", _ACCOUNT]
+_LINUX_NO_BACKEND = ("vault: no secret store on this host — install libsecret-tools "
+                     "(`secret-tool`) and run a Secret Service (gnome-keyring)")
+
+
+def _use_keychain() -> bool:
+    return sys.platform == "darwin"
+
+
+def _linux_secret_tool() -> str:
+    tool = shutil.which("secret-tool")
+    if not tool:
+        raise RuntimeError(_LINUX_NO_BACKEND)
+    return tool
+
+
 def _store_in_keychain(key: str, value: str) -> None:
+    if not _use_keychain():
+        # secret-tool reads the value from stdin — it never appears in argv.
+        result = subprocess.run(
+            [_linux_secret_tool(), "store", "--label", f"sutando:{key}",
+             *_LINUX_SECRET_ATTRS, "service", key],
+            input=value.encode(), capture_output=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"vault: failed to store '{key}': "
+                f"{result.stderr.decode(errors='replace').strip() or _LINUX_NO_BACKEND}"
+            )
+        _register_key(key)
+        return
     # Note: value is passed as an argv element — briefly visible in `ps` to
     # the same user. Acceptable on a single-user Mac; not a multi-user safe API.
     result = subprocess.run(
@@ -192,7 +225,18 @@ def list_vault_keys() -> list[str]:
 
 
 def get_vault_key(key: str) -> str:
-    """Retrieve a secret value from Keychain. Raises KeyError if not found."""
+    """Retrieve a secret value from the host secret store. Raises KeyError if not found."""
+    if not _use_keychain():
+        try:
+            tool = _linux_secret_tool()
+        except RuntimeError as exc:
+            raise KeyError(f"vault: key '{key}' unavailable — {exc}") from exc
+        result = subprocess.run(
+            [tool, "lookup", *_LINUX_SECRET_ATTRS, "service", key], capture_output=True,
+        )
+        if result.returncode != 0 or not result.stdout:
+            raise KeyError(f"vault: key '{key}' not found in the secret store")
+        return result.stdout.decode().strip()
     result = subprocess.run(
         ["security", "find-generic-password", "-a", _ACCOUNT, "-s", key, "-w"],
         capture_output=True,
@@ -243,6 +287,19 @@ _ERRSEC_ITEM_NOT_FOUND = 44  # errSecItemNotFound
 
 
 def _delete_from_keychain(key: str) -> None:
+    if not _use_keychain():
+        # secret-tool clear exits 0 whether or not an item matched (idempotent).
+        result = subprocess.run(
+            [_linux_secret_tool(), "clear", *_LINUX_SECRET_ATTRS, "service", key],
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"vault: failed to delete '{key}' from the secret store "
+                f"(rc={result.returncode}); manifest entry kept so the secret is not stranded"
+            )
+        _deregister_key(key)
+        return
     # rc 44 is errSecItemNotFound — already gone, so the manifest drop proceeds.
     # Any other non-zero may leave the item LIVE; dropping it then strands a secret.
     result = subprocess.run(

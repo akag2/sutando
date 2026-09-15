@@ -21,7 +21,7 @@ python3 src/health-check.py   # service-level health once running
 | `npx` | ships with Node | `src/startup.sh:479` |
 | `python3` | `brew install python3` | `src/startup.sh:481` |
 | Authenticated `claude` **or** `codex` CLI | whichever `core.runtime` names | `src/startup.sh` selected-core preflight |
-| `fswatch` | `brew install fswatch` (startup auto-installs when Homebrew is present) | `src/startup.sh:494,497` |
+| `fswatch` | `brew install fswatch` (auto-installed via Homebrew on macOS) / `apt-get install fswatch` | `src/startup.sh:494,497` |
 
 That is the whole hard gate. Nothing else stops a boot.
 
@@ -75,6 +75,28 @@ needs none of them.
 
 Nothing to install: `osascript`, `open`, `pgrep`, `lsof`, `ps`, `sips`,
 `launchctl`, `security`, `screencapture`, `pbcopy`, `pbpaste`, `say`, `which`.
+
+## Linux equivalents
+
+On Debian/Ubuntu the same roles are filled by apt packages — `bash
+scripts/linux/install-debian-deps.sh` installs them all; `scripts/platform.sh`
+owns the tool→package mapping the boot hints print:
+
+| macOS | Linux | Used by |
+|---|---|---|
+| `screencapture` | `scrot` or ImageMagick `import` | `src/screen-capture-server.py` |
+| `sips` | ImageMagick `mogrify` | frame downscale |
+| `screencapture -v` | `ffmpeg -f x11grab` | `/capture-video` |
+| `osascript` keystrokes | `xdotool` | `press_key`, `type_text`, `switch_app` |
+| `pbcopy` / `pbpaste` | `xclip` (or `xsel`) | `clipboard`, paste path of `type_text` |
+| `open` | `xdg-open` | `open_file`, `start.sh` |
+| `osascript` volume | `pactl` (or `amixer`) | `volume` |
+| `caffeinate` | `xset s off -dpms` | `startup.sh` |
+| `security` (Keychain) | `secret-tool` (libsecret) | vault |
+| `launchctl` | — (services run unsupervised; see `scripts/linux/install-headless-desktop.sh` for systemd units) | `startup.sh` |
+| `lsof` | `lsof` (**not installed by default** — apt) | every port guard |
+
+Full Linux status, including what stays macOS-only: [`docs/linux.md`](linux.md).
 
 ## A note on the Xcode Command Line Tools
 

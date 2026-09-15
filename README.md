@@ -9,7 +9,7 @@ Voice, vision, screen, meetings, calls when I'm engaged. Learns my patterns, shi
 
 It belongs entirely to you.
 
-> 🛠 **Open source:** this repo — clone, build, run locally on your own Mac.
+> 🛠 **Open source:** this repo — clone, build, run locally on your own Mac, or on a Linux (Debian/Ubuntu) desktop or VM — see [docs/linux.md](docs/linux.md).
 > 🍎 **Native app preview:** [sutando.ai](https://sutando.ai) — packaged Mac app, request access.
 
 > **No pay-per-token core API key required.** Sutando runs through the Claude Code or Codex CLI session you select, with optional service credentials only for the capabilities you enable.
@@ -110,6 +110,11 @@ once for recovery; the runtime launcher still checks again before replacing the
 core session.
 
 **Recommended, but not checked at boot** — macOS 15+ and Node.js 22+.
+
+**Linux (Debian/Ubuntu)** — supported for the core, dashboard, web UI, bridges, and
+screen/keyboard/clipboard tools on an X11 desktop (real or Xvfb). `bash scripts/linux/install-debian-deps.sh`
+installs everything; macOS-only surfaces (menu-bar app, launchd, Zoom, AppleScript recipes) are
+listed in [docs/linux.md](docs/linux.md).
 
 `bash src/verify-setup.sh` covers this second list — it checks the Node version and whether your CLI is actually authenticated. Run it if startup succeeds but the core doesn't.
 

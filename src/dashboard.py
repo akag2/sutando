@@ -324,17 +324,45 @@ def _quota_age_label(quota: dict) -> str:
         return f"{age:.1f}h ago"
     return f"{int(age*60)}m ago"
 
+def _linux_battery_summary() -> str:
+    """pmset-shaped line from /sys/class/power_supply, or "" when there is no battery."""
+    base = "/sys/class/power_supply"
+    try:
+        for name in sorted(os.listdir(base)):
+            cap = os.path.join(base, name, "capacity")
+            if not os.path.exists(cap):
+                continue
+            with open(cap) as fh:
+                pct = fh.read().strip()
+            status = ""
+            try:
+                with open(os.path.join(base, name, "status")) as fh:
+                    status = fh.read().strip().lower()
+            except OSError:
+                pass
+            return f"{pct}% {status}"
+    except OSError:
+        pass
+    return ""
+
+
 def get_system_stats() -> dict:
     import os
     st = os.statvfs("/")
     free_gb = (st.f_bavail * st.f_frsize) / (1024 ** 3)
 
-    result = subprocess.run(["/usr/bin/pmset", "-g", "batt"], capture_output=True, text=True, timeout=5)
-    battery_m = re.search(r'(\d+)%', result.stdout)
+    # pmset is macOS-only; a Linux host (no battery, or /sys/class/power_supply)
+    # renders the same "—" a battery-less Mac does rather than 500 the page.
+    if sys.platform == "darwin":
+        result = subprocess.run(["/usr/bin/pmset", "-g", "batt"], capture_output=True, text=True, timeout=5)
+        batt_out = result.stdout
+    else:
+        batt_out = _linux_battery_summary()
+    battery_m = re.search(r'(\d+)%', batt_out)
     if battery_m:
         battery = f"{battery_m.group(1)}%"
         # \b keeps "discharging" (battery power) from substring-matching "charging".
-        charging = bool(re.search(r'\bcharging\b', result.stdout.lower())) or "ac power" in result.stdout.lower()
+        charging = bool(re.search(r'\bcharging\b', batt_out.lower())) or "ac power" in batt_out.lower()
     else:
         # Battery-less Mac (mini / Studio / Pro): pmset reports "AC Power" with no
         # percentage line. The old "?" + charging=True combo rendered as "? ⚡".
