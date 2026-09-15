@@ -497,7 +497,10 @@ start_gateway_lanes() {
     _gw_job_pid() {
       launchctl list 2>/dev/null | awk -v l="$_GW_LABEL" '$3 == l && $1 ~ /^[0-9]+$/ { print $1; exit }'
     }
-    if [ -f "$_GW_INSTALLER" ] && [ -f "$REPO/src/launchd/$_GW_LABEL.plist" ]; then
+    # launchd supervision is Darwin-only; Linux takes the bare launch below
+    # (scripts/platform.sh may not be sourced by every caller — inline the test).
+    if [ "$(uname -s)" = Darwin ] && command -v launchctl >/dev/null 2>&1 \
+       && [ -f "$_GW_INSTALLER" ] && [ -f "$REPO/src/launchd/$_GW_LABEL.plist" ]; then
       if launchctl print "gui/$(id -u)/$_GW_LABEL" > /dev/null 2>&1; then
         if [ -n "$(_gw_job_pid)" ]; then
           echo "  ✓ gateway bridge (launchd-supervised)"

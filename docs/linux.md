@@ -102,6 +102,27 @@ Then, on the host, as the same user: `export DISPLAY=:99; ./start.sh`. The
 startup transcript should show `✓ Screen capture (scrot on :99)` and
 `✓ Input control (xdotool on :99)`.
 
+## Connect to AG2 Space
+
+The AG2 Space link is the gateway bridge (`src/remote-gateway-bridge.py`,
+[remote-gateway-protocol.md](remote-gateway-protocol.md)); on Linux it starts
+directly from `startup.sh` (no launchd) as soon as `channels/ag2space/.env`
+holds a token. The desktop app's Connect flow writes that file on macOS; on a
+Linux host use the terminal equivalent:
+
+```bash
+python3 scripts/ag2space-connect.py --label gce-linux     # username + password prompt
+python3 scripts/ag2space-connect.py --browser             # sign in on a web page (Google OK)
+```
+
+Give a **label** when you already own an agent (a Mac running Sutando): it
+binds this host to `@<you>-<label>.agent`, creating it if needed. Without a
+label the server reuses your first agent, so two hosts would share one
+identity and one task queue. `--browser` cannot pass a label, so it is for a
+single host or Google-only accounts. The script writes the env file (0600) and
+restarts the gateway lane; the core must be logged in (`claude login`) for the
+DM you send in AG2 Space to be answered.
+
 ## How the port works
 
 The platform decision lives in three files; everything else asks them:
