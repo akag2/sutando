@@ -2,11 +2,11 @@
 # Give a Linux server a persistent virtual desktop Sutando can see and drive.
 #
 # A cloud VM has no monitor, so there is no $DISPLAY for screenshots or
-# keystrokes. This installs four systemd units for the invoking user:
+# keystrokes. This installs three systemd units for the invoking user:
 #
-#   sutando-xvfb     Xvfb :99          the virtual X server (1920x1080)
+#   sutando-xvnc     Xvnc :99          the virtual X server (1920x1080), which
+#                                      also serves VNC on 127.0.0.1:5900
 #   sutando-desktop  XFCE on :99       a real session: panel, file manager, browser
-#   sutando-x11vnc   VNC on 127.0.0.1:5900   look at / control the desktop
 #   sutando-novnc    noVNC on 127.0.0.1:6080  same, from a browser
 #
 # VNC and noVNC bind LOOPBACK ONLY and run without a password: reach them over
@@ -52,9 +52,13 @@ USER_ID="$(id -u)"
 USER_HOME="$(getent passwd "$USER_NAME" | cut -d: -f6)"
 
 export DEBIAN_FRONTEND=noninteractive
-echo "→ apt: xvfb, xfce4, x11vnc, novnc, chromium"
+# TigerVNC's Xvnc, not Xvfb + x11vnc: on Debian 12's Xvfb (xserver 21.1.7)
+# GTK3 apps get pointer motion and keys but never a button press, so WebKitGTK
+# windows (the AG2 Space desktop app) and even the XFCE panel menus cannot be
+# clicked over VNC. Xvnc is a full X server and delivers buttons normally.
+echo "→ apt: tigervnc, xfce4, novnc, chromium"
 sudo apt-get update -y
-sudo apt-get install -y xvfb x11vnc novnc websockify xfce4 xfce4-terminal dbus-x11 chromium \
+sudo apt-get install -y tigervnc-standalone-server novnc websockify xfce4 xfce4-terminal dbus-x11 chromium \
 	fonts-noto fonts-noto-color-emoji x11-utils
 
 # /run/user/<uid> must exist for a system service running as this user.
@@ -62,13 +66,15 @@ sudo loginctl enable-linger "$USER_NAME" || true
 
 unit() { sudo tee "/etc/systemd/system/$1" >/dev/null; }
 
-unit sutando-xvfb.service <<UNIT
+# Loopback-only VNC with no VNC password: reach it through an ssh tunnel
+# (`ssh -L 5900:127.0.0.1:5900`), never by opening 5900 on a public interface.
+unit sutando-xvnc.service <<UNIT
 [Unit]
-Description=Xvfb $DISPLAY_NUM virtual display for Sutando
+Description=Xvnc $DISPLAY_NUM virtual display + VNC for Sutando (loopback only — reach via ssh tunnel)
 After=network.target
 [Service]
 User=$USER_NAME
-ExecStart=/usr/bin/Xvfb $DISPLAY_NUM -screen 0 ${GEOMETRY}x24 -nolisten tcp -ac
+ExecStart=/usr/bin/Xvnc $DISPLAY_NUM -geometry $GEOMETRY -depth 24 -rfbport 5900 -localhost -SecurityTypes None -AlwaysShared -desktop Sutando -nolisten tcp -ac
 Restart=always
 RestartSec=2
 [Install]
@@ -78,8 +84,8 @@ UNIT
 unit sutando-desktop.service <<UNIT
 [Unit]
 Description=XFCE session on $DISPLAY_NUM for Sutando
-After=sutando-xvfb.service
-Requires=sutando-xvfb.service
+After=sutando-xvnc.service
+Requires=sutando-xvnc.service
 [Service]
 User=$USER_NAME
 Environment=DISPLAY=$DISPLAY_NUM
@@ -93,24 +99,10 @@ RestartSec=3
 WantedBy=multi-user.target
 UNIT
 
-unit sutando-x11vnc.service <<UNIT
-[Unit]
-Description=x11vnc for the Sutando virtual desktop (loopback only — reach via ssh tunnel)
-After=sutando-desktop.service
-Requires=sutando-xvfb.service
-[Service]
-User=$USER_NAME
-ExecStart=/usr/bin/x11vnc -display $DISPLAY_NUM -forever -shared -localhost -rfbport 5900 -nopw -noxdamage -xkb -quiet
-Restart=always
-RestartSec=2
-[Install]
-WantedBy=multi-user.target
-UNIT
-
 unit sutando-novnc.service <<UNIT
 [Unit]
 Description=noVNC web front for the Sutando virtual desktop (loopback only)
-After=sutando-x11vnc.service
+After=sutando-xvnc.service
 [Service]
 User=$USER_NAME
 ExecStart=/usr/bin/websockify --web=/usr/share/novnc/ 127.0.0.1:6080 127.0.0.1:5900
@@ -120,11 +112,20 @@ RestartSec=2
 WantedBy=multi-user.target
 UNIT
 
+# Earlier revisions installed Xvfb + x11vnc under these names; retire them so a
+# re-run does not leave two X servers fighting over the display number.
+for old in sutando-x11vnc sutando-xvfb; do
+	if [ -f "/etc/systemd/system/$old.service" ]; then
+		sudo systemctl disable --now "$old" 2>/dev/null || true
+		sudo rm -f "/etc/systemd/system/$old.service"
+		sudo systemctl reset-failed "$old" 2>/dev/null || true
+	fi
+done
 sudo systemctl daemon-reload
 # `restart`, not `enable --now`: a re-run with a new --display/--geometry must
 # take effect on units that are already running, not only on the next boot.
-sudo systemctl enable sutando-xvfb sutando-desktop sutando-x11vnc sutando-novnc
-sudo systemctl restart sutando-xvfb sutando-desktop sutando-x11vnc sutando-novnc
+sudo systemctl enable sutando-xvnc sutando-desktop sutando-novnc
+sudo systemctl restart sutando-xvnc sutando-desktop sutando-novnc
 
 # Make the display the default for this user's shells, so `./start.sh` over
 # SSH finds it without an export each time.
@@ -143,5 +144,5 @@ echo
 echo "Virtual desktop is up on $DISPLAY_NUM."
 echo "  view it:   ssh -L 5900:127.0.0.1:5900 -L 6080:127.0.0.1:6080 <host>"
 echo "             then open vnc://localhost:5900  or  http://localhost:6080/vnc.html"
-echo "  status:    systemctl status sutando-xvfb sutando-desktop sutando-x11vnc sutando-novnc"
+echo "  status:    systemctl status sutando-xvnc sutando-desktop sutando-novnc"
 echo "  then:      export DISPLAY=$DISPLAY_NUM; ./start.sh"

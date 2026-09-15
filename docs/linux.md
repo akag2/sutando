@@ -5,7 +5,7 @@ one on a cloud VM. This page is the Linux counterpart of the macOS quick start
 in `README.md`: what is supported, what is not, how to install, and how the
 macOS-only pieces degrade.
 
-Tested on Debian 12 (bookworm) with XFCE on Xvfb (GCE `e2-standard-4`); see the
+Tested on Debian 12 (bookworm) with XFCE on TigerVNC's Xvnc (GCE `e2-standard-4`); see the
 status legend below for what "tested" covers per surface.
 Ubuntu 22.04+ should behave the same; other distros only change the install
 hints (`scripts/platform.sh` maps package names).
@@ -78,16 +78,22 @@ persistent virtual desktop:
 bash scripts/linux/install-headless-desktop.sh
 ```
 
-That installs four systemd units for your user — `Xvfb :99`, an XFCE session on
-it, `x11vnc` on `127.0.0.1:5900` and noVNC on `127.0.0.1:6080` — and adds
-`export DISPLAY=:99` to your `~/.profile`. VNC binds loopback only and has no
-password: the SSH (or cloud IAP) tunnel is the authentication.
+That installs three systemd units for your user — `Xvnc :99` (TigerVNC's X
+server, which also serves VNC on `127.0.0.1:5900`), an XFCE session on it, and
+noVNC on `127.0.0.1:6080` — and adds `export DISPLAY=:99` to your `~/.profile`.
+VNC binds loopback only and has no password: the SSH (or cloud IAP) tunnel is
+the authentication.
+
+Why Xvnc and not Xvfb + x11vnc: on Debian 12's Xvfb, GTK3 applications receive
+pointer motion and key presses but never a mouse button press, so WebKitGTK
+windows (the AG2 Space desktop app) and even the XFCE panel menus cannot be
+clicked over VNC. Xvnc is a full X server and delivers buttons normally.
 
 **Trust boundary.** This installer assumes a single-user host you administer
-(a personal VM). Xvfb runs with `-ac` and x11vnc without a password, so any
+(a personal VM). Xvnc runs with `-ac` and without a VNC password, so any
 local process or account on the machine can see and drive the desktop — the
 same access the Sutando core itself has. Do not use it on a shared host; there
-you want an authenticated VNC (`x11vnc -rfbauth`), an Xauthority-protected
+you want an authenticated VNC (`Xvnc -SecurityTypes VncAuth -PasswordFile`), an Xauthority-protected
 display, and a dedicated account.
 
 ```bash
@@ -138,6 +144,6 @@ The platform decision lives in three files; everything else asks them:
 
 - **`✗ lsof not found`** — `sudo apt-get install -y lsof`. Every port guard in `startup.sh` uses it.
 - **`⚠ Screen capture unavailable — no $DISPLAY`** — you are in a plain SSH shell. `export DISPLAY=:99` (after the headless-desktop install) or run inside the desktop session.
-- **`scrot: Can't open X display`** — the X server is not up: `systemctl status sutando-xvfb`.
+- **`scrot: Can't open X display`** — the X server is not up: `systemctl status sutando-xvnc`.
 - **`vault: no secret store on this host`** — install `libsecret-tools` and run `gnome-keyring-daemon` in the session, or keep secrets in `.env` for now.
 - **Dashboard did not auto-open** — `start.sh` only opens a browser when `xdg-open` and a `$DISPLAY` exist; otherwise open `http://localhost:7844` yourself (through the tunnel on a VM).

@@ -112,7 +112,7 @@ core session.
 **Recommended, but not checked at boot** — macOS 15+ and Node.js 22+.
 
 **Linux (Debian/Ubuntu)** — supported for the core, dashboard, web UI, bridges, and
-screen/keyboard/clipboard tools on an X11 desktop (real or Xvfb). `bash scripts/linux/install-debian-deps.sh`
+screen/keyboard/clipboard tools on an X11 desktop (real or virtual). `bash scripts/linux/install-debian-deps.sh`
 installs everything; macOS-only surfaces (menu-bar app, launchd, Zoom, AppleScript recipes) are
 listed in [docs/linux.md](docs/linux.md).
 
