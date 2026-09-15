@@ -62,19 +62,93 @@ def api(base: str, path: str, body: dict, timeout: int = 30) -> tuple[int, dict]
 
 
 def sutando_env() -> dict:
-    """Process env with CLAUDE_CONFIG_DIR resolved the way startup.sh resolves it.
+    """Process env with CLAUDE_CONFIG_DIR resolved exactly as startup.sh resolves it.
 
-    Outside a Sutando shell the variable is unset and `claude-home-path` falls
-    back to ~/.claude — a file written there is one the bridge never reads.
+    Mirrors src/claude_config_dir.sh: the configured dir wins whenever the
+    helper is readable — an exported value (a stale shell, another checkout)
+    is NOT honoured, because startup will not honour it either and the file
+    would land where no bridge reads it. Only a missing helper falls back to
+    the caller's export.
     """
     env = dict(os.environ)
-    if not env.get("CLAUDE_CONFIG_DIR"):
-        out = subprocess.run(
-            ["bash", str(REPO / "scripts" / "sutando-config.sh"), "claude-sutando-config-dir"],
-            capture_output=True, text=True, check=True,
-        )
+    helper = REPO / "scripts" / "sutando-config.sh"
+    if os.access(helper, os.R_OK):
+        out = subprocess.run(["bash", str(helper), "claude-sutando-config-dir"],
+                             capture_output=True, text=True)
+        if out.returncode != 0:
+            raise SystemExit(f"ag2space-connect: claude_sutando_config_dir invalid — refusing: {out.stderr.strip()}")
         env["CLAUDE_CONFIG_DIR"] = out.stdout.strip()
+    elif not env.get("CLAUDE_CONFIG_DIR"):
+        raise SystemExit(f"ag2space-connect: {helper} unreadable and no CLAUDE_CONFIG_DIR exported — refusing")
     return env
+
+
+def bridge_pids() -> list[int]:
+    """PIDs of gateway bridges launched from THIS checkout (either entry name)."""
+    pids: list[int] = []
+    for marker in ("src/remote-gateway-bridge.py", "src/remote-relay-bridge.py"):
+        out = subprocess.run(["pgrep", "-f", str(REPO / marker)], capture_output=True, text=True)
+        pids += [int(x) for x in out.stdout.split() if x.isdigit() and int(x) != os.getpid()]
+    return sorted(set(pids))
+
+
+def stop_running_bridge(env: dict, wait_s: float = 15.0) -> list[int]:
+    """Stop the bridge that holds the OLD connection so the restart is real.
+
+    restart-gateway-lanes.sh only spawns; the bridge's singleton lock makes the
+    new process defer to a live old one, which would keep polling the previous
+    agent. On macOS a launchd-supervised job is bounced with kickstart -k
+    (it re-reads the env file on launch); a bare process is SIGTERMed and
+    waited for. The task watcher is never touched.
+    """
+    import signal
+    if sys.platform == "darwin":
+        svc = f"gui/{os.getuid()}/com.sutando.gateway-bridge"
+        if subprocess.run(["launchctl", "print", svc], capture_output=True).returncode == 0:
+            subprocess.run(["launchctl", "kickstart", "-k", svc], capture_output=True)
+    victims = bridge_pids()
+    for pid in victims:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    deadline = time.time() + wait_s
+    while time.time() < deadline and any(p in bridge_pids() for p in victims):
+        time.sleep(0.5)
+    left = [p for p in victims if p in bridge_pids()]
+    for pid in left:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    return victims
+
+
+def gateway_status_path(env: dict) -> Path:
+    out = subprocess.run(["bash", str(REPO / "scripts" / "sutando-config.sh"), "workspace"],
+                         capture_output=True, text=True, check=True, env=env)
+    return Path(out.stdout.strip()) / "state" / "gateway-status.json"
+
+
+def wait_for_new_bridge(env: dict, old_pids: list[int], since: float, relay_url: str, wait_s: float = 25.0) -> str:
+    """Return "" when a fresh bridge is serving the new relay, else the reason it is not (yet)."""
+    status = gateway_status_path(env)
+    host = relay_url.split("//", 1)[-1].split("/", 1)[0]
+    deadline = time.time() + wait_s
+    seen_pid = False
+    while time.time() < deadline:
+        live = [p for p in bridge_pids() if p not in old_pids]
+        seen_pid = seen_pid or bool(live)
+        try:
+            st = json.loads(status.read_text())
+            if float(st.get("ts") or 0) >= since and st.get("connected") and host in str(st.get("gateway") or ""):
+                return ""
+        except (OSError, ValueError):
+            pass
+        time.sleep(1)
+    if not seen_pid:
+        return "no new gateway bridge process appeared"
+    return f"bridge started but {status} has not reported connected to {host} yet (check workspace/logs/remote-gateway-bridge.log)"
 
 
 def env_path(env: dict) -> Path:
@@ -121,8 +195,13 @@ def main() -> int:
     args = ap.parse_args()
 
     senv = sutando_env()
+    if args.env_file and not args.no_restart:
+        print("ag2space-connect: --env-file needs --no-restart — the launcher only reads channels/ag2space/.env "
+              "under the config dir, so a custom file cannot be started from here", file=sys.stderr)
+        return 2
     target = Path(args.env_file) if args.env_file else env_path(senv)
-    if target.exists() and not args.force:
+    replacing = target.exists()
+    if replacing and not args.force:
         print(f"ag2space-connect: {target} already exists — this host is connected. Re-run with --force to replace it.", file=sys.stderr)
         return 2
 
@@ -181,9 +260,19 @@ def main() -> int:
     if args.no_restart:
         print("Gateway lane not restarted (--no-restart). Start it with: bash scripts/restart-gateway-lanes.sh")
         return 0
+    # A replaced connection must replace the RUNNING bridge too, or the old
+    # process keeps polling the previous agent while this prints success.
+    old_pids = stop_running_bridge(senv) if replacing else []
+    if old_pids:
+        print(f"Stopped the previous gateway bridge (pid {', '.join(map(str, old_pids))}).")
+    since = time.time()
     rc = subprocess.run(["bash", str(REPO / "scripts" / "restart-gateway-lanes.sh")], env=senv).returncode
     if rc != 0:
         print(f"ag2space-connect: restart-gateway-lanes.sh exited {rc} — the env file is in place; run it again or bash src/startup.sh", file=sys.stderr)
+        return 1
+    why = wait_for_new_bridge(senv, old_pids, since, poll["relay_url"])
+    if why:
+        print(f"ag2space-connect: env file written but the connection is PENDING — {why}", file=sys.stderr)
         return 1
     print(f"Connected. Open AG2 Space and DM {poll['agent_id']} — the reply comes from this host.")
     return 0

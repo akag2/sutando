@@ -41,8 +41,8 @@ const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 export { describeScreenTool, clickTool, scrollAndDescribeTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, switchTabTool, closeTabTool, scrollTool, openUrlTool } from './browser-tools.js';
 import { keystrokeOutcome } from './osascript-setup-hint.js';
 import {
-	activateAppByTitlePlan, activateAppPlan, activateOnlyPlan, clipboardReadPlan, clipboardWritePlan,
-	collapseSelectionRightPlan, currentPlatform, openPathPlan, pastePlan, pressKeyPlan, runOpen, runPlan,
+	activateAppByTitlePlan, activateAppPlan, activateForKeystroke, clipboardReadPlan, clipboardWritePlan,
+	collapseSelectionRightPlan, currentPlatform, openPathPlan, pastePlan, pressKeyPlan, resolveAppAlias, runOpen, runPlan,
 	selectAllPlan, typeTextPlan, volumePlan, type Modifier,
 } from './platform-desktop.js';
 import { describeScreenTool, clickTool, pointAtTool, scrollAndDescribeTool, screenRecordTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, switchTabTool, closeTabTool, scrollTool, openUrlTool } from './browser-tools.js';
@@ -206,16 +206,14 @@ export const pressKeyTool: ToolDefinition = {
 		if (app) {
 			// Activation only (the darwin plan is the single `activate` line with
 			// its original 3s bound; switch_app's frontmost-set is not part of
-			// press_key). Failure is non-fatal, as before — the key is still sent.
-			try {
-				try {
-					runPlan(activateOnlyPlan(app, platform));
-				} catch (err) {
-					if (platform !== 'linux') throw err;
-					runPlan(activateAppByTitlePlan(app, 3_000));
-				}
-				await new Promise(r => setTimeout(r, 300));
-			} catch {}
+			// press_key). darwin: failure stays non-fatal, as before — the key is
+			// still sent. linux: a miss means the key would land on whatever is
+			// focused, so it is an error and nothing is fired.
+			const activated = activateForKeystroke(app, platform);
+			if (!activated.ok && platform === 'linux') {
+				return { error: `Could not activate ${app} for press_key — ${activated.error}. No key was sent.` };
+			}
+			await new Promise(r => setTimeout(r, 300));
 		}
 		// Key-code table (darwin) / keysym table (linux) live in the backend:
 		// voice-spoken aliases such as "downarrow" resolve there on both.
@@ -239,25 +237,8 @@ const _browserToolsImported = { switchTabTool, scrollTool }; // eslint-disable-l
 
 // --- macOS system tools ---
 
-const APP_ALIASES: Record<string, string> = {
-	'vs code': 'Visual Studio Code', 'vscode': 'Visual Studio Code',
-	'chrome': 'Google Chrome', 'safari': 'Safari',
-	'terminal': 'Terminal', 'finder': 'Finder',
-	'slack': 'Slack', 'discord': 'Discord',
-};
-// Linux: the spoken name → the WM_CLASS the window actually carries. Anything
-// not listed is matched by name as spoken (xdotool's search is case-insensitive).
-const LINUX_APP_ALIASES: Record<string, string> = {
-	'vs code': 'code', 'vscode': 'code',
-	'chrome': 'chromium', 'google chrome': 'chromium', 'chromium': 'chromium',
-	'terminal': 'xfce4-terminal', 'finder': 'thunar', 'files': 'thunar',
-	'slack': 'slack', 'discord': 'discord',
-};
-function resolveAppAlias(app: string, platform: string): string {
-	const key = app.toLowerCase();
-	if (platform === 'linux') return LINUX_APP_ALIASES[key] ?? app;
-	return APP_ALIASES[key] ?? app;
-}
+// Spoken-name aliases per platform live in platform-desktop.ts
+// (resolveAppAlias), shared by switch_app and press_key(app=…).
 
 // System Events process names differ from app bundle names
 const PROCESS_NAMES: Record<string, string> = {

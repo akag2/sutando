@@ -12,13 +12,17 @@
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import type { Plan } from '../src/platform-desktop.js';
 
 import { classifyPlatform, hasDisplay, unsupportedPlatformMessage } from '../src/platform.js';
 import {
 	activateAppByTitlePlan,
 	activateAppPlan,
+	activateForKeystroke,
 	activateOnlyPlan,
-	appleScriptString,
 	clipboardReadPlan,
 	clipboardWritePlan,
 	collapseSelectionRightPlan,
@@ -82,7 +86,9 @@ describe('activate app', () => {
 		assert.equal(plan.cmd, 'osascript');
 		// Every embedded quote is escaped, so the literal cannot be broken out of:
 		// the hostile `"; do shell script` reaches osascript as `\"; do shell script`.
-		assert.equal(plan.args[1], `tell application "${appleScriptString(hostile)}" to activate`);
+		// Hand-typed expectation (NOT built with appleScriptString): every `"` in
+		// the hostile value arrives as `\"`, so osascript sees one string literal.
+		assert.equal(plan.args[1], 'tell application "\\"; do shell script \\"rm -rf ~\\"; tell application \\"Finder" to activate');
 		assert.ok(plan.args[1].includes('\\"; do shell script'));
 		assert.ok(!plan.args[1].includes(' ""; do shell script'));
 		assert.match(plan.args[3], /set frontmost of process ".*" to true$/);
@@ -185,11 +191,53 @@ describe('runners', () => {
 		await assert.rejects(runOpen({ cmd: 'sutando-test-opener-that-does-not-exist', args: ['/tmp/x'] }), /ENOENT/);
 		await runOpen({ cmd: 'sh', args: ['-c', 'exit 0'] }); // a real spawn resolves
 	});
-	it('hasCommand answers per PATH, not per name', () => {
+	it('hasCommand answers per PATH, and a miss is never remembered', () => {
 		resetCommandCacheForTests();
 		assert.equal(hasCommand('sh', { PATH: '/nonexistent' }), false);
 		assert.equal(hasCommand('sh', { PATH: '/bin:/usr/bin' }), true);
 		assert.equal(hasCommand('sh', { PATH: '/nonexistent' }), false);
+		// Install a tool into a PATH dir that was already probed empty.
+		const dir = mkdtempSync(join(tmpdir(), 'hascmd-'));
+		assert.equal(hasCommand('sutando-later-tool', { PATH: dir }), false);
+		writeFileSync(join(dir, 'sutando-later-tool'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+		assert.equal(hasCommand('sutando-later-tool', { PATH: dir }), true, 'a later install must be seen without a restart');
+		rmSync(dir, { recursive: true, force: true });
+	});
+});
+
+describe('press_key target activation (injected runner, no desktop)', () => {
+	const calls: string[][] = [];
+	const scene = (visible: string[]) => (plan: Plan) => {
+		calls.push([plan.cmd, ...plan.args]);
+		if (plan.cmd !== 'xdotool') return '';
+		const pattern = plan.args[3]; // ^name
+		const byTitle = plan.args.includes('--name');
+		const hit = visible.some(w => new RegExp(pattern, 'i').test(byTitle ? `Review page - ${w}` : w));
+		if (!hit) throw new Error('xdotool: no match');
+		return '';
+	};
+	it('linux: "chrome" is aliased to the chromium class and activates it', () => {
+		calls.length = 0;
+		const r = activateForKeystroke('chrome', 'linux', scene(['chromium']));
+		assert.deepEqual(r, { ok: true });
+		assert.equal(calls[0][4], '^chromium');
+	});
+	it('linux: class miss falls back to title; both misses report an error, so the caller fires nothing', () => {
+		calls.length = 0;
+		const r = activateForKeystroke('chrome', 'linux', scene(['gedit']));
+		assert.equal(r.ok, false);
+		assert.deepEqual(calls.map(c => c.slice(0, 4)), [
+			['xdotool', 'search', '--onlyvisible', '--class'],
+			['xdotool', 'search', '--onlyvisible', '--name'],
+		]);
+		assert.match((r as { error: string }).error, /chromium/);
+	});
+	it('darwin: the single activate line, alias applied, failure reported but not retried', () => {
+		calls.length = 0;
+		const r = activateForKeystroke('chrome', 'darwin', (plan) => { calls.push([plan.cmd, ...plan.args]); throw new Error('denied'); });
+		assert.equal(r.ok, false);
+		assert.equal(calls.length, 1);
+		assert.deepEqual(calls[0], ['osascript', '-e', 'tell application "Google Chrome" to activate']);
 	});
 });
 

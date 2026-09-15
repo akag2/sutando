@@ -252,13 +252,69 @@ export function hasCommand(cmd: string, env: NodeJS.ProcessEnv = process.env): b
 	let found: boolean;
 	try {
 		// `command -v` via sh is the portable probe; execFileSync keeps argv literal.
-		execFileSync('sh', ['-c', 'command -v -- "$1"', 'sh', cmd], { env, stdio: ['ignore', 'pipe', 'ignore'], timeout: 2_000 });
+		// /bin/sh by absolute path: the probe must not itself depend on the PATH it is judging.
+		execFileSync('/bin/sh', ['-c', 'command -v -- "$1"', 'sh', cmd], { env, stdio: ['ignore', 'pipe', 'ignore'], timeout: 2_000 });
 		found = true;
 	} catch {
 		found = false;
 	}
-	_cmdCache.set(key, found);
+	// Only a HIT is remembered: a tool installed later into the same PATH must
+	// be found on the next call without a service restart.
+	if (found) _cmdCache.set(key, true);
 	return found;
+}
+
+// --- app targeting -----------------------------------------------------------
+
+/** macOS: spoken name → application bundle name. */
+export const DARWIN_APP_ALIASES: Record<string, string> = {
+	'vs code': 'Visual Studio Code', 'vscode': 'Visual Studio Code',
+	'chrome': 'Google Chrome', 'safari': 'Safari',
+	'terminal': 'Terminal', 'finder': 'Finder',
+	'slack': 'Slack', 'discord': 'Discord',
+};
+
+/** Linux: spoken name → the WM_CLASS the window actually carries (case-insensitive prefix match). */
+export const LINUX_APP_ALIASES: Record<string, string> = {
+	'vs code': 'code', 'vscode': 'code',
+	'chrome': 'chromium', 'google chrome': 'chromium', 'chromium': 'chromium',
+	'terminal': 'xfce4-terminal', 'finder': 'thunar', 'files': 'thunar',
+	'slack': 'slack', 'discord': 'discord',
+};
+
+export function resolveAppAlias(app: string, platform: HostPlatform): string {
+	const key = app.toLowerCase();
+	if (platform === 'linux') return LINUX_APP_ALIASES[key] ?? app;
+	return DARWIN_APP_ALIASES[key] ?? app;
+}
+
+export type ActivateOutcome = { ok: true } | { ok: false; error: string };
+
+/**
+ * Bring the app a keystroke is meant for to the front. darwin: the single
+ * `activate` line (press_key's historical pre-step). linux: WM_CLASS search,
+ * then window-title search. The runner is injectable so the decision — which
+ * plans, in which order, and what counts as failure — is testable without a
+ * desktop. Callers decide what a failure means on their platform.
+ */
+export function activateForKeystroke(
+	app: string,
+	platform: HostPlatform,
+	run: (plan: Plan) => unknown = runPlan,
+): ActivateOutcome {
+	const name = resolveAppAlias(app, platform);
+	try {
+		run(activateOnlyPlan(name, platform));
+		return { ok: true };
+	} catch (err) {
+		if (platform !== 'linux') return { ok: false, error: err instanceof Error ? err.message : String(err) };
+	}
+	try {
+		run(activateAppByTitlePlan(name, 3_000));
+		return { ok: true };
+	} catch (err) {
+		return { ok: false, error: `no visible window matches "${name}" by class or title: ${err instanceof Error ? err.message : String(err)}` };
+	}
 }
 export function resetCommandCacheForTests(): void { _cmdCache.clear(); }
 

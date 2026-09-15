@@ -40,7 +40,7 @@ crashing the service:
 
 - **Menu-bar app** (`--with-app`, `scripts/install-menu-bar-app.sh`) — Swift/AppKit. The installer exits 0 with "macOS only".
 - **launchd supervision** of voice-agent, web-client, bridges, credential proxy — services are started directly by `startup.sh`; nothing restarts them on crash. Use the systemd units from `scripts/linux/install-headless-desktop.sh` as a template if you need supervision.
-- **Browser control tools** in `src/browser-tools.ts` — `open_url`, `switch_tab`, `close_tab`, `scroll`, `click`, `describe_screen` and the slide-deck controls all drive Google Chrome through AppleScript. None of them work on Linux yet; they return the `osascript` spawn error. (Use the voice/web UI's own browser, or `open_file` on an `.html`/URL via `xdg-open`.)
+- **Browser control tools** in `src/browser-tools.ts` — `open_url`, `switch_tab`, `close_tab`, `scroll`, `click` and the slide-deck controls drive Google Chrome through AppleScript and return the `osascript` spawn error on Linux. `describe_screen` is different: it goes through the capture server and the vision service, not AppleScript, so it should work on Linux but is **unverified** there. To show a page, `open_file` on a local `.html` file opens it in the default browser via `xdg-open` (the tool checks the path exists, so an `http://` URL is not accepted).
 - **Zoom / Google Meet joining** (`skills/zoom`, `src/meeting-tools.ts`) — drives the macOS Zoom app.
 - **Calendar, Reminders, Contacts, iMessage, Notes** recipes in `docs/built-in-tools.md` — AppleScript / EventKit.
 - **Multi-display** — one X screen per `$DISPLAY`; `display=N` selectors all resolve to it.
