@@ -108,6 +108,10 @@ class Flow(unittest.TestCase):
         self.assertIn("AGENT_ID=@u-gce.agent:x", text)
         complete = [b for p, b in _Api.seen if p == "/api/connect/complete"]
         self.assertEqual(complete[0]["label"], "gce")
+        # Credentials are exchanged BEFORE the device code is minted, so the
+        # 15-minute code TTL is not spent at the prompts (the 404 seen live).
+        paths = [p for p, _ in _Api.seen]
+        self.assertLess(paths.index("/api/user-login"), paths.index("/api/connect/start"))
         self.assertEqual(complete[0]["user_session_token"], "sess-1")
         self.assertNotIn("pw", json.dumps(_Api.seen).replace('"password": "pw"', ""), "password only ever goes to /user-login")
 

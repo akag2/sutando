@@ -130,8 +130,12 @@ def gateway_status_path(env: dict) -> Path:
     return Path(out.stdout.strip()) / "state" / "gateway-status.json"
 
 
-def wait_for_new_bridge(env: dict, old_pids: list[int], since: float, relay_url: str, wait_s: float = 25.0) -> str:
-    """Return "" when a fresh bridge is serving the new relay, else the reason it is not (yet)."""
+def wait_for_new_bridge(env: dict, old_pids: list[int], since: float, relay_url: str, wait_s: float = 90.0) -> str:
+    """Return "" when a fresh bridge is serving the new relay, else the reason it is not (yet).
+
+    90 s: a just-minted bearer can take one poll to propagate to the relay (a 401 the
+    bridge retries after 30 s), so the wait must outlast at least one re-check.
+    """
     status = gateway_status_path(env)
     host = relay_url.split("//", 1)[-1].split("/", 1)[0]
     deadline = time.time() + wait_s
@@ -176,6 +180,29 @@ def write_env(path: Path, *, agent_id: str, relay_url: str, bearer: str) -> None
     os.chmod(path, 0o600)
 
 
+def login_prompt(base: str) -> "str | None":
+    """Prompt for username + password, exchange them for a user_session_token; None on failure."""
+    # The login endpoint takes the Matrix localpart only — for @sutando-anas
+    # (or @anas-…) that is "anas"; an email or a full @user:server is refused.
+    username = input("AG2 Space username (the part before the colon in your Matrix id, e.g. anas): ").strip().lower()
+    if username.startswith("@"):
+        username = username[1:]
+    if "@" in username:
+        print("ag2space-connect: use your AG2 Space username, not an email — for @sutando-anas:ag2.space it is 'anas'", file=sys.stderr)
+        return None
+    username = username.split(":", 1)[0]
+    password = getpass.getpass("AG2 Space password: ")
+    if not username or not password:
+        print("ag2space-connect: username and password are required", file=sys.stderr)
+        return None
+    st, login = api(base, "/user-login", {"username": username, "password": password})
+    del password
+    if st != 200 or not login.get("user_session_token"):
+        print(f"ag2space-connect: login failed ({st}): {login.get('error', 'no session token')}", file=sys.stderr)
+        return None
+    return login["user_session_token"]
+
+
 def default_label() -> str:
     host = socket.gethostname().split(".")[0].lower()
     host = re.sub(r"[^a-z0-9-]+", "-", host).strip("-")[:32].strip("-")
@@ -206,6 +233,20 @@ def main() -> int:
         return 2
 
     base = args.api.rstrip("/")
+    session_token = None
+    label = None
+    if not args.browser:
+        label = args.label or default_label()
+        if not LABEL_RE.match(label):
+            print(f"ag2space-connect: invalid label '{label}' — lowercase letters, digits and internal hyphens, up to 32 chars", file=sys.stderr)
+            return 2
+        print(f"Binding this host to agent label '{label}' on {base}.")
+        # Credentials first: the device code lives 15 minutes, and typing at
+        # the prompts must not eat into that.
+        session_token = login_prompt(base)
+        if session_token is None:
+            return 1
+
     st, start = api(base, "/connect/start", {})
     if st != 200 or not start.get("device_code"):
         print(f"ag2space-connect: /connect/start failed ({st}): {start.get('error', start)}", file=sys.stderr)
@@ -216,30 +257,7 @@ def main() -> int:
         print("Open this URL in a browser and sign in to link this host:\n\n  " + start["verify_url"] + "\n")
         print("Waiting for the sign-in to complete (Ctrl-C to abort)…")
     else:
-        label = args.label or default_label()
-        if not LABEL_RE.match(label):
-            print(f"ag2space-connect: invalid label '{label}' — lowercase letters, digits and internal hyphens, up to 32 chars", file=sys.stderr)
-            return 2
-        print(f"Binding this host to agent label '{label}' on {base}.")
-        # The login endpoint takes the Matrix localpart only — for @sutando-anas
-        # (or @anas-…) that is "anas"; an email or a full @user:server is refused.
-        username = input("AG2 Space username (the part before the colon in your Matrix id, e.g. anas): ").strip().lower()
-        if username.startswith("@"):
-            username = username[1:]
-        if "@" in username:
-            print("ag2space-connect: use your AG2 Space username, not an email — for @sutando-anas:ag2.space it is 'anas'", file=sys.stderr)
-            return 2
-        username = username.split(":", 1)[0]
-        password = getpass.getpass("AG2 Space password: ")
-        if not username or not password:
-            print("ag2space-connect: username and password are required", file=sys.stderr)
-            return 2
-        st, login = api(base, "/user-login", {"username": username, "password": password})
-        del password
-        if st != 200 or not login.get("user_session_token"):
-            print(f"ag2space-connect: login failed ({st}): {login.get('error', 'no session token')}", file=sys.stderr)
-            return 1
-        body = {"device_code": code, "user_session_token": login["user_session_token"], "label": label}
+        body = {"device_code": code, "user_session_token": session_token, "label": label}
         if args.display_name:
             body["display_name"] = args.display_name.strip()[:100]
         st, done = api(base, "/connect/complete", body, timeout=90)
