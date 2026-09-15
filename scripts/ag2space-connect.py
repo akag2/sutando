@@ -61,10 +61,26 @@ def api(base: str, path: str, body: dict, timeout: int = 30) -> tuple[int, dict]
             return e.code, {"error": str(e)}
 
 
-def env_path() -> Path:
+def sutando_env() -> dict:
+    """Process env with CLAUDE_CONFIG_DIR resolved the way startup.sh resolves it.
+
+    Outside a Sutando shell the variable is unset and `claude-home-path` falls
+    back to ~/.claude — a file written there is one the bridge never reads.
+    """
+    env = dict(os.environ)
+    if not env.get("CLAUDE_CONFIG_DIR"):
+        out = subprocess.run(
+            ["bash", str(REPO / "scripts" / "sutando-config.sh"), "claude-sutando-config-dir"],
+            capture_output=True, text=True, check=True,
+        )
+        env["CLAUDE_CONFIG_DIR"] = out.stdout.strip()
+    return env
+
+
+def env_path(env: dict) -> Path:
     out = subprocess.run(
         ["bash", str(REPO / "scripts" / "sutando-config.sh"), "claude-home-path", "channels/ag2space/.env"],
-        capture_output=True, text=True, check=True,
+        capture_output=True, text=True, check=True, env=env,
     )
     return Path(out.stdout.strip())
 
@@ -104,7 +120,8 @@ def main() -> int:
     ap.add_argument("--force", action="store_true", help="overwrite an existing gateway env file")
     args = ap.parse_args()
 
-    target = Path(args.env_file) if args.env_file else env_path()
+    senv = sutando_env()
+    target = Path(args.env_file) if args.env_file else env_path(senv)
     if target.exists() and not args.force:
         print(f"ag2space-connect: {target} already exists — this host is connected. Re-run with --force to replace it.", file=sys.stderr)
         return 2
@@ -164,7 +181,7 @@ def main() -> int:
     if args.no_restart:
         print("Gateway lane not restarted (--no-restart). Start it with: bash scripts/restart-gateway-lanes.sh")
         return 0
-    rc = subprocess.run(["bash", str(REPO / "scripts" / "restart-gateway-lanes.sh")]).returncode
+    rc = subprocess.run(["bash", str(REPO / "scripts" / "restart-gateway-lanes.sh")], env=senv).returncode
     if rc != 0:
         print(f"ag2space-connect: restart-gateway-lanes.sh exited {rc} — the env file is in place; run it again or bash src/startup.sh", file=sys.stderr)
         return 1
