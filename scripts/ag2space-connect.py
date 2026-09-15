@@ -221,7 +221,15 @@ def main() -> int:
             print(f"ag2space-connect: invalid label '{label}' — lowercase letters, digits and internal hyphens, up to 32 chars", file=sys.stderr)
             return 2
         print(f"Binding this host to agent label '{label}' on {base}.")
-        username = input("AG2 Space username: ").strip().lower()
+        # The login endpoint takes the Matrix localpart only — for @sutando-anas
+        # (or @anas-…) that is "anas"; an email or a full @user:server is refused.
+        username = input("AG2 Space username (the part before the colon in your Matrix id, e.g. anas): ").strip().lower()
+        if username.startswith("@"):
+            username = username[1:]
+        if "@" in username:
+            print("ag2space-connect: use your AG2 Space username, not an email — for @sutando-anas:ag2.space it is 'anas'", file=sys.stderr)
+            return 2
+        username = username.split(":", 1)[0]
         password = getpass.getpass("AG2 Space password: ")
         if not username or not password:
             print("ag2space-connect: username and password are required", file=sys.stderr)
