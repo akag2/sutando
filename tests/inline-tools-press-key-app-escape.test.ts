@@ -40,7 +40,7 @@ describe('inline-tools pressKey app activation — AppleScript injection guard',
 	it('pressKey app-activation branch delegates to activateAppPlan (no inline AppleScript)', () => {
 		const pressKeyBranch = SRC.match(/pressKeyTool[\s\S]*?Activate target app[\s\S]{0,900}/);
 		assert(pressKeyBranch, 'could not locate pressKeyTool app-activation branch');
-		assert.match(pressKeyBranch[0], /activateAppPlan\(app/);
+		assert.match(pressKeyBranch[0], /activateOnlyPlan\(app/);
 		assert.doesNotMatch(pressKeyBranch[0], /osascript/);
 	});
 

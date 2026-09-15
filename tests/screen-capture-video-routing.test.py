@@ -32,6 +32,7 @@ def load_module():
     mod = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(mod)
+    mod.IS_DARWIN = True  # these fixtures mock the macOS backend; CI runs on ubuntu
     return mod
 
 

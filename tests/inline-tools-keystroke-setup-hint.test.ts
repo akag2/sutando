@@ -58,9 +58,20 @@ describe('the keystroke tools route their failures through it', () => {
 		assert.doesNotMatch(SRC, /error: `Type failed:/);
 	});
 
-	it('all four failure sites call keystrokeOutcome', () => {
-		const calls = SRC.match(/return keystrokeOutcome\(/g) ?? [];
-		assert.equal(calls.length, 4,
-			`expected 4 routed failure sites (2 press_key, 2 type_text), got ${calls.length}`);
+	it('every keystroke failure site routes through keystrokeOutcome with its tool prefix', () => {
+		// One press_key site (the key-code/keystroke split now lives in the
+		// platform backend, so there is a single send) and both type_text
+		// branches (paste, type). Pinned by prefix so a site cannot silently
+		// start returning a bare string — counting branches pinned the
+		// implementation shape, not the behaviour.
+		const pressKey = SRC.match(/export const pressKeyTool[\s\S]*?\n};\n/)?.[0] ?? '';
+		const typeText = SRC.match(/export const typeTextTool[\s\S]*?\n};\n/)?.[0] ?? '';
+		assert.match(pressKey, /return keystrokeOutcome\('press_key'/);
+		assert.match(typeText, /return keystrokeOutcome\('Paste'/);
+		assert.match(typeText, /return keystrokeOutcome\('Type'/);
+		for (const [name, body] of [['pressKeyTool', pressKey], ['typeTextTool', typeText]] as const) {
+			assert.ok(body.length > 0, `could not locate ${name}`);
+			assert.doesNotMatch(body, /return \{ error: `(press_key|Paste|Type)/, `${name} formats its own keystroke error`);
+		}
 	});
 });

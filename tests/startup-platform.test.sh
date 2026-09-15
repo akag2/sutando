@@ -21,9 +21,24 @@ lacks(){ if printf '%s' "$2" | grep -qF -- "$3"; then bad "$1" "unexpected [$3] 
 
 mkfake() { printf '#!/bin/sh\n%s\n' "$2" > "$1"; chmod +x "$1"; }
 
+
+# Isolated command inventory: the fakes, plus symlinks to the handful of
+# coreutils the helpers legitimately use. Nothing else from the host — a Linux
+# runner with ImageMagick/fswatch/lsof installed must not flip an "absent" case.
+mkcore() {
+  local d="$1"; mkdir -p "$d/core"
+  local t
+  for t in wc tr rm dirname head cat grep sed seq sleep pgrep; do
+    local src; src="$(command -v "$t" 2>/dev/null)" || continue
+    ln -sf "$src" "$d/core/$t"
+  done
+  printf '%s' "$d/core"
+}
+CORE="$(mkcore "$(mktemp -d)")"
+
 # $1 OSTYPE, $2 fake bin dir, $3 DISPLAY, $4 snippet → stdout
 run() {
-  OSTYPE="$1" PATH="$2:/usr/bin:/bin" DISPLAY="$3" WAYLAND_DISPLAY="" TMPDIR="$2" \
+  OSTYPE="$1" PATH="$2:$CORE" DISPLAY="$3" WAYLAND_DISPLAY="" TMPDIR="$2" \
     /bin/bash -c ". '$REPO/scripts/platform.sh'; . '$REPO/src/startup-platform.sh'; $4" 2>&1
 }
 
@@ -97,6 +112,6 @@ out=$(run darwin25 "$dno" "" 'startup_fswatch_check; echo rc=$?')
 has   "darwin, no fswatch, no brew → rc 1"         "$out" "rc=1"
 has   "darwin hint is brew"                        "$out" "brew install fswatch"
 
-rm -rf "$lab" "$dlab" "$nof" "$dno"
+rm -rf "$lab" "$dlab" "$nof" "$dno" "$(dirname "$CORE")"
 echo "Summary: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

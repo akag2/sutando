@@ -15,17 +15,27 @@ import assert from 'node:assert/strict';
 
 import { classifyPlatform, hasDisplay, unsupportedPlatformMessage } from '../src/platform.js';
 import {
+	activateAppByTitlePlan,
 	activateAppPlan,
+	activateOnlyPlan,
 	appleScriptString,
 	clipboardReadPlan,
 	clipboardWritePlan,
+	collapseSelectionRightPlan,
+	hasCommand,
 	linuxKeySpec,
 	linuxModifier,
 	notifyPlan,
 	openPathPlan,
+	pastePlan,
 	pressKeyPlan,
+	resetCommandCacheForTests,
+	runOpen,
+	runPlan,
+	selectAllPlan,
 	typeTextPlan,
 	volumePlan,
+	xdotoolWindowPattern,
 } from '../src/platform-desktop.js';
 
 const NO_TOOLS = { PATH: '/nonexistent' } as NodeJS.ProcessEnv;
@@ -77,10 +87,20 @@ describe('activate app', () => {
 		assert.ok(!plan.args[1].includes(' ""; do shell script'));
 		assert.match(plan.args[3], /set frontmost of process ".*" to true$/);
 	});
-	it('linux: xdotool search by class, activate the newest match', () => {
+	it('linux: xdotool search by class, regex-escaped and anchored, first match activated', () => {
 		const plan = activateAppPlan('chromium', 'chromium', 'linux');
 		assert.equal(plan.cmd, 'xdotool');
-		assert.deepEqual(plan.args, ['search', '--onlyvisible', '--class', 'chromium', 'windowactivate', '--sync', '%@']);
+		assert.deepEqual(plan.args, ['search', '--onlyvisible', '--class', '^chromium', 'windowactivate', '--sync', '%1']);
+		// A name is a literal, never a regex or an option: `c++` and `-foo` are inert.
+		assert.equal(xdotoolWindowPattern('c++'), '^c\\+\\+');
+		assert.equal(xdotoolWindowPattern('-foo.bar'), '^-foo\\.bar');
+		assert.ok(!activateAppByTitlePlan('-x').args.some(a => a === '-x'));
+	});
+	it('press_key activation is the single darwin `activate` line at 3s — never the frontmost set', () => {
+		assert.deepEqual(activateOnlyPlan('Slack', 'darwin'), {
+			cmd: 'osascript', args: ['-e', 'tell application "Slack" to activate'], timeout: 3_000,
+		});
+		assert.equal(activateOnlyPlan('slack', 'linux').timeout, 3_000);
 	});
 });
 
@@ -102,6 +122,27 @@ describe('press key', () => {
 	});
 });
 
+describe('type_text paste chords keep the pre-port darwin argv and timeouts', () => {
+	// Independent expected strings (typed by hand from the parent commit's
+	// inline-tools.ts), NOT built with appleScriptString — so a change to the
+	// escape helper cannot rewrite the expectation along with the plan.
+	it('select-all / collapse-right / paste are the character-based chords, 3s/3s/5s', () => {
+		assert.deepEqual(selectAllPlan('darwin'), { cmd: 'osascript', args: ['-e', 'tell application "System Events" to keystroke "a" using command down'], timeout: 3_000 });
+		assert.deepEqual(collapseSelectionRightPlan('darwin'), { cmd: 'osascript', args: ['-e', 'tell application "System Events" to key code 124'], timeout: 3_000 });
+		assert.deepEqual(pastePlan('darwin'), { cmd: 'osascript', args: ['-e', 'tell application "System Events" to keystroke "v" using command down'], timeout: 5_000 });
+	});
+	it('the paste branch clipboard calls keep their 2s bound; the clipboard tool its 5s', () => {
+		assert.equal(clipboardReadPlan('darwin', NO_TOOLS, 2_000).timeout, 2_000);
+		assert.equal(clipboardWritePlan('x', 'darwin', NO_TOOLS, 2_000).timeout, 2_000);
+		assert.equal(clipboardReadPlan('darwin', NO_TOOLS).timeout, 5_000);
+	});
+	it('linux: ctrl+a / Right / ctrl+v', () => {
+		assert.deepEqual(selectAllPlan('linux').args, ['key', '--clearmodifiers', 'ctrl+a']);
+		assert.deepEqual(collapseSelectionRightPlan('linux').args, ['key', '--clearmodifiers', 'Right']);
+		assert.deepEqual(pastePlan('linux').args, ['key', '--clearmodifiers', 'ctrl+v']);
+	});
+});
+
 describe('type text', () => {
 	it('darwin: keystroke with AppleScript escaping', () => {
 		assert.deepEqual(typeTextPlan('say "hi"', 'darwin').args, ['-e', 'tell application "System Events" to keystroke "say \\"hi\\""']);
@@ -116,12 +157,39 @@ describe('clipboard', () => {
 		assert.deepEqual(clipboardReadPlan('darwin', NO_TOOLS), { cmd: 'pbpaste', args: [], timeout: 5_000 });
 		assert.deepEqual(clipboardWritePlan('🤖', 'darwin', NO_TOOLS), { cmd: 'pbcopy', args: [], input: '🤖', timeout: 5_000 });
 	});
-	it('linux: xsel when xclip is absent; text still via stdin, never argv', () => {
+	it('linux: xsel when xclip is absent; text still via stdin, never argv; writers are quiet', () => {
 		const w = clipboardWritePlan('secret', 'linux', NO_TOOLS);
 		assert.equal(w.cmd, 'xsel');
 		assert.equal(w.input, 'secret');
 		assert.ok(!w.args.includes('secret'));
+		assert.equal(w.quietOutput, true);
 		assert.equal(clipboardReadPlan('linux', NO_TOOLS).cmd, 'xsel');
+		assert.equal(clipboardReadPlan('linux', NO_TOOLS).quietOutput, undefined, 'a reader must keep stdout');
+	});
+});
+
+describe('runners', () => {
+	it('a quiet writer returns as soon as the writer exits, even if a forked child keeps the pipes', () => {
+		// xclip's shape: the parent exits 0 at once, a background child holds
+		// stdout/stderr open. Without quietOutput this timed out at `timeout`.
+		const t0 = Date.now();
+		runPlan({ cmd: 'sh', args: ['-c', 'cat >/dev/null; sleep 2 & exit 0'], input: 'x', timeout: 1_000, quietOutput: true });
+		assert.ok(Date.now() - t0 < 900, 'quiet writer waited on the daemon');
+		assert.throws(
+			() => runPlan({ cmd: 'sh', args: ['-c', 'sleep 2 & exit 0'], input: 'x', timeout: 150 }),
+			/ETIMEDOUT|timed out/i,
+			'control: the piped form still reproduces the stall',
+		);
+	});
+	it('runOpen rejects on a missing opener instead of raising an unhandled error event', async () => {
+		await assert.rejects(runOpen({ cmd: 'sutando-test-opener-that-does-not-exist', args: ['/tmp/x'] }), /ENOENT/);
+		await runOpen({ cmd: 'sh', args: ['-c', 'exit 0'] }); // a real spawn resolves
+	});
+	it('hasCommand answers per PATH, not per name', () => {
+		resetCommandCacheForTests();
+		assert.equal(hasCommand('sh', { PATH: '/nonexistent' }), false);
+		assert.equal(hasCommand('sh', { PATH: '/bin:/usr/bin' }), true);
+		assert.equal(hasCommand('sh', { PATH: '/nonexistent' }), false);
 	});
 });
 

@@ -31,6 +31,7 @@ spec = importlib.util.spec_from_file_location(
 )
 sc = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(sc)
+sc.IS_DARWIN = True  # these fixtures mock the macOS backend; CI runs on ubuntu
 
 _passed = 0
 _failed = 0

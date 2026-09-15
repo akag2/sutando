@@ -71,8 +71,12 @@ class LinuxSecretTool(unittest.TestCase):
                 vi.get_vault_key("K")
 
     def test_interception_still_redacts_when_store_fails(self):
-        with patch.object(vi.shutil, "which", return_value=None):
-            res = vi.intercept_vault_commands("vault set API_KEY abc123xyz")
+        # Quoted value: the entropy scanner does not gate quoted input, so the
+        # only way this key lands in `failed` is the Linux store refusing.
+        with patch.object(vi.shutil, "which", return_value=None), \
+                patch.object(vi, "_store_in_keychain", wraps=vi._store_in_keychain) as store:
+            res = vi.intercept_vault_commands('vault set API_KEY "abc123xyz"')
+        store.assert_called_once()
         self.assertNotIn("abc123xyz", res.text)
         self.assertIn("API_KEY", res.failed)
 

@@ -22,6 +22,7 @@ python3 src/health-check.py   # service-level health once running
 | `python3` | `brew install python3` | `src/startup.sh:481` |
 | Authenticated `claude` **or** `codex` CLI | whichever `core.runtime` names | `src/startup.sh` selected-core preflight |
 | `fswatch` | `brew install fswatch` (auto-installed via Homebrew on macOS) / `apt-get install fswatch` | `src/startup.sh:494,497` |
+| `lsof` | ships with macOS / `apt-get install lsof` (every port guard in startup.sh) | `src/startup.sh` prerequisite block |
 
 That is the whole hard gate. Nothing else stops a boot.
 

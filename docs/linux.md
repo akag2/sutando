@@ -5,27 +5,33 @@ one on a cloud VM. This page is the Linux counterpart of the macOS quick start
 in `README.md`: what is supported, what is not, how to install, and how the
 macOS-only pieces degrade.
 
-Tested on Debian 12 (bookworm) with XFCE on Xvfb (GCE `e2-standard-4`).
+Tested on Debian 12 (bookworm) with XFCE on Xvfb (GCE `e2-standard-4`); see the
+status legend below for what "tested" covers per surface.
 Ubuntu 22.04+ should behave the same; other distros only change the install
 hints (`scripts/platform.sh` maps package names).
 
 ## What works
 
+Status legend — **verified**: exercised on the Debian 12 test VM; **implemented**:
+has a Linux code path and unit tests for the commands it builds, not yet exercised
+live. Treat "implemented" rows as beta until someone reports them working.
+
 | Surface | Linux status | Backend |
 |---|---|---|
-| Core agent (Claude Code / Codex CLI in tmux) | ✅ | unchanged — `src/agent/start-cli.sh` |
-| Task watcher (`tasks/` → core) | ✅ | `fswatch` (inotify backend, apt package) |
-| Dashboard `:7844`, agent API `:7843`, web client `:8080` | ✅ | unchanged (Python / Node) |
-| Browser voice (Gemini Live) | ✅ with `GEMINI_API_KEY` | unchanged |
-| Screen capture `:7845` (screenshots, vision) | ✅ needs `$DISPLAY` | `scrot` / ImageMagick `import`; resize via `mogrify` |
-| Screen recording (`/capture-video`) | ✅ needs `$DISPLAY` + ffmpeg | `ffmpeg -f x11grab` (+ PulseAudio) → `.mp4` |
-| Inline tools: `press_key`, `type_text`, `switch_app` | ✅ | `xdotool` |
-| Inline tools: `clipboard` | ✅ | `xclip` (or `xsel`) |
-| Inline tools: `open_file`, dashboard auto-open | ✅ | `xdg-open` |
-| Inline tools: `volume` | ✅ | `pactl` (or `amixer`) |
-| Telegram / Discord / Slack bridges | ✅ | unchanged; run directly (no launchd) |
-| Vault (`vault set KEY VALUE`) | ✅ with `secret-tool` + a Secret Service | libsecret; refuses loudly when absent |
-| Phone (Twilio + ngrok) | ✅ | unchanged |
+| Boot (`startup.sh`), dashboard `:7844`, agent API `:7843`, web client `:8080` | verified | unchanged (Python / Node) |
+| Core agent session (Claude Code in tmux) | verified up to Claude's login prompt; task round trip after `claude login` **not yet witnessed** | unchanged — `src/agent/start-cli.sh` |
+| Task watcher (`tasks/` → core) | implemented (fswatch's inotify backend maps create + move-in to `Created`) | `fswatch` |
+| Screen capture `:7845` — still frames, `/displays`, downscale | verified | `scrot` / ImageMagick `import`; resize via `mogrify` |
+| Screen recording (`/capture-video`) | implemented — start/stop + decode not exercised live | `ffmpeg -f x11grab` (+ PulseAudio only when `pactl info` answers) → `.mp4` |
+| `press_key`, `type_text`, `switch_app` | implemented | `xdotool` |
+| `clipboard` | implemented | `xclip` (or `xsel`) |
+| `open_file`, dashboard auto-open | implemented | `xdg-open` (a missing opener is reported to the caller, never crashes the service) |
+| `volume` | implemented | `pactl` (or `amixer`) |
+| Browser voice (Gemini Live) | implemented — needs `GEMINI_API_KEY`; not exercised on Linux | unchanged |
+| Telegram / Discord / Slack bridges | implemented — run directly, no supervisor | unchanged |
+| Credential proxy `:7846` (quota tracking) | verified to read the Linux credential file; token injection needs a logged-in CLI | `<CLAUDE_CONFIG_DIR>/.credentials.json` |
+| Vault (`vault set KEY VALUE`) | implemented — needs `secret-tool` + a Secret Service; refuses loudly otherwise | libsecret |
+| Phone (Twilio + ngrok) | implemented | unchanged |
 
 ## What does not work on Linux (yet)
 
@@ -34,7 +40,7 @@ crashing the service:
 
 - **Menu-bar app** (`--with-app`, `scripts/install-menu-bar-app.sh`) — Swift/AppKit. The installer exits 0 with "macOS only".
 - **launchd supervision** of voice-agent, web-client, bridges, credential proxy — services are started directly by `startup.sh`; nothing restarts them on crash. Use the systemd units from `scripts/linux/install-headless-desktop.sh` as a template if you need supervision.
-- **Chrome AppleScript tools** in `src/browser-tools.ts` (tab switching, JS-driven scroll, the slide deck controls) — `osascript` is not available. The Playwright-driven `open_url` path still works.
+- **Browser control tools** in `src/browser-tools.ts` — `open_url`, `switch_tab`, `close_tab`, `scroll`, `click`, `describe_screen` and the slide-deck controls all drive Google Chrome through AppleScript. None of them work on Linux yet; they return the `osascript` spawn error. (Use the voice/web UI's own browser, or `open_file` on an `.html`/URL via `xdg-open`.)
 - **Zoom / Google Meet joining** (`skills/zoom`, `src/meeting-tools.ts`) — drives the macOS Zoom app.
 - **Calendar, Reminders, Contacts, iMessage, Notes** recipes in `docs/built-in-tools.md` — AppleScript / EventKit.
 - **Multi-display** — one X screen per `$DISPLAY`; `display=N` selectors all resolve to it.
@@ -76,6 +82,13 @@ That installs four systemd units for your user — `Xvfb :99`, an XFCE session o
 it, `x11vnc` on `127.0.0.1:5900` and noVNC on `127.0.0.1:6080` — and adds
 `export DISPLAY=:99` to your `~/.profile`. VNC binds loopback only and has no
 password: the SSH (or cloud IAP) tunnel is the authentication.
+
+**Trust boundary.** This installer assumes a single-user host you administer
+(a personal VM). Xvfb runs with `-ac` and x11vnc without a password, so any
+local process or account on the machine can see and drive the desktop — the
+same access the Sutando core itself has. Do not use it on a shared host; there
+you want an authenticated VNC (`x11vnc -rfbauth`), an Xauthority-protected
+display, and a dedicated account.
 
 ```bash
 # from your laptop

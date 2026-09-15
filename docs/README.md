@@ -16,6 +16,8 @@ Machine-readable ownership and lifecycle metadata lives in
 - [Use built-in tools](built-in-tools.md) — authoritative capability catalog.
 - [External runtime dependencies](runtime-dependencies.md) — what must be
   installed, what only a feature needs, and what to vendor when embedding.
+- [Sutando on Linux](linux.md) — Debian/Ubuntu install, what works on an
+  X11 desktop, the headless virtual-desktop installer, what stays macOS-only.
 
 ## Agent instruction detail (relocated from CLAUDE.md, 2026-08-17 context diet)
 

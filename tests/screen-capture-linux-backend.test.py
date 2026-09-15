@@ -70,16 +70,25 @@ class LinuxBackend(unittest.TestCase):
             self.assertFalse(self.m._downscale_frame("/t/a.jpg", 1280, 60))
 
     def test_record_argv_is_x11grab_until_sigint(self):
-        with patch.dict(os.environ, {"DISPLAY": ":99"}), patch.object(self.m.shutil, "which", return_value=None):
-            cmd = self.m.linux_record_cmd("/t/c.mp4", audio=True)
+        with patch.dict(os.environ, {"DISPLAY": ":99"}):
+            cmd = self.m.linux_record_cmd("/t/c.mp4", audio=True, pulse_ok=False)
         self.assertEqual(cmd[:2], ["ffmpeg", "-loglevel"])
         self.assertIn("x11grab", cmd)
         self.assertEqual(cmd[cmd.index("-i") + 1], ":99")
-        self.assertNotIn("pulse", cmd)          # no pactl → no audio input
+        self.assertNotIn("pulse", cmd)          # no audio server → silent capture, not a broken argv
         self.assertEqual(cmd[-1], "/t/c.mp4")
-        with patch.object(self.m.shutil, "which", return_value="/usr/bin/pactl"):
-            self.assertIn("pulse", self.m.linux_record_cmd("/t/c.mp4", audio=True, display=":1"))
-            self.assertNotIn("pulse", self.m.linux_record_cmd("/t/c.mp4", audio=False, display=":1"))
+        self.assertIn("pulse", self.m.linux_record_cmd("/t/c.mp4", audio=True, display=":1", pulse_ok=True))
+        self.assertNotIn("pulse", self.m.linux_record_cmd("/t/c.mp4", audio=False, display=":1", pulse_ok=True))
+
+    def test_pulse_probe_asks_the_server_not_the_binary(self):
+        with patch.object(self.m.shutil, "which", return_value=None):
+            self.assertFalse(self.m.linux_pulse_available())
+        with patch.object(self.m.shutil, "which", return_value="/usr/bin/pactl"), \
+                patch.object(self.m.subprocess, "run", return_value=type("R", (), {"returncode": 1})()):
+            self.assertFalse(self.m.linux_pulse_available(), "pactl present but no server → no audio")
+        with patch.object(self.m.shutil, "which", return_value="/usr/bin/pactl"), \
+                patch.object(self.m.subprocess, "run", return_value=type("R", (), {"returncode": 0})()):
+            self.assertTrue(self.m.linux_pulse_available())
 
     def test_list_displays_is_the_single_x_screen(self):
         with patch.dict(os.environ, {"DISPLAY": ":99"}), \

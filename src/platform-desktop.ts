@@ -4,22 +4,37 @@
  *
  * Every tool in inline-tools.ts used to spawn the macOS binary directly
  * (osascript / open / pbcopy / pbpaste). This module owns that choice per
- * platform: darwin keeps the exact commands it always ran; linux routes the
- * same operations through xdg-open, xdotool, xclip (or xsel) and pactl (or
- * amixer) against the session's $DISPLAY — a real desktop or an Xvfb virtual
- * one. The tools stay platform-blind.
+ * platform: darwin keeps the exact commands AND timeouts each caller ran
+ * before (they are pinned by tests/platform-desktop.test.ts against the
+ * pre-port argv); linux routes the same operations through xdg-open, xdotool,
+ * xclip (or xsel) and pactl (or amixer) against the session's $DISPLAY — a
+ * real desktop or an Xvfb virtual one. The tools stay platform-blind.
  *
- * Split into PLANS and RUNNERS. A plan is a pure `{ cmd, args, input? }` for
- * one platform, so the exact argv is testable on any host; a runner executes
- * a plan with the same execFileSync shape (no shell, argv array) the tools
- * used before. Keystroke plans keep the tools' AppleScript escaping on darwin
- * and pass literal strings on linux, where no interpreter sits in between.
+ * Split into PLANS and RUNNERS. A plan is a pure `{ cmd, args, input?,
+ * timeout? }` for one platform, so the exact argv is testable on any host; a
+ * runner executes a plan with the same execFileSync shape (no shell, argv
+ * array) the tools used before. Keystroke plans keep the tools' AppleScript
+ * escaping on darwin and pass literal strings on linux, where no interpreter
+ * sits in between — but xdotool's window search is a POSIX regex, so app
+ * names are regex-escaped and anchored before they reach it.
  */
 
 import { execFileSync, spawn } from 'node:child_process';
 import { classifyPlatform, type HostPlatform } from './platform.js';
 
-export type Plan = { cmd: string; args: string[]; input?: string; timeout?: number };
+export type Plan = {
+	cmd: string;
+	args: string[];
+	input?: string;
+	timeout?: number;
+	/**
+	 * Discard the child's stdout/stderr instead of piping them. Required for a
+	 * clipboard writer such as xclip, which forks a daemon that keeps the
+	 * selection and inherits the pipes: a synchronous caller waiting on those
+	 * pipes would block until its timeout although the write already succeeded.
+	 */
+	quietOutput?: boolean;
+};
 
 export type Modifier = 'command' | 'shift' | 'control' | 'option';
 
@@ -71,6 +86,15 @@ export function linuxKeySpec(key: string, modifiers: Modifier[] = []): string {
 	return [...modifiers.map(linuxModifier), name].join('+');
 }
 
+/**
+ * `xdotool search` takes a POSIX extended regex (case-insensitive). An app
+ * name is a literal: escape every metacharacter and anchor at the start, so
+ * `c++` cannot become a quantifier and `-foo` cannot become an option.
+ */
+export function xdotoolWindowPattern(app: string): string {
+	return '^' + app.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
+}
+
 // --- plans -------------------------------------------------------------------
 
 export function openPathPlan(path: string, app: string | undefined, platform: HostPlatform): Plan {
@@ -81,6 +105,11 @@ export function openPathPlan(path: string, app: string | undefined, platform: Ho
 	return app ? { cmd: app, args: [path] } : { cmd: 'xdg-open', args: [path] };
 }
 
+/**
+ * Bring an app to the front. darwin: `activate` plus the System Events
+ * frontmost set — the switch_app sequence, 10s. linux: first visible window
+ * whose WM_CLASS starts with the name.
+ */
 export function activateAppPlan(app: string, processName: string, platform: HostPlatform): Plan {
 	if (platform === 'darwin') {
 		return {
@@ -92,13 +121,24 @@ export function activateAppPlan(app: string, processName: string, platform: Host
 			timeout: 10_000,
 		};
 	}
-	// Match the WM_CLASS first (stable, e.g. "chromium"), most-recent window wins.
-	return { cmd: 'xdotool', args: ['search', '--onlyvisible', '--class', app, 'windowactivate', '--sync', '%@'], timeout: 10_000 };
+	return { cmd: 'xdotool', args: ['search', '--onlyvisible', '--class', xdotoolWindowPattern(app), 'windowactivate', '--sync', '%1'], timeout: 10_000 };
+}
+
+/**
+ * Activation ONLY — the press_key(app=…) pre-step. darwin: the single
+ * `activate` line with its original 3s bound, no frontmost set (that was
+ * switch_app's sequence, never press_key's). linux: same window search.
+ */
+export function activateOnlyPlan(app: string, platform: HostPlatform): Plan {
+	if (platform === 'darwin') {
+		return { cmd: 'osascript', args: ['-e', `tell application "${appleScriptString(app)}" to activate`], timeout: 3_000 };
+	}
+	return { cmd: 'xdotool', args: ['search', '--onlyvisible', '--class', xdotoolWindowPattern(app), 'windowactivate', '--sync', '%1'], timeout: 3_000 };
 }
 
 /** Second-chance activation by window title, for apps whose class differs from their name. */
-export function activateAppByTitlePlan(app: string): Plan {
-	return { cmd: 'xdotool', args: ['search', '--onlyvisible', '--name', app, 'windowactivate', '--sync', '%@'], timeout: 10_000 };
+export function activateAppByTitlePlan(app: string, timeout = 10_000): Plan {
+	return { cmd: 'xdotool', args: ['search', '--onlyvisible', '--name', xdotoolWindowPattern(app), 'windowactivate', '--sync', '%1'], timeout };
 }
 
 export function pressKeyPlan(key: string, modifiers: Modifier[], platform: HostPlatform): Plan {
@@ -113,6 +153,36 @@ export function pressKeyPlan(key: string, modifiers: Modifier[], platform: HostP
 	return { cmd: 'xdotool', args: ['key', '--clearmodifiers', linuxKeySpec(key, modifiers)], timeout: 3_000 };
 }
 
+// The three fixed key chords type_text has always sent around a paste. On
+// darwin these are the CHARACTER-based AppleScript forms the tool used
+// before the port (`keystroke "a" using command down`, not `key code 0`),
+// with their original per-call timeouts — a key-code form would depend on
+// the physical layout, the character form does not.
+
+/** Select all (Cmd+A / Ctrl+A). */
+export function selectAllPlan(platform: HostPlatform): Plan {
+	if (platform === 'darwin') {
+		return { cmd: 'osascript', args: ['-e', 'tell application "System Events" to keystroke "a" using command down'], timeout: 3_000 };
+	}
+	return { cmd: 'xdotool', args: ['key', '--clearmodifiers', 'ctrl+a'], timeout: 3_000 };
+}
+
+/** Collapse the selection to its end (Right arrow). */
+export function collapseSelectionRightPlan(platform: HostPlatform): Plan {
+	if (platform === 'darwin') {
+		return { cmd: 'osascript', args: ['-e', 'tell application "System Events" to key code 124'], timeout: 3_000 };
+	}
+	return { cmd: 'xdotool', args: ['key', '--clearmodifiers', 'Right'], timeout: 3_000 };
+}
+
+/** Paste (Cmd+V / Ctrl+V). */
+export function pastePlan(platform: HostPlatform): Plan {
+	if (platform === 'darwin') {
+		return { cmd: 'osascript', args: ['-e', 'tell application "System Events" to keystroke "v" using command down'], timeout: 5_000 };
+	}
+	return { cmd: 'xdotool', args: ['key', '--clearmodifiers', 'ctrl+v'], timeout: 5_000 };
+}
+
 /** Type a short single-line string at the caret. */
 export function typeTextPlan(text: string, platform: HostPlatform): Plan {
 	if (platform === 'darwin') {
@@ -122,18 +192,21 @@ export function typeTextPlan(text: string, platform: HostPlatform): Plan {
 	return { cmd: 'xdotool', args: ['type', '--clearmodifiers', '--delay', '12', '--', text], timeout: 15_000 };
 }
 
-export function clipboardReadPlan(platform: HostPlatform, env: NodeJS.ProcessEnv = process.env): Plan {
-	if (platform === 'darwin') return { cmd: 'pbpaste', args: [], timeout: 5_000 };
+/** `timeout` is per caller: the clipboard tool uses 5s, the paste branch of type_text 2s (unchanged). */
+export function clipboardReadPlan(platform: HostPlatform, env: NodeJS.ProcessEnv = process.env, timeout = 5_000): Plan {
+	if (platform === 'darwin') return { cmd: 'pbpaste', args: [], timeout };
 	return hasCommand('xclip', env)
-		? { cmd: 'xclip', args: ['-o', '-selection', 'clipboard'], timeout: 5_000 }
-		: { cmd: 'xsel', args: ['--output', '--clipboard'], timeout: 5_000 };
+		? { cmd: 'xclip', args: ['-o', '-selection', 'clipboard'], timeout }
+		: { cmd: 'xsel', args: ['--output', '--clipboard'], timeout };
 }
 
-export function clipboardWritePlan(text: string, platform: HostPlatform, env: NodeJS.ProcessEnv = process.env): Plan {
-	if (platform === 'darwin') return { cmd: 'pbcopy', args: [], input: text, timeout: 5_000 };
+export function clipboardWritePlan(text: string, platform: HostPlatform, env: NodeJS.ProcessEnv = process.env, timeout = 5_000): Plan {
+	if (platform === 'darwin') return { cmd: 'pbcopy', args: [], input: text, timeout };
+	// quietOutput: both writers fork a selection-owner daemon that inherits
+	// stdout/stderr; piping those would stall the caller (see Plan).
 	return hasCommand('xclip', env)
-		? { cmd: 'xclip', args: ['-i', '-selection', 'clipboard'], input: text, timeout: 5_000 }
-		: { cmd: 'xsel', args: ['--input', '--clipboard'], input: text, timeout: 5_000 };
+		? { cmd: 'xclip', args: ['-i', '-selection', 'clipboard'], input: text, timeout, quietOutput: true }
+		: { cmd: 'xsel', args: ['--input', '--clipboard'], input: text, timeout, quietOutput: true };
 }
 
 export function volumePlan(
@@ -167,10 +240,14 @@ export function notifyPlan(title: string, message: string, platform: HostPlatfor
 
 // --- runners -----------------------------------------------------------------
 
-/** PATH lookup without spawning — cached per process, cleared for tests. */
+/**
+ * PATH lookup without spawning a shell per call — cached per (PATH, command)
+ * so a different PATH is a different answer. Cleared for tests.
+ */
 const _cmdCache = new Map<string, boolean>();
 export function hasCommand(cmd: string, env: NodeJS.ProcessEnv = process.env): boolean {
-	const cached = _cmdCache.get(cmd);
+	const key = `${env.PATH ?? ''}\0${cmd}`;
+	const cached = _cmdCache.get(key);
 	if (cached !== undefined) return cached;
 	let found: boolean;
 	try {
@@ -180,29 +257,41 @@ export function hasCommand(cmd: string, env: NodeJS.ProcessEnv = process.env): b
 	} catch {
 		found = false;
 	}
-	_cmdCache.set(cmd, found);
+	_cmdCache.set(key, found);
 	return found;
 }
 export function resetCommandCacheForTests(): void { _cmdCache.clear(); }
 
 export function runPlan(plan: Plan, extraEnv?: NodeJS.ProcessEnv): string {
+	const hasInput = plan.input !== undefined;
 	return execFileSync(plan.cmd, plan.args, {
 		encoding: 'utf-8',
 		timeout: plan.timeout ?? 5_000,
-		...(plan.input !== undefined ? { input: plan.input } : {}),
+		...(hasInput ? { input: plan.input } : {}),
+		// stdout must stay piped when the caller reads it (clipboard read); a
+		// quiet writer discards both output streams so a forked daemon that
+		// inherits them cannot hold the call open.
+		...(plan.quietOutput ? { stdio: [hasInput ? 'pipe' : 'ignore', 'ignore', 'ignore'] as const } : {}),
 		...(extraEnv ? { env: { ...process.env, ...extraEnv } } : {}),
 	});
 }
 
 /**
- * Open and forget: `xdg-open` may hand off to a browser that inherits our
- * stdio and never exits, so on linux the child is detached. `open` on darwin
- * returns as soon as LaunchServices accepts the request, as before.
+ * Open and forget. darwin: `open` returns as soon as LaunchServices accepts
+ * the request, as before. linux: `xdg-open` may hand off to a browser that
+ * inherits our stdio and never exits, so the child is detached — but a
+ * missing opener (`xdg-open` absent, or an `app` that is a macOS name, not a
+ * Linux executable) must surface to the caller as a rejection, not as an
+ * unhandled 'error' event that takes the voice/phone process down. Resolves
+ * once the child has actually been spawned.
  */
-export function runOpen(plan: Plan): void {
-	if (plan.cmd === 'open') { runPlan(plan); return; }
-	const child = spawn(plan.cmd, plan.args, { detached: true, stdio: 'ignore' });
-	child.unref();
+export function runOpen(plan: Plan): Promise<void> {
+	if (plan.cmd === 'open') { runPlan(plan); return Promise.resolve(); }
+	return new Promise<void>((resolve, reject) => {
+		const child = spawn(plan.cmd, plan.args, { detached: true, stdio: 'ignore' });
+		child.once('error', reject);
+		child.once('spawn', () => { child.unref(); resolve(); });
+	});
 }
 
 export const currentPlatform = (): HostPlatform => classifyPlatform();

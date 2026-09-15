@@ -28,6 +28,7 @@ def load():
     spec = importlib.util.spec_from_file_location("scs_under_test", MOD)
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
+    m.IS_DARWIN = True  # these fixtures mock the macOS backend; CI runs on ubuntu
     return m
 
 

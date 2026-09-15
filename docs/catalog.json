@@ -238,6 +238,17 @@
    "canonical_for": "remote gateway wire protocol",
    "last_verified": "2026-09-04"
   },
+  "docs/linux.md": {
+   "title": "Sutando on Linux (Debian / Ubuntu)",
+   "audience": [
+     "users",
+     "operators",
+     "contributors"
+   ],
+   "status": "active",
+   "canonical_for": "Linux host support: install, per-surface status and backends, headless virtual desktop, macOS-only surfaces",
+   "last_verified": "2026-09-15"
+  },
   "docs/runtime-dependencies.md": {
    "title": "External runtime dependencies",
    "audience": [

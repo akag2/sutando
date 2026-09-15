@@ -28,6 +28,7 @@ try:
     spec.loader.exec_module(scs)
 except SystemExit:
     pass
+scs.IS_DARWIN = True  # these fixtures mock the macOS backend; CI runs on ubuntu
 
 failures = []
 

@@ -62,11 +62,22 @@ def linux_downscale_cmd(path: str, maxdim: "int | None", quality: "int | None") 
     return cmd
 
 
-def linux_record_cmd(path: str, audio: bool, display: "str | None" = None) -> list:
-    """ffmpeg x11grab argv recording $DISPLAY until SIGINT; audio via PulseAudio."""
+def linux_pulse_available() -> bool:
+    """True only when a PulseAudio/PipeWire server answers — the client binary alone proves nothing."""
+    if not shutil.which("pactl"):
+        return False
+    try:
+        return subprocess.run(["pactl", "info"], capture_output=True, timeout=2).returncode == 0
+    except Exception:
+        return False
+
+
+def linux_record_cmd(path: str, audio: bool, display: "str | None" = None,
+                     pulse_ok: "bool | None" = None) -> list:
+    """ffmpeg x11grab argv recording $DISPLAY until SIGINT; audio via PulseAudio when a server answers."""
     disp = display or os.environ.get("DISPLAY", ":0")
     cmd = ["ffmpeg", "-loglevel", "error", "-y", "-f", "x11grab", "-framerate", "15", "-i", disp]
-    if audio and shutil.which("pactl"):
+    if audio and (linux_pulse_available() if pulse_ok is None else pulse_ok):
         cmd += ["-f", "pulse", "-i", "default"]
     cmd += ["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", path]
     return cmd

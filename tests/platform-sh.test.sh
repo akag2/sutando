@@ -15,9 +15,24 @@ ok()   { printf "  ok   %s\n" "$1"; pass=$((pass+1)); }
 bad()  { printf "  FAIL %s — %s\n" "$1" "${2:-}"; fail=$((fail+1)); }
 check(){ if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "expected [$3], got [$2]"; fi; }
 
+
+# Isolated command inventory: the fakes, plus symlinks to the handful of
+# coreutils the helpers legitimately use. Nothing else from the host — a Linux
+# runner with ImageMagick/fswatch/lsof installed must not flip an "absent" case.
+mkcore() {
+  local d="$1"; mkdir -p "$d/core"
+  local t
+  for t in wc tr rm dirname head cat grep sed seq sleep pgrep; do
+    local src; src="$(command -v "$t" 2>/dev/null)" || continue
+    ln -sf "$src" "$d/core/$t"
+  done
+  printf '%s' "$d/core"
+}
+CORE="$(mkcore "$(mktemp -d)")"
+
 run() { # $1 = OSTYPE, $2 = extra PATH dir (may be empty), $3 = snippet
   local extra="${2:-}"
-  OSTYPE="$1" PATH="${extra:+$extra:}/usr/bin:/bin" DISPLAY="${DISPLAY_OVERRIDE-}" WAYLAND_DISPLAY="" \
+  OSTYPE="$1" PATH="${extra:+$extra:}$CORE" DISPLAY="${DISPLAY_OVERRIDE-}" WAYLAND_DISPLAY="" \
     /bin/bash -c ". '$REPO/scripts/platform.sh'; $3"
 }
 
@@ -46,7 +61,7 @@ case "$(run linux-gnu "$aptlab" 'sutando_install_hint node')" in
 esac
 # No package manager at all → still a sentence, never empty.
 nopm=$(mktemp -d)
-out=$(OSTYPE=linux-gnu PATH="$nopm" /bin/bash -c ". '$REPO/scripts/platform.sh'; sutando_install_hint fswatch")
+out=$(OSTYPE=linux-gnu PATH="$nopm:$CORE" /bin/bash -c ". '$REPO/scripts/platform.sh'; sutando_install_hint fswatch")
 check "linux without a package manager still hints" "$out" "install fswatch with your package manager"
 
 # --- display -----------------------------------------------------------------
@@ -64,6 +79,6 @@ lc=$(mktemp -d); printf '#!/bin/sh\nexit 0\n' > "$lc/launchctl"; chmod +x "$lc/l
 check "launchd never on linux even with a launchctl on PATH" "$(run linux-gnu "$lc" 'sutando_has_launchd && echo yes || echo no')" "no"
 check "launchd on darwin with launchctl" "$(run darwin25 "$lc" 'sutando_has_launchd && echo yes || echo no')" "yes"
 
-rm -rf "$lab" "$aptlab" "$nopm" "$shot" "$lc"
+rm -rf "$lab" "$aptlab" "$nopm" "$shot" "$lc" "$(dirname "$CORE")"
 echo "Summary: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

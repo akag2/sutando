@@ -41,8 +41,9 @@ const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 export { describeScreenTool, clickTool, scrollAndDescribeTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, switchTabTool, closeTabTool, scrollTool, openUrlTool } from './browser-tools.js';
 import { keystrokeOutcome } from './osascript-setup-hint.js';
 import {
-	activateAppByTitlePlan, activateAppPlan, clipboardReadPlan, clipboardWritePlan, currentPlatform,
-	openPathPlan, pressKeyPlan, runOpen, runPlan, typeTextPlan, volumePlan, type Modifier,
+	activateAppByTitlePlan, activateAppPlan, activateOnlyPlan, clipboardReadPlan, clipboardWritePlan,
+	collapseSelectionRightPlan, currentPlatform, openPathPlan, pastePlan, pressKeyPlan, runOpen, runPlan,
+	selectAllPlan, typeTextPlan, volumePlan, type Modifier,
 } from './platform-desktop.js';
 import { describeScreenTool, clickTool, pointAtTool, scrollAndDescribeTool, screenRecordTool, playVideoTool, pauseVideoTool, resumeVideoTool, replayVideoTool, closeVideoTool, switchTabTool, closeTabTool, scrollTool, openUrlTool } from './browser-tools.js';
 
@@ -117,7 +118,7 @@ export const openFileTool: ToolDefinition = {
 			// Platform backend: `open [-a app]` on macOS, `xdg-open` (or the named
 			// command) on Linux — see src/platform-desktop.ts.
 			const platform = currentPlatform();
-			runOpen(openPathPlan(filePath, app, platform));
+			await runOpen(openPathPlan(filePath, app, platform));
 			if (fullscreen) {
 				// Brief delay so the just-opened app becomes frontmost before
 				// the keystroke lands. Cmd+Ctrl+F is the macOS native-fullscreen
@@ -203,8 +204,16 @@ export const pressKeyTool: ToolDefinition = {
 		// (arbitrary code execution from a tool-call argument). xdotool takes the
 		// name as a literal argv entry, so no escaping layer exists on linux.
 		if (app) {
+			// Activation only (the darwin plan is the single `activate` line with
+			// its original 3s bound; switch_app's frontmost-set is not part of
+			// press_key). Failure is non-fatal, as before — the key is still sent.
 			try {
-				runPlan(activateAppPlan(app, PROCESS_NAMES[app] ?? app, platform));
+				try {
+					runPlan(activateOnlyPlan(app, platform));
+				} catch (err) {
+					if (platform !== 'linux') throw err;
+					runPlan(activateAppByTitlePlan(app, 3_000));
+				}
 				await new Promise(r => setTimeout(r, 300));
 			} catch {}
 		}
@@ -236,6 +245,19 @@ const APP_ALIASES: Record<string, string> = {
 	'terminal': 'Terminal', 'finder': 'Finder',
 	'slack': 'Slack', 'discord': 'Discord',
 };
+// Linux: the spoken name → the WM_CLASS the window actually carries. Anything
+// not listed is matched by name as spoken (xdotool's search is case-insensitive).
+const LINUX_APP_ALIASES: Record<string, string> = {
+	'vs code': 'code', 'vscode': 'code',
+	'chrome': 'chromium', 'google chrome': 'chromium', 'chromium': 'chromium',
+	'terminal': 'xfce4-terminal', 'finder': 'thunar', 'files': 'thunar',
+	'slack': 'slack', 'discord': 'discord',
+};
+function resolveAppAlias(app: string, platform: string): string {
+	const key = app.toLowerCase();
+	if (platform === 'linux') return LINUX_APP_ALIASES[key] ?? app;
+	return APP_ALIASES[key] ?? app;
+}
 
 // System Events process names differ from app bundle names
 const PROCESS_NAMES: Record<string, string> = {
@@ -252,10 +274,10 @@ export const switchAppTool: ToolDefinition = {
 	execution: 'inline',
 	async execute(args) {
 		let { app } = args as { app: string };
-		app = APP_ALIASES[app.toLowerCase()] ?? app;
-		// AppleScript escaping happens inside the darwin plan; the linux plan
-		// hands xdotool the name as a literal argv entry.
 		const platform = currentPlatform();
+		app = resolveAppAlias(app, platform);
+		// AppleScript escaping happens inside the darwin plan; the linux plan
+		// regex-escapes and anchors the name before xdotool sees it.
 		try {
 			try {
 				runPlan(activateAppPlan(app, PROCESS_NAMES[app] ?? app, platform));
@@ -353,25 +375,27 @@ export const typeTextTool: ToolDefinition = {
 				// pbcopy still mangled bytes in launchd context).
 				const utf8Env = { LANG: 'en_US.UTF-8', LC_ALL: 'en_US.UTF-8' };
 				let savedClipboard = '';
-				try { savedClipboard = runPlan(clipboardReadPlan(platform), utf8Env); } catch {}
+				try { savedClipboard = runPlan(clipboardReadPlan(platform, process.env, 2_000), utf8Env); } catch {}
 				// Convert literal \n to actual newlines
 				const pasteText = text.replace(/\\n/g, '\n').replace(/\\t/g, '\t');
-				runPlan(clipboardWritePlan(pasteText, platform), utf8Env);
+				runPlan(clipboardWritePlan(pasteText, platform, process.env, 2_000), utf8Env);
 				// replace_all: emit Cmd+A first so the subsequent Cmd+V replaces the
 				// entire field content (closes the selection-state ambiguity that
 				// 'replace' default had — relied on caller to have selected).
 				// append: collapse selection to its end via Right-arrow before Cmd+V.
 				// at_caret (default): paste at current caret / replace current selection per macOS Cmd+V semantics.
-				// The "command" modifier maps to Ctrl on linux inside the backend.
+				// The darwin plans are the character-based AppleScript chords this
+				// branch always sent (keystroke "a"/"v" using command down, key code
+				// 124), with their original 3s/3s/5s bounds; linux sends Ctrl+A/Right/Ctrl+V.
 				if (mode === 'replace_all') {
-					runPlan(pressKeyPlan('a', ['command'], platform), utf8Env);
+					runPlan(selectAllPlan(platform), utf8Env);
 				} else if (mode === 'append') {
-					runPlan(pressKeyPlan('right', [], platform), utf8Env);
+					runPlan(collapseSelectionRightPlan(platform), utf8Env);
 				}
-				runPlan(pressKeyPlan('v', ['command'], platform), utf8Env);
+				runPlan(pastePlan(platform), utf8Env);
 				execFileSync('sleep', ['0.3']);
 				if (savedClipboard) {
-					runPlan(clipboardWritePlan(savedClipboard, platform), utf8Env);
+					runPlan(clipboardWritePlan(savedClipboard, platform, process.env, 2_000), utf8Env);
 				}
 				console.log(`${ts()} [TypeText] pasted (multi-line, mode=${mode}): ${text.slice(0, 40)}...`);
 				return { status: 'typed', text };
@@ -386,9 +410,9 @@ export const typeTextTool: ToolDefinition = {
 			// append: collapse selection to its end via Right-arrow before typing.
 			// at_caret (default): keystroke at caret / replaces current selection per System Events behavior.
 			if (mode === 'replace_all') {
-				runPlan(pressKeyPlan('a', ['command'], platform));
+				runPlan(selectAllPlan(platform));
 			} else if (mode === 'append') {
-				runPlan(pressKeyPlan('right', [], platform));
+				runPlan(collapseSelectionRightPlan(platform));
 			}
 			runPlan(typeTextPlan(text, platform));
 			console.log(`${ts()} [TypeText] typed (mode=${mode}): ${text.slice(0, 40)}`);

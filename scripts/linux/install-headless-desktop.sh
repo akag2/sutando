@@ -31,6 +31,15 @@ while [ $# -gt 0 ]; do
 	esac
 done
 
+# Both values are interpolated into systemd units and a shell profile: only
+# the shapes X11 accepts (`:N`, `WxH`) may pass.
+case "$DISPLAY_NUM" in :[0-9]|:[0-9][0-9]|:[0-9][0-9][0-9]) ;; *)
+	echo "install-headless-desktop: --display must look like :99 (got '$DISPLAY_NUM')" >&2; exit 2 ;;
+esac
+case "$GEOMETRY" in [0-9]*x[0-9]*) [[ "$GEOMETRY" =~ ^[0-9]{3,5}x[0-9]{3,5}$ ]] || { echo "install-headless-desktop: --geometry must look like 1920x1080" >&2; exit 2; } ;; *)
+	echo "install-headless-desktop: --geometry must look like 1920x1080 (got '$GEOMETRY')" >&2; exit 2 ;;
+esac
+
 if [ "$(id -u)" = 0 ]; then
 	echo "install-headless-desktop: run as the user Sutando will run as (sudo is used internally)" >&2
 	exit 2
@@ -112,13 +121,21 @@ WantedBy=multi-user.target
 UNIT
 
 sudo systemctl daemon-reload
-sudo systemctl enable --now sutando-xvfb sutando-desktop sutando-x11vnc sutando-novnc
+# `restart`, not `enable --now`: a re-run with a new --display/--geometry must
+# take effect on units that are already running, not only on the next boot.
+sudo systemctl enable sutando-xvfb sutando-desktop sutando-x11vnc sutando-novnc
+sudo systemctl restart sutando-xvfb sutando-desktop sutando-x11vnc sutando-novnc
 
 # Make the display the default for this user's shells, so `./start.sh` over
 # SSH finds it without an export each time.
 snippet="$USER_HOME/.profile"
-if ! grep -q 'DISPLAY=.*sutando-headless-desktop' "$snippet" 2>/dev/null; then
-	printf '\nexport DISPLAY="${DISPLAY:-%s}"  # sutando-headless-desktop\nexport BROWSER=chromium\n' "$DISPLAY_NUM" >> "$snippet"
+marker='# sutando-headless-desktop'
+line="export DISPLAY=\"\${DISPLAY:-$DISPLAY_NUM}\"  $marker"
+if grep -qF "$marker" "$snippet" 2>/dev/null; then
+	# Re-run with a different display: rewrite the managed line in place.
+	tmp="$(mktemp)"; grep -vF "$marker" "$snippet" > "$tmp"; printf '%s\n' "$line" >> "$tmp"; mv "$tmp" "$snippet"
+else
+	printf '\n%s\nexport BROWSER=chromium\n' "$line" >> "$snippet"
 fi
 DISPLAY="$DISPLAY_NUM" xdg-mime default chromium.desktop x-scheme-handler/http x-scheme-handler/https text/html 2>/dev/null || true
 
