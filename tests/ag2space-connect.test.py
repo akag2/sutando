@@ -142,40 +142,114 @@ class Flow(unittest.TestCase):
 
 
 class BridgeReplacement(unittest.TestCase):
-    def test_stop_running_bridge_kills_this_checkouts_bridge_and_waits(self):
-        marker = str(REPO / "src" / "remote-gateway-bridge.py")
-        # A stand-in whose argv carries this checkout's bridge path, like a real bare launch.
-        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", marker])
-        try:
-            time.sleep(0.3)
-            self.assertIn(proc.pid, mod.bridge_pids())
-            with patch.object(mod.sys, "platform", "linux"):
-                victims = mod.stop_running_bridge({}, wait_s=5)
-            self.assertIn(proc.pid, victims)
-            self.assertIsNotNone(proc.wait(timeout=5))
-            self.assertNotIn(proc.pid, mod.bridge_pids())
-        finally:
-            if proc.poll() is None:
-                proc.kill()
+    """Every case runs against a TEMPORARY checkout identity and workspace, so a
+    live bridge from the real checkout can never be selected, let alone signaled."""
 
-    def test_wait_for_new_bridge_reports_why_when_nothing_starts(self):
-        with patch.object(mod, "gateway_status_path", return_value=Path(tempfile.mkdtemp()) / "gateway-status.json"), \
-                patch.object(mod, "bridge_pids", return_value=[]):
-            why = mod.wait_for_new_bridge({}, [], time.time(), "https://relay.test/relay", wait_s=1)
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.checkout = self.tmp / "checkout"; (self.checkout / "src").mkdir(parents=True)
+        self.ws = self.tmp / "workspace"; (self.ws / "state" / "locks").mkdir(parents=True)
+        self._repo = mod.REPO
+        mod.REPO = self.checkout
+        self.p_ws = patch.object(mod, "workspace_path", return_value=self.ws); self.p_ws.start()
+        self.procs = []
+
+    def tearDown(self):
+        mod.REPO = self._repo
+        self.p_ws.stop()
+        for pr in self.procs:
+            if pr.poll() is None:
+                pr.kill()
+
+    def _standin(self):
+        marker = str(self.checkout / "src" / "remote-gateway-bridge.py")
+        pr = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", marker])
+        self.procs.append(pr); time.sleep(0.3)
+        return pr
+
+    def _lock(self, pid: int, name="gateway-bridge"):
+        (self.ws / "state" / "locks" / f"{name}.lock").write_text(json.dumps({"role": name, "pid": pid, "host": "h", "workspace": str(self.ws)}))
+
+    def test_stop_targets_only_this_workspaces_primary_lock_holder(self):
+        primary, named_lane = self._standin(), self._standin()
+        self._lock(primary.pid)
+        self._lock(named_lane.pid, "gateway-bridge.dev")   # same argv, different lane
+        with patch.object(mod.sys, "platform", "linux"):
+            out = mod.stop_running_bridge({}, wait_s=5)
+        self.assertEqual(out, {"mode": "bare", "old_pid": primary.pid})
+        self.assertIsNotNone(primary.wait(timeout=5))
+        self.assertIsNone(named_lane.poll(), "a named lane with identical argv must survive")
+
+    def test_stale_or_foreign_lock_is_not_a_kill_target(self):
+        self._lock(999999)                       # no such process
+        with patch.object(mod.sys, "platform", "linux"):
+            self.assertEqual(mod.stop_running_bridge({}, wait_s=1)["mode"], "none")
+        other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", "/elsewhere/src/remote-gateway-bridge.py"])
+        self.procs.append(other); time.sleep(0.3)
+        self._lock(other.pid)                     # lock names a pid that is NOT this checkout's bridge
+        with patch.object(mod.sys, "platform", "linux"):
+            self.assertEqual(mod.stop_running_bridge({}, wait_s=1)["mode"], "none")
+        self.assertIsNone(other.poll())
+
+    def _launchctl_print(self, wrapper: str, ws: str, pid: int) -> str:
+        return (f"gui/501/{mod.LAUNCHD_LABEL} = {{\n\tpid = {pid}\n\targuments = {{\n\t\t/bin/bash\n\t\t{wrapper}\n\t}}\n"
+                f"\tenvironment = {{\n\t\tSUTANDO_WORKSPACE => {ws}\n\t\tHOME => /x\n\t}}\n}}\n")
+
+    def test_macos_supervised_path_records_old_pid_then_kickstarts_and_signals_nothing(self):
+        calls, kills = [], []
+        wrapper = str(self.checkout / "src" / "launchd" / "gateway-bridge-wrapper.sh")
+        def run(argv, **kw):
+            calls.append(argv)
+            if argv[:2] == ["launchctl", "print"]:
+                return type("R", (), {"returncode": 0, "stdout": self._launchctl_print(wrapper, str(self.ws), 303)})()
+            return type("R", (), {"returncode": 0, "stdout": ""})()
+        with patch.object(mod.sys, "platform", "darwin"):
+            out = mod.stop_running_bridge({}, run=run, kill=lambda pid, sig: kills.append(pid))
+        self.assertEqual(out, {"mode": "launchd", "old_pid": 303})
+        self.assertEqual([c[:2] for c in calls], [["launchctl", "print"], ["launchctl", "kickstart"]])
+        self.assertEqual(kills, [], "the supervised path must never signal a pid — the replacement could be it")
+
+    def test_macos_foreign_launchd_job_is_left_alone(self):
+        calls = []
+        def run(argv, **kw):
+            calls.append(argv)
+            return type("R", (), {"returncode": 0, "stdout": self._launchctl_print("/other/checkout/src/launchd/gateway-bridge-wrapper.sh", str(self.ws), 77)})()
+        with patch.object(mod.sys, "platform", "darwin"):
+            out = mod.stop_running_bridge({}, run=run, kill=lambda *a: (_ for _ in ()).throw(AssertionError("kill")))
+        self.assertEqual(out["mode"], "none")
+        self.assertFalse(any(c[:2] == ["launchctl", "kickstart"] for c in calls))
+
+    # --- readiness -----------------------------------------------------------
+    def _status(self, **kw):
+        d = {"ts": time.time() + 1, "connected": True, "gateway": "https://relay.test/relay"}; d.update(kw)
+        (self.ws / "state" / "gateway-status.json").write_text(json.dumps(d))
+
+    def test_readiness_requires_a_new_lock_holder_not_the_old_pid(self):
+        old = self._standin(); self._lock(old.pid); self._status()
+        why = mod.wait_for_new_bridge({}, old.pid, time.time() - 5, "https://relay.test/relay", wait_s=1.5)
         self.assertIn("no new gateway bridge process", why)
 
-    def test_wait_for_new_bridge_accepts_a_fresh_connected_status_for_the_new_relay(self):
-        d = Path(tempfile.mkdtemp()); status = d / "gateway-status.json"
-        since = time.time()
-        status.write_text(json.dumps({"ts": since + 1, "connected": True, "gateway": "https://relay.test/relay"}))
-        with patch.object(mod, "gateway_status_path", return_value=status), \
-                patch.object(mod, "bridge_pids", return_value=[4242]):
-            self.assertEqual(mod.wait_for_new_bridge({}, [], since, "https://relay.test/relay", wait_s=2), "")
-        # An old-relay status, even if connected, is not the new connection.
-        status.write_text(json.dumps({"ts": since + 1, "connected": True, "gateway": "https://old.example/relay"}))
-        with patch.object(mod, "gateway_status_path", return_value=status), \
-                patch.object(mod, "bridge_pids", return_value=[4242]):
-            self.assertIn("not reported connected", mod.wait_for_new_bridge({}, [], since, "https://relay.test/relay", wait_s=1))
+    def test_readiness_rejects_same_host_different_path_and_other_host(self):
+        new = self._standin(); self._lock(new.pid)
+        for bad in ("https://relay.test/other-relay", "https://other-relay.test/relay", "https://relay.test.example/relay"):
+            self._status(gateway=bad)
+            why = mod.wait_for_new_bridge({}, None, time.time() - 5, "https://relay.test/relay", wait_s=1.5)
+            self.assertIn("expected https://relay.test/relay", why, bad)
+
+    def test_readiness_rejects_a_bridge_serving_another_agent(self):
+        new = self._standin(); self._lock(new.pid); self._status()
+        with patch.object(mod, "bridge_agent_id", return_value="@u-other.agent:x"):
+            why = mod.wait_for_new_bridge({}, None, time.time() - 5, "https://relay.test/relay", "@u-gce.agent:x", wait_s=1.5)
+        self.assertIn("serves @u-other.agent:x", why)
+
+    def test_readiness_success_needs_new_pid_fresh_connected_status_exact_relay_and_agent(self):
+        new = self._standin(); self._lock(new.pid); self._status(gateway="https://relay.test/relay/")
+        with patch.object(mod, "bridge_agent_id", return_value="@u-gce.agent:x"):
+            self.assertEqual(mod.wait_for_new_bridge({}, 1, time.time() - 5, "https://relay.test/relay", "@u-gce.agent:x", wait_s=3), "")
+        self._status(connected=False, error="auth rejected HTTP 401")
+        self.assertIn("not connected yet", mod.wait_for_new_bridge({}, 1, time.time() - 5, "https://relay.test/relay", wait_s=1.5))
+        self._status(ts=time.time() - 100)
+        self.assertIn("since the restart", mod.wait_for_new_bridge({}, 1, time.time() - 5, "https://relay.test/relay", wait_s=1.5))
 
 
 if __name__ == "__main__":

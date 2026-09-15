@@ -83,76 +83,179 @@ def sutando_env() -> dict:
     return env
 
 
-def bridge_pids() -> list[int]:
-    """PIDs of gateway bridges launched from THIS checkout (either entry name)."""
-    pids: list[int] = []
-    for marker in ("src/remote-gateway-bridge.py", "src/remote-relay-bridge.py"):
-        out = subprocess.run(["pgrep", "-f", str(REPO / marker)], capture_output=True, text=True)
-        pids += [int(x) for x in out.stdout.split() if x.isdigit() and int(x) != os.getpid()]
-    return sorted(set(pids))
-
-
-def stop_running_bridge(env: dict, wait_s: float = 15.0) -> list[int]:
-    """Stop the bridge that holds the OLD connection so the restart is real.
-
-    restart-gateway-lanes.sh only spawns; the bridge's singleton lock makes the
-    new process defer to a live old one, which would keep polling the previous
-    agent. On macOS a launchd-supervised job is bounced with kickstart -k
-    (it re-reads the env file on launch); a bare process is SIGTERMed and
-    waited for. The task watcher is never touched.
-    """
-    import signal
-    if sys.platform == "darwin":
-        svc = f"gui/{os.getuid()}/com.sutando.gateway-bridge"
-        if subprocess.run(["launchctl", "print", svc], capture_output=True).returncode == 0:
-            subprocess.run(["launchctl", "kickstart", "-k", svc], capture_output=True)
-    victims = bridge_pids()
-    for pid in victims:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-    deadline = time.time() + wait_s
-    while time.time() < deadline and any(p in bridge_pids() for p in victims):
-        time.sleep(0.5)
-    left = [p for p in victims if p in bridge_pids()]
-    for pid in left:
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-    return victims
-
-
-def gateway_status_path(env: dict) -> Path:
+def workspace_path(env: dict) -> Path:
     out = subprocess.run(["bash", str(REPO / "scripts" / "sutando-config.sh"), "workspace"],
                          capture_output=True, text=True, check=True, env=env)
-    return Path(out.stdout.strip()) / "state" / "gateway-status.json"
+    return Path(out.stdout.strip())
 
 
-def wait_for_new_bridge(env: dict, old_pids: list[int], since: float, relay_url: str, wait_s: float = 90.0) -> str:
-    """Return "" when a fresh bridge is serving the new relay, else the reason it is not (yet).
+# The one bridge this may replace: this workspace's primary-lane lock holder.
+# Never by argv — named lanes and other workspaces share it verbatim.
+def primary_lock_path(ws: Path) -> Path:
+    return ws / "state" / "locks" / "gateway-bridge.lock"
 
-    90 s: a just-minted bearer can take one poll to propagate to the relay (a 401 the
-    bridge retries after 30 s), so the wait must outlast at least one re-check.
+
+def lock_holder(ws: Path) -> "dict | None":
+    try:
+        d = json.loads(primary_lock_path(ws).read_text())
+        return d if isinstance(d, dict) and isinstance(d.get("pid"), int) else None
+    except (OSError, ValueError):
+        return None
+
+
+def bridge_markers() -> tuple[str, str]:
+    return (str(REPO / "src" / "remote-gateway-bridge.py"), str(REPO / "src" / "remote-relay-bridge.py"))
+
+
+def pid_is_this_checkouts_bridge(pid: int) -> bool:
+    try:
+        args = subprocess.run(["ps", "-o", "args=", "-p", str(pid)], capture_output=True, text=True).stdout
+    except OSError:
+        return False
+    return any(m in args for m in bridge_markers())
+
+
+def primary_bridge_pid(ws: Path) -> "int | None":
+    """PID of this workspace's primary-lane bridge, or None when the lock is absent, stale, or foreign."""
+    h = lock_holder(ws)
+    if not h:
+        return None
+    pid = h["pid"]
+    if pid == os.getpid() or not pid_is_this_checkouts_bridge(pid):
+        return None
+    return pid
+
+
+def bridge_agent_id(pid: int) -> "str | None":
+    """AGENT_ID from the bridge's environment where the OS exposes it (Linux); None elsewhere."""
+    try:
+        raw = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        return None
+    for item in raw.split(b"\0"):
+        if item.startswith(b"AGENT_ID="):
+            return item[len(b"AGENT_ID="):].decode(errors="replace").strip() or None
+    return None
+
+
+LAUNCHD_LABEL = "com.sutando.gateway-bridge"
+
+
+def launchd_job(ws: Path, run=subprocess.run) -> "dict | None":
+    """The user's gateway launchd job, with `ours` = it runs THIS checkout against THIS workspace."""
+    if sys.platform != "darwin":
+        return None
+    svc = f"gui/{os.getuid()}/{LAUNCHD_LABEL}"
+    r = run(["launchctl", "print", svc], capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    text = r.stdout
+    m = re.search(r"^\s*pid = (\d+)", text, re.M)
+    wrapper = str(REPO / "src" / "launchd" / "gateway-bridge-wrapper.sh")
+    args = _launchctl_block(text, "arguments")
+    envb = _launchctl_block(text, "environment")
+    ours = (wrapper in args) and any(
+        ln.startswith("SUTANDO_WORKSPACE") and ln.split("=>", 1)[-1].strip() == str(ws) for ln in envb)
+    return {"service": svc, "pid": int(m.group(1)) if m else None, "ours": ours}
+
+
+def _launchctl_block(text: str, name: str) -> list[str]:
+    lines = text.splitlines()
+    for i, ln in enumerate(lines):
+        if ln.strip() == f"{name} = {{":
+            out = []
+            for raw in lines[i + 1:]:
+                if raw.strip() == "}":
+                    return out
+                out.append(raw.strip())
+    return []
+
+
+def stop_running_bridge(env: dict, wait_s: float = 15.0, run=subprocess.run, kill=os.kill) -> dict:
+    """Retire the primary-lane bridge of THIS workspace so the restart is real.
+
+    Supervised (macOS, launchd job verified to run this checkout + workspace):
+    record its pid, one `kickstart -k`, signal nothing — the job restarts
+    itself and re-reads the env file. Unsupervised: SIGTERM the lock-holding
+    pid (after checking its argv is this checkout's bridge), wait for exit.
+    Named lanes, other workspaces and foreign launchd jobs are never touched.
     """
-    status = gateway_status_path(env)
-    host = relay_url.split("//", 1)[-1].split("/", 1)[0]
+    import signal
+    ws = workspace_path(env)
+    old_pid = primary_bridge_pid(ws)
+    job = launchd_job(ws, run=run)
+    if job and job["ours"]:
+        run(["launchctl", "kickstart", "-k", job["service"]], capture_output=True)
+        return {"mode": "launchd", "old_pid": job["pid"] or old_pid}
+    if job and not job["ours"]:
+        print(f"ag2space-connect: the {LAUNCHD_LABEL} launchd job belongs to another checkout/workspace — left alone",
+              file=sys.stderr)
+    if old_pid is None:
+        return {"mode": "none", "old_pid": None}
+    try:
+        kill(old_pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return {"mode": "none", "old_pid": None}
     deadline = time.time() + wait_s
-    seen_pid = False
+    while time.time() < deadline and pid_is_this_checkouts_bridge(old_pid):
+        time.sleep(0.5)
+    if pid_is_this_checkouts_bridge(old_pid):
+        try:
+            kill(old_pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    return {"mode": "bare", "old_pid": old_pid}
+
+
+def normalize_relay(url: str) -> str:
+    """scheme://host[:port]/path — what the bridge persists in gateway-status.json."""
+    from urllib.parse import urlsplit
+    p = urlsplit(url.strip())
+    host = (p.hostname or "").lower() + (f":{p.port}" if p.port else "")
+    return f"{p.scheme.lower()}://{host}{p.path.rstrip('/')}"
+
+
+def wait_for_new_bridge(env: dict, old_pid: "int | None", since: float, relay_url: str,
+                        agent_id: "str | None" = None, wait_s: float = 90.0) -> str:
+    """Return "" once the REPLACEMENT is serving the new connection, else why not (yet).
+
+    Evidence required, all at once: this workspace's lock is held by a live
+    bridge pid that is not the old one; that bridge's AGENT_ID is the new
+    agent where the OS exposes it; and gateway-status.json, which only the
+    lock holder writes, is newer than the restart, `connected`, and names
+    exactly this relay (full normalized URL, not a hostname). 90 s: a
+    just-minted bearer can take one long-poll (25 s) plus a 30 s auth
+    re-check before the relay accepts it.
+    """
+    ws = workspace_path(env)
+    status = ws / "state" / "gateway-status.json"
+    want = normalize_relay(relay_url)
+    deadline = time.time() + wait_s
+    last = "no new gateway bridge process took this workspace's lock"
     while time.time() < deadline:
-        live = [p for p in bridge_pids() if p not in old_pids]
-        seen_pid = seen_pid or bool(live)
+        pid = primary_bridge_pid(ws)
+        if pid is None or pid == old_pid:
+            last = "no new gateway bridge process took this workspace's lock"
+            time.sleep(1); continue
+        seen_agent = bridge_agent_id(pid)
+        if agent_id and seen_agent and seen_agent != agent_id:
+            last = f"bridge pid {pid} serves {seen_agent}, not {agent_id}"
+            time.sleep(1); continue
         try:
             st = json.loads(status.read_text())
-            if float(st.get("ts") or 0) >= since and st.get("connected") and host in str(st.get("gateway") or ""):
-                return ""
         except (OSError, ValueError):
-            pass
+            last = f"bridge pid {pid} is up but {status} is not readable yet"
+            time.sleep(1); continue
+        if float(st.get("ts") or 0) < since:
+            last = f"bridge pid {pid} is up but has not written status since the restart"
+        elif normalize_relay(str(st.get("gateway") or "")) != want:
+            last = f"bridge pid {pid} reports gateway {st.get('gateway')!r}, expected {want}"
+        elif not st.get("connected"):
+            last = f"bridge pid {pid} is not connected yet: {st.get('error') or 'waiting'}"
+        else:
+            return ""
         time.sleep(1)
-    if not seen_pid:
-        return "no new gateway bridge process appeared"
-    return f"bridge started but {status} has not reported connected to {host} yet (check workspace/logs/remote-gateway-bridge.log)"
+    return last + " (check workspace/logs/remote-gateway-bridge.log)"
 
 
 def env_path(env: dict) -> Path:
@@ -288,15 +391,17 @@ def main() -> int:
         return 0
     # A replaced connection must replace the RUNNING bridge too, or the old
     # process keeps polling the previous agent while this prints success.
-    old_pids = stop_running_bridge(senv) if replacing else []
-    if old_pids:
-        print(f"Stopped the previous gateway bridge (pid {', '.join(map(str, old_pids))}).")
+    stopped = stop_running_bridge(senv) if replacing else {"mode": "none", "old_pid": None}
+    if stopped["mode"] == "launchd":
+        print(f"Bounced the launchd-supervised gateway bridge (was pid {stopped['old_pid']}).")
+    elif stopped["mode"] == "bare":
+        print(f"Stopped the previous gateway bridge (pid {stopped['old_pid']}).")
     since = time.time()
     rc = subprocess.run(["bash", str(REPO / "scripts" / "restart-gateway-lanes.sh")], env=senv).returncode
     if rc != 0:
         print(f"ag2space-connect: restart-gateway-lanes.sh exited {rc} — the env file is in place; run it again or bash src/startup.sh", file=sys.stderr)
         return 1
-    why = wait_for_new_bridge(senv, old_pids, since, poll["relay_url"])
+    why = wait_for_new_bridge(senv, stopped["old_pid"], since, poll["relay_url"], poll.get("agent_id"))
     if why:
         print(f"ag2space-connect: env file written but the connection is PENDING — {why}", file=sys.stderr)
         return 1

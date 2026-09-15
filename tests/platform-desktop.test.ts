@@ -232,12 +232,12 @@ describe('press_key target activation (injected runner, no desktop)', () => {
 		]);
 		assert.match((r as { error: string }).error, /chromium/);
 	});
-	it('darwin: the single activate line, alias applied, failure reported but not retried', () => {
+	it('darwin: the single activate line with the name AS SPOKEN (no alias), failure reported but not retried', () => {
 		calls.length = 0;
 		const r = activateForKeystroke('chrome', 'darwin', (plan) => { calls.push([plan.cmd, ...plan.args]); throw new Error('denied'); });
 		assert.equal(r.ok, false);
 		assert.equal(calls.length, 1);
-		assert.deepEqual(calls[0], ['osascript', '-e', 'tell application "Google Chrome" to activate']);
+		assert.deepEqual(calls[0], ['osascript', '-e', 'tell application "chrome" to activate']);
 	});
 });
 

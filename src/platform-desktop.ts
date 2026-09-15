@@ -302,7 +302,9 @@ export function activateForKeystroke(
 	platform: HostPlatform,
 	run: (plan: Plan) => unknown = runPlan,
 ): ActivateOutcome {
-	const name = resolveAppAlias(app, platform);
+	// darwin keeps the name exactly as spoken (press_key never aliased there);
+	// linux maps it to the WM_CLASS the window carries.
+	const name = platform === 'linux' ? resolveAppAlias(app, platform) : app;
 	try {
 		run(activateOnlyPlan(name, platform));
 		return { ok: true };

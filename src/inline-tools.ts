@@ -213,7 +213,9 @@ export const pressKeyTool: ToolDefinition = {
 			if (!activated.ok && platform === 'linux') {
 				return { error: `Could not activate ${app} for press_key — ${activated.error}. No key was sent.` };
 			}
-			await new Promise(r => setTimeout(r, 300));
+			// The settle delay follows a SUCCESSFUL activation only (darwin's old
+			// try/catch skipped it on failure).
+			if (activated.ok) await new Promise(r => setTimeout(r, 300));
 		}
 		// Key-code table (darwin) / keysym table (linux) live in the backend:
 		// voice-spoken aliases such as "downarrow" resolve there on both.
