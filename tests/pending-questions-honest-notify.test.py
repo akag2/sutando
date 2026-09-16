@@ -15,12 +15,84 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 
 
-def _load(results_dir):
+class _Which:
+    """Pins desktop-notifier discovery so the suite does not depend on the host:
+    `available` names the commands `shutil.which` should find."""
+
+    def __init__(self, *available):
+        self.available = set(available)
+
+    def which(self, cmd):
+        return f"/fake/bin/{cmd}" if cmd in self.available else None
+
+
+def _load(results_dir, notifiers=("osascript",)):
     spec = importlib.util.spec_from_file_location("cpq", REPO / "src" / "check-pending-questions.py")
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
     m.RESULTS_DIR = Path(results_dir)
+    # The AppleScript/body-format fixtures below mock subprocess only; discovery
+    # must be pinned to macOS here or a host without osascript never reaches them.
+    m.shutil = _Which(*notifiers)
     return m
+
+
+class TestNotifierDiscovery(unittest.TestCase):
+    """notify_macos on hosts without osascript (round-5 review): notify-send when
+    present, an honest False when nothing is, never an exception — and deliver()
+    still reaches the voice/DM paths in every case."""
+
+    def _deliver_reaches_fallbacks(self, m):
+        reached = []
+        m.notify_discord_dm = lambda q: reached.append("dm")
+        m.notify_voice = lambda q: reached.append("voice")
+        m.voice_client_connected = lambda: True
+        m.undrained_proactive_files = lambda: []
+        s = m.deliver([{"title": "q"}], 1, ["q"])
+        self.assertEqual(reached, ["voice", "dm"])
+        return s
+
+    def test_linux_uses_notify_send(self):
+        import tempfile
+        m = _load(tempfile.mkdtemp(prefix="cpq-ns-"), notifiers=("notify-send",))
+        sent = []
+        class Sub:
+            def run(self, argv, **kw):
+                sent.append(argv)
+                return type("R", (), {"returncode": 0})()
+        m.subprocess = Sub()
+        self.assertTrue(m.notify_macos(2, ["a", "b"]))
+        self.assertEqual(sent[0][:2], ["notify-send", "Sutando"])
+        self.assertNotIn("osascript", sent[0])
+        self.assertIn("macos=ok", self._deliver_reaches_fallbacks(m))
+
+    def test_no_notifier_installed_is_failed_not_a_crash(self):
+        import tempfile
+        m = _load(tempfile.mkdtemp(prefix="cpq-none-"), notifiers=())
+        class Sub:
+            def run(self, *a, **kw):
+                raise AssertionError("nothing must be spawned when no notifier exists")
+        m.subprocess = Sub()
+        self.assertFalse(m.notify_macos(1, ["t"]))
+        self.assertIn("macos=FAILED", self._deliver_reaches_fallbacks(m))
+
+    def test_spawn_failure_is_failed_not_a_crash(self):
+        import tempfile
+        m = _load(tempfile.mkdtemp(prefix="cpq-oserr-"), notifiers=("notify-send",))
+        class Sub:
+            def run(self, *a, **kw):
+                raise OSError(2, "No such file or directory", "notify-send")
+        m.subprocess = Sub()
+        self.assertFalse(m.notify_macos(1, ["t"]))
+        self.assertIn("macos=FAILED", self._deliver_reaches_fallbacks(m))
+
+    def test_macos_prefers_osascript_when_both_exist(self):
+        import tempfile
+        m = _load(tempfile.mkdtemp(prefix="cpq-both-"), notifiers=("osascript", "notify-send"))
+        sent = []
+        m.subprocess = _Capture(sent)
+        self.assertTrue(m.notify_macos(1, ["t"]))
+        self.assertIn("display notification", sent[0])
 
 
 def _notification_body(applescript):
