@@ -191,9 +191,53 @@ class BridgeReplacement(unittest.TestCase):
             self.assertEqual(mod.stop_running_bridge({}, wait_s=1)["mode"], "none")
         self.assertIsNone(other.poll())
 
-    def _launchctl_print(self, wrapper: str, ws: str, pid: int) -> str:
+    def _launchctl_print(self, wrapper: str, ws: str, pid: int, config_dir: str = "") -> str:
+        ccd = f"\t\tCLAUDE_CONFIG_DIR => {config_dir}\n" if config_dir else ""
         return (f"gui/501/{mod.LAUNCHD_LABEL} = {{\n\tpid = {pid}\n\targuments = {{\n\t\t/bin/bash\n\t\t{wrapper}\n\t}}\n"
-                f"\tenvironment = {{\n\t\tSUTANDO_WORKSPACE => {ws}\n\t\tHOME => /x\n\t}}\n}}\n")
+                f"\tenvironment = {{\n\t\tSUTANDO_WORKSPACE => {ws}\n{ccd}\t\tHOME => /x\n\t}}\n}}\n")
+
+    def test_macos_job_baked_to_another_config_dir_is_reinstalled_not_kickstarted(self):
+        """Round-4 finding: kickstarting a job whose plist bakes the OLD CLAUDE_CONFIG_DIR
+        reloads the old channel .env, so the 'new' bridge is the old agent with a new pid."""
+        calls = []
+        wrapper = str(self.checkout / "src" / "launchd" / "gateway-bridge-wrapper.sh")
+        new_dir = self.tmp / "cfg-new"; new_dir.mkdir()
+        old_dir = self.tmp / "cfg-old"; old_dir.mkdir()
+        def run(argv, **kw):
+            calls.append((argv, kw.get("env")))
+            if argv[:2] == ["launchctl", "print"]:
+                return type("R", (), {"returncode": 0, "stdout": self._launchctl_print(wrapper, str(self.ws), 303, str(old_dir))})()
+            return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        env = {"CLAUDE_CONFIG_DIR": str(new_dir)}
+        with patch.object(mod.sys, "platform", "darwin"):
+            out = mod.stop_running_bridge(env, run=run, kill=lambda pid, sig: (_ for _ in ()).throw(AssertionError("kill")))
+        self.assertEqual(out, {"mode": "launchd-reinstalled", "old_pid": 303})
+        self.assertFalse(any(a[:2] == ["launchctl", "kickstart"] for a, _ in calls), "a stale job must not be kickstarted")
+        install = [(a, e) for a, e in calls if a[0] == "bash" and a[1].endswith("install-gateway-bridge-launchd.sh")]
+        self.assertEqual(len(install), 1)
+        self.assertEqual(install[0][0][-1], "install")
+        self.assertEqual(install[0][1]["CLAUDE_CONFIG_DIR"], str(new_dir), "the installer must bake the directory just written")
+        # Same directory (also via a symlink) → an ordinary kickstart.
+        link = self.tmp / "cfg-link"; link.symlink_to(new_dir)
+        calls.clear()
+        def run2(argv, **kw):
+            calls.append((argv, kw.get("env")))
+            if argv[:2] == ["launchctl", "print"]:
+                return type("R", (), {"returncode": 0, "stdout": self._launchctl_print(wrapper, str(self.ws), 303, str(link))})()
+            return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        with patch.object(mod.sys, "platform", "darwin"):
+            out = mod.stop_running_bridge(env, run=run2)
+        self.assertEqual(out["mode"], "launchd")
+
+    def test_macos_failed_reinstall_is_reported_not_claimed(self):
+        wrapper = str(self.checkout / "src" / "launchd" / "gateway-bridge-wrapper.sh")
+        def run(argv, **kw):
+            if argv[:2] == ["launchctl", "print"]:
+                return type("R", (), {"returncode": 0, "stdout": self._launchctl_print(wrapper, str(self.ws), 303, "/old-config")})()
+            return type("R", (), {"returncode": 1, "stdout": "", "stderr": "bootstrap failed"})()
+        with patch.object(mod.sys, "platform", "darwin"):
+            out = mod.stop_running_bridge({"CLAUDE_CONFIG_DIR": str(self.tmp)}, run=run)
+        self.assertEqual(out["mode"], "launchd-stale")
 
     def test_macos_supervised_path_records_old_pid_then_kickstarts_and_signals_nothing(self):
         calls, kills = [], []
@@ -241,6 +285,20 @@ class BridgeReplacement(unittest.TestCase):
         with patch.object(mod, "bridge_agent_id", return_value="@u-other.agent:x"):
             why = mod.wait_for_new_bridge({}, None, time.time() - 5, "https://relay.test/relay", "@u-gce.agent:x", wait_s=1.5)
         self.assertIn("serves @u-other.agent:x", why)
+
+    def test_readiness_without_process_identity_uses_the_status_agent_id(self):
+        """macOS hides /proc-style environments: the bridge's own status must
+        name the agent, and an unknown identity is never success (round 4)."""
+        new = self._standin(); self._lock(new.pid)
+        with patch.object(mod, "bridge_agent_id", return_value=None):
+            self._status()                                     # connected, right relay, no agent_id
+            why = mod.wait_for_new_bridge({}, 1, time.time() - 5, "https://relay.test/relay", "@new.agent:test", wait_s=1.5)
+            self.assertIn("has not reported which agent it serves", why)
+            self._status(agent_id="@old.agent:test")            # same relay, old configuration reconnected
+            why = mod.wait_for_new_bridge({}, 1, time.time() - 5, "https://relay.test/relay", "@new.agent:test", wait_s=1.5)
+            self.assertIn("serves @old.agent:test, not @new.agent:test", why)
+            self._status(agent_id="@new.agent:test")
+            self.assertEqual(mod.wait_for_new_bridge({}, 1, time.time() - 5, "https://relay.test/relay", "@new.agent:test", wait_s=3), "")
 
     def test_readiness_success_needs_new_pid_fresh_connected_status_exact_relay_and_agent(self):
         new = self._standin(); self._lock(new.pid); self._status(gateway="https://relay.test/relay/")

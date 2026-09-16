@@ -141,8 +141,11 @@ def bridge_agent_id(pid: int) -> "str | None":
 LAUNCHD_LABEL = "com.sutando.gateway-bridge"
 
 
-def launchd_job(ws: Path, run=subprocess.run) -> "dict | None":
-    """The user's gateway launchd job, with `ours` = it runs THIS checkout against THIS workspace."""
+def launchd_job(ws: Path, run=subprocess.run, config_dir: "str | None" = None) -> "dict | None":
+    """The user's gateway launchd job. `ours` = it runs THIS checkout against THIS
+    workspace; `stale` = ours, but its baked CLAUDE_CONFIG_DIR is not `config_dir`
+    (the directory the new credentials were just written under), so a kickstart
+    would reload the OLD channel .env and connect as the old agent."""
     if sys.platform != "darwin":
         return None
     svc = f"gui/{os.getuid()}/{LAUNCHD_LABEL}"
@@ -154,9 +157,26 @@ def launchd_job(ws: Path, run=subprocess.run) -> "dict | None":
     wrapper = str(REPO / "src" / "launchd" / "gateway-bridge-wrapper.sh")
     args = _launchctl_block(text, "arguments")
     envb = _launchctl_block(text, "environment")
-    ours = (wrapper in args) and any(
-        ln.startswith("SUTANDO_WORKSPACE") and ln.split("=>", 1)[-1].strip() == str(ws) for ln in envb)
-    return {"service": svc, "pid": int(m.group(1)) if m else None, "ours": ours}
+    def _env(key: str) -> str:
+        for ln in envb:
+            if ln.startswith(key) and ln[len(key):].lstrip().startswith("=>"):
+                return ln.split("=>", 1)[-1].strip()
+        return ""
+    ours = (wrapper in args) and _env("SUTANDO_WORKSPACE") == str(ws)
+    job_dir = _env("CLAUDE_CONFIG_DIR")
+    stale = bool(ours and config_dir and _same_path(job_dir, config_dir) is False)
+    return {"service": svc, "pid": int(m.group(1)) if m else None, "ours": ours,
+            "config_dir": job_dir or None, "stale": stale}
+
+
+def _same_path(a: str, b: str) -> bool:
+    """Path equality after resolving symlinks; a missing or empty side is unequal."""
+    if not a or not b:
+        return False
+    try:
+        return Path(a).resolve() == Path(b).resolve()
+    except OSError:
+        return a.rstrip("/") == b.rstrip("/")
 
 
 def _launchctl_block(text: str, name: str) -> list[str]:
@@ -183,7 +203,19 @@ def stop_running_bridge(env: dict, wait_s: float = 15.0, run=subprocess.run, kil
     import signal
     ws = workspace_path(env)
     old_pid = primary_bridge_pid(ws)
-    job = launchd_job(ws, run=run)
+    job = launchd_job(ws, run=run, config_dir=env.get("CLAUDE_CONFIG_DIR"))
+    if job and job["ours"] and job["stale"]:
+        # A kickstart would reload the OLD baked CLAUDE_CONFIG_DIR; the installer
+        # boots the job out and re-bootstraps it with the current directory.
+        print(f"ag2space-connect: {LAUNCHD_LABEL} is baked to CLAUDE_CONFIG_DIR={job['config_dir']}, "
+              f"not {env.get('CLAUDE_CONFIG_DIR')} — reinstalling the launchd job", file=sys.stderr)
+        r = run(["bash", str(REPO / "src" / "install-gateway-bridge-launchd.sh"), "install"],
+                capture_output=True, text=True, env=env)
+        if r.returncode != 0:
+            print(f"ag2space-connect: launchd reinstall failed (rc={r.returncode}): {(r.stderr or r.stdout or '').strip()[-400:]}",
+                  file=sys.stderr)
+            return {"mode": "launchd-stale", "old_pid": job["pid"] or old_pid}
+        return {"mode": "launchd-reinstalled", "old_pid": job["pid"] or old_pid}
     if job and job["ours"]:
         run(["launchctl", "kickstart", "-k", job["service"]], capture_output=True)
         return {"mode": "launchd", "old_pid": job["pid"] or old_pid}
@@ -220,11 +252,14 @@ def wait_for_new_bridge(env: dict, old_pid: "int | None", since: float, relay_ur
     """Return "" once the REPLACEMENT is serving the new connection, else why not (yet).
 
     Evidence required, all at once: this workspace's lock is held by a live
-    bridge pid that is not the old one; that bridge's AGENT_ID is the new
-    agent where the OS exposes it; and gateway-status.json, which only the
+    bridge pid that is not the old one; gateway-status.json, which only the
     lock holder writes, is newer than the restart, `connected`, and names
-    exactly this relay (full normalized URL, not a hostname). 90 s: a
-    just-minted bearer can take one long-poll (25 s) plus a 30 s auth
+    exactly this relay (full normalized URL, not a hostname); and that bridge
+    positively reports serving the new agent — from /proc where the OS has it,
+    else from the `agent_id` the bridge writes into its own status. An
+    unknown identity is not evidence: on macOS the old configuration can
+    reconnect to the same relay with a new pid and look identical otherwise.
+    90 s: a just-minted bearer can take one long-poll (25 s) plus a 30 s auth
     re-check before the relay accepts it.
     """
     ws = workspace_path(env)
@@ -237,21 +272,22 @@ def wait_for_new_bridge(env: dict, old_pid: "int | None", since: float, relay_ur
         if pid is None or pid == old_pid:
             last = "no new gateway bridge process took this workspace's lock"
             time.sleep(1); continue
-        seen_agent = bridge_agent_id(pid)
-        if agent_id and seen_agent and seen_agent != agent_id:
-            last = f"bridge pid {pid} serves {seen_agent}, not {agent_id}"
-            time.sleep(1); continue
         try:
             st = json.loads(status.read_text())
         except (OSError, ValueError):
             last = f"bridge pid {pid} is up but {status} is not readable yet"
             time.sleep(1); continue
-        if float(st.get("ts") or 0) < since:
+        seen_agent = bridge_agent_id(pid) or (str(st.get("agent_id") or "").strip() or None)
+        if agent_id and seen_agent and seen_agent != agent_id:
+            last = f"bridge pid {pid} serves {seen_agent}, not {agent_id}"
+        elif float(st.get("ts") or 0) < since:
             last = f"bridge pid {pid} is up but has not written status since the restart"
         elif normalize_relay(str(st.get("gateway") or "")) != want:
             last = f"bridge pid {pid} reports gateway {st.get('gateway')!r}, expected {want}"
         elif not st.get("connected"):
             last = f"bridge pid {pid} is not connected yet: {st.get('error') or 'waiting'}"
+        elif agent_id and not seen_agent:
+            last = f"bridge pid {pid} is connected but has not reported which agent it serves (expected {agent_id})"
         else:
             return ""
         time.sleep(1)
@@ -392,8 +428,16 @@ def main() -> int:
     # A replaced connection must replace the RUNNING bridge too, or the old
     # process keeps polling the previous agent while this prints success.
     stopped = stop_running_bridge(senv) if replacing else {"mode": "none", "old_pid": None}
+    if stopped["mode"] == "launchd-stale":
+        print("ag2space-connect: the credential file is written, but the launchd job still runs the OLD "
+              "CLAUDE_CONFIG_DIR and could not be reinstalled — the running bridge is NOT the new agent. "
+              "Fix the install (bash src/install-gateway-bridge-launchd.sh install) and run bash scripts/restart-gateway-lanes.sh",
+              file=sys.stderr)
+        return 1
     if stopped["mode"] == "launchd":
         print(f"Bounced the launchd-supervised gateway bridge (was pid {stopped['old_pid']}).")
+    elif stopped["mode"] == "launchd-reinstalled":
+        print(f"Reinstalled the launchd-supervised gateway bridge for the current CLAUDE_CONFIG_DIR (was pid {stopped['old_pid']}).")
     elif stopped["mode"] == "bare":
         print(f"Stopped the previous gateway bridge (pid {stopped['old_pid']}).")
     since = time.time()

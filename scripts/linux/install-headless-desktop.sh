@@ -52,10 +52,11 @@ USER_ID="$(id -u)"
 USER_HOME="$(getent passwd "$USER_NAME" | cut -d: -f6)"
 
 export DEBIAN_FRONTEND=noninteractive
-# TigerVNC's Xvnc, not Xvfb + x11vnc: on Debian 12's Xvfb (xserver 21.1.7)
-# GTK3 apps get pointer motion and keys but never a button press, so WebKitGTK
-# windows (the AG2 Space desktop app) and even the XFCE panel menus cannot be
-# clicked over VNC. Xvnc is a full X server and delivers buttons normally.
+# TigerVNC's Xvnc, not Xvfb + x11vnc: in the original Xvfb + XFCE + x11vnc
+# session GTK3 windows (WebKitGTK apps, the XFCE panel menu) got pointer motion
+# and keys but no mouse button presses, while the same test on Xvnc passed. A
+# fresh bare Xvfb did deliver clicks, so the cause is unexplained; Xvnc is the
+# setup verified working end to end, and it needs one process instead of two.
 echo "→ apt: tigervnc, xfce4, novnc, chromium"
 sudo apt-get update -y
 sudo apt-get install -y tigervnc-standalone-server novnc websockify xfce4 xfce4-terminal dbus-x11 chromium \

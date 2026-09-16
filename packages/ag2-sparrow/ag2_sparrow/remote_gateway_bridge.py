@@ -2749,6 +2749,9 @@ def _emit_gateway_status(connected: bool, *, error: str | None = None,
             "backoff_s": int(backoff_s),
             "error": _one_line(error) if error else None,
             "gateway": _redact_url(URL),
+            # Which agent this bridge serves, so a restart can be verified by
+            # identity on hosts that hide process environments (macOS).
+            "agent_id": (os.environ.get("AGENT_MXID") or os.environ.get("AGENT_ID") or "").strip() or None,
             "launched_via": _LAUNCHED_VIA,
             "schema_version": 1,
             "runtime": {**RUNTIME_IDENTITY, "engine": _engine_desc(),

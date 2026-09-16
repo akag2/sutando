@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -295,10 +296,18 @@ def notify_macos(count, titles):
     # notification silently reports FAILED (bit us 2026-07-26 — a title
     # containing a quoted phrase broke every fire while it sat in the top 3).
     esc = msg.replace("\\", "\\\\").replace('"', '\\"')
-    r = subprocess.run([
-        "osascript", "-e",
-        f'display notification "{esc}" with title "Sutando"'
-    ], capture_output=True)
+    # No osascript (Linux): notify-send when present, else FAILED — never a
+    # crash, so deliver() still reaches the voice and DM paths.
+    if shutil.which("osascript"):
+        argv = ["osascript", "-e", f'display notification "{esc}" with title "Sutando"']
+    elif shutil.which("notify-send"):
+        argv = ["notify-send", "Sutando", msg]
+    else:
+        return False
+    try:
+        r = subprocess.run(argv, capture_output=True)
+    except OSError:
+        return False
     return r.returncode == 0
 
 

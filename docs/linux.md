@@ -19,11 +19,12 @@ live. Treat "implemented" rows as beta until someone reports them working.
 | Surface | Linux status | Backend |
 |---|---|---|
 | Boot (`startup.sh`), dashboard `:7844`, agent API `:7843`, web client `:8080` | verified | unchanged (Python / Node) |
-| Core agent session (Claude Code in tmux) | verified up to Claude's login prompt; task round trip after `claude login` **not yet witnessed** | unchanged — `src/agent/start-cli.sh` |
-| Task watcher (`tasks/` → core) | implemented (fswatch's inotify backend maps create + move-in to `Created`) | `fswatch` |
+| Core agent session (Claude Code in tmux) | verified — logged in; AG2 Space DM round trips witnessed (owner's and an independent reviewer's, replies in 11–18 s) | unchanged — `src/agent/start-cli.sh` |
+| Task watcher (`tasks/` → core) | verified — gateway tasks reached the core and results were delivered back | `fswatch` |
 | Screen capture `:7845` — still frames, `/displays`, downscale | verified | `scrot` / ImageMagick `import`; resize via `mogrify` |
-| Screen recording (`/capture-video`) | implemented — start/stop + decode not exercised live | `ffmpeg -f x11grab` (+ PulseAudio only when `pactl info` answers) → `.mp4` |
-| `press_key`, `type_text`, `switch_app` | implemented | `xdotool` |
+| Screen recording (`/capture-video`) | verified — start/stop, output decodes (h264 + aac) | `ffmpeg -f x11grab` (+ PulseAudio only when `pactl info` answers) → `.mp4` |
+| `press_key`, `type_text`, `switch_app` | verified (`xdotool` typing into a desktop window) | `xdotool` |
+| Pending-question desktop notification (`check-pending-questions.py`) | implemented — `notify-send` when present; reported as FAILED (never a crash) without it, the voice/DM paths still run | libnotify |
 | `clipboard` | implemented | `xclip` (or `xsel`) |
 | `open_file`, dashboard auto-open | implemented | `xdg-open` (a missing opener is reported to the caller, never crashes the service) |
 | `volume` | implemented | `pactl` (or `amixer`) |
@@ -84,10 +85,13 @@ noVNC on `127.0.0.1:6080` — and adds `export DISPLAY=:99` to your `~/.profile`
 VNC binds loopback only and has no password: the SSH (or cloud IAP) tunnel is
 the authentication.
 
-Why Xvnc and not Xvfb + x11vnc: on Debian 12's Xvfb, GTK3 applications receive
-pointer motion and key presses but never a mouse button press, so WebKitGTK
-windows (the AG2 Space desktop app) and even the XFCE panel menus cannot be
-clicked over VNC. Xvnc is a full X server and delivers buttons normally.
+Why Xvnc and not Xvfb + x11vnc: in the original Xvfb + XFCE + x11vnc session on
+the test VM, GTK3 windows (the AG2 Space desktop app, a bare WebKitGTK page, even
+the XFCE panel menu) received pointer motion and key presses but no mouse button
+presses, over VNC and from `xdotool` alike, and the same test on an Xvnc display
+passed. A fresh, bare Xvfb started later did deliver clicks, so the cause is a
+state of that session rather than an established Xvfb defect and remains
+unexplained. Xvnc is the configuration that was verified working end to end.
 
 **Trust boundary.** This installer assumes a single-user host you administer
 (a personal VM). Xvnc runs with `-ac` and without a VNC password, so any
