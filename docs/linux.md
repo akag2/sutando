@@ -89,9 +89,12 @@ Why Xvnc and not Xvfb + x11vnc: in the original Xvfb + XFCE + x11vnc session on
 the test VM, GTK3 windows (the AG2 Space desktop app, a bare WebKitGTK page, even
 the XFCE panel menu) received pointer motion and key presses but no mouse button
 presses, over VNC and from `xdotool` alike, and the same test on an Xvnc display
-passed. A fresh, bare Xvfb started later did deliver clicks, so the cause is a
-state of that session rather than an established Xvfb defect and remains
-unexplained. Xvnc is the configuration that was verified working end to end.
+passed. A fresh, bare Xvfb started later did deliver clicks, and so did a
+fresh Xvfb + XFCE + x11vnc install on a second host, so the cause was a state
+of that one session rather than an Xvfb defect and remains unexplained. Xvnc
+is kept because it was verified working end to end, it is one process instead
+of two, and the installer migration (old units → Xvnc, re-run, display and
+geometry change) was exercised on a disposable host.
 
 **Trust boundary.** This installer assumes a single-user host you administer
 (a personal VM). Xvnc runs with `-ac` and without a VNC password, so any

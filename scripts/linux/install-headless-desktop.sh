@@ -55,8 +55,8 @@ export DEBIAN_FRONTEND=noninteractive
 # TigerVNC's Xvnc, not Xvfb + x11vnc: in the original Xvfb + XFCE + x11vnc
 # session GTK3 windows (WebKitGTK apps, the XFCE panel menu) got pointer motion
 # and keys but no mouse button presses, while the same test on Xvnc passed. A
-# fresh bare Xvfb did deliver clicks, so the cause is unexplained; Xvnc is the
-# setup verified working end to end, and it needs one process instead of two.
+# fresh Xvfb (bare, and with XFCE + x11vnc on another host) did deliver clicks,
+# so the cause is unexplained; Xvnc is the setup verified end to end, one process.
 echo "→ apt: tigervnc, xfce4, novnc, chromium"
 sudo apt-get update -y
 sudo apt-get install -y tigervnc-standalone-server novnc websockify xfce4 xfce4-terminal dbus-x11 chromium \
