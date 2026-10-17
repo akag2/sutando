@@ -434,6 +434,23 @@ class PinnedEntries(unittest.TestCase):
         self.assertIn("h4-newest", r.head)
         self.assertNotIn("h4-newest", r.archived)
 
+    def test_a_newer_stamped_pin_still_does_not_flip_with_only_three_history_entries(self):
+        """Regression for the gap the majority vote itself had: with the endpoint
+        comparison counted as a second vote, the pin's direction only lost once 3+
+        history-only adjacent pairs opposed it (4+ history entries). Three history
+        entries -- one fewer than the original #4222 regression test above -- used
+        to still flip to newest-first, archiving the newest history entry.
+        """
+        E = lambda st, n: f"## {st} — {n}\n" + ("x" * 900) + "\n\n"
+        text = ("# t\n\n" + E("2026-09-12T18:15Z", "PINNED - state as of")
+                + E("2026-09-04T10:00Z", "h1") + E("2026-09-04T12:00Z", "h2")
+                + E("2026-09-11T07:57Z", "h3-newest"))
+        _, entries = ct.split(text)
+        self.assertIs(ct._orientation(entries), False)
+        r = ct.plan(text, 1200)
+        self.assertIn("h3-newest", r.head)
+        self.assertNotIn("h3-newest", r.archived)
+
     def test_the_over_budget_exit_says_it_wrote_and_how_much(self):
         """rc=3 next to 'nothing was archived' read as a no-op while 213 KB moved."""
         d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
