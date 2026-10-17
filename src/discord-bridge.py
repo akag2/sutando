@@ -159,7 +159,8 @@ def _is_discord_channel_id(value: str) -> bool:
     return value.isdigit() and 17 <= len(value) <= 20
 from result_markers import parse_markers, has_skip_action  # noqa: E402
 from ag2_sparrow.core_state_notice import (  # noqa: E402
-    plan_notices as _plan_core_notices, is_core_healthy as _core_is_healthy)
+    plan_notices as _plan_core_notices, is_core_healthy as _core_is_healthy,
+    NOTICE_BUDGET_S as _CORE_NOTICE_BUDGET_S)
 import mention_gate  # noqa: E402  — owner @-mention ingestion gate (skills/mention-gate)
 from policy.guardrail import engage_rulebook, DISCORD_PROVENANCE  # noqa: E402
 from policy.egress.result import guard_result_for_tier, resolve_access_tier as _resolve_task_tier  # noqa: E402
@@ -2791,7 +2792,10 @@ async def _core_notice_sweep(rooms) -> None:
     recovery revalidates health before each send — including AFTER the
     channel-resolution await, since the core can fail during
     that await — and stops if the core degraded again. A room the batch never
-    reached (health-abort) is not charged a failure. Never raises."""
+    reached (health-abort or budget) is not charged a failure. Bounded by
+    NOTICE_BUDGET_S, same as the sync sweep, so a slow run of channel
+    resolutions/sends can't hold the lock (and block intake's own sweep)
+    indefinitely. Never raises."""
     try:
         async with _core_notice_lock:
             plan = _plan_core_notices(
@@ -2802,8 +2806,11 @@ async def _core_notice_sweep(rooms) -> None:
             if plan is None:
                 return
             sent, attempted = [], []
+            deadline = time.monotonic() + _CORE_NOTICE_BUDGET_S
             try:
                 for room, body in plan.items:
+                    if time.monotonic() >= deadline:
+                        break  # bounded main-path time; the rest re-plan next sweep
                     if plan.kind == "recovery" and not _core_is_healthy(STATE_DIR):
                         break  # core degraded again mid-batch — stale recovery
                     ch = await _resolve_channel(room)

@@ -251,6 +251,29 @@ def main():
         rooms = bridge._core_notice_pending_rooms()
         expect(rooms == {"555000000000000012"},
                "pending rooms: only unanswered tasks (answered one excluded)")
+
+        # 10. review nit — NOTICE_BUDGET_S bounds the async sweep too.
+        # Both channels' sends burn the budget since plan.items order isn't guaranteed.
+        import unittest.mock as mock
+        reset()
+        _write_state(state_dir, "logged-out")
+        a, b = _Channel(555000000000000020), _Channel(555000000000000021)
+        registry[a.id], registry[b.id] = a, b
+        clock = [0.0]
+        real_a_send, real_b_send = a.send, b.send
+
+        async def _slow_a(body, *args, **kwargs):
+            clock[0] += bridge._CORE_NOTICE_BUDGET_S  # this send burns the budget
+            return await real_a_send(body, *args, **kwargs)
+
+        async def _slow_b(body, *args, **kwargs):
+            clock[0] += bridge._CORE_NOTICE_BUDGET_S
+            return await real_b_send(body, *args, **kwargs)
+        a.send, b.send = _slow_a, _slow_b
+        with mock.patch.object(bridge.time, "monotonic", lambda: clock[0]):
+            sweep({str(a.id), str(b.id)})
+        expect(len(a.sent) + len(b.sent) == 1,
+               "budget: the batch's 2nd room is never attempted once the budget is spent")
     finally:
         shutil.rmtree(state_dir, ignore_errors=True)
         shutil.rmtree(tmp_home, ignore_errors=True)
