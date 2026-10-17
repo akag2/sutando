@@ -42,7 +42,6 @@ class _StubApp:
 def _load_module():
     os.environ.setdefault("SLACK_BOT_TOKEN", "xoxb-test-token")
     os.environ.setdefault("SLACK_APP_TOKEN", "xapp-test-token")
-    os.environ.setdefault("SUTANDO_WORKSPACE", tempfile.mkdtemp(prefix="slcsn-ws-"))
     try:
         import slack_bolt as _real_bolt
         _real_bolt.App = _StubApp
