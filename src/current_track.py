@@ -163,15 +163,26 @@ def _orientation(entries):
 
     None is a real answer: `2026-09-06` against `2026-09-06T08:00:00Z` says nothing
     about their order, and guessing archives whichever live entry the guess misses.
+
+    Every comparable pair (the endpoints, plus each adjacent pair) casts one vote for
+    its local direction; a clear majority decides. One entry recorded out of order --
+    a correction appended where it landed rather than where its own heading date would
+    place it -- must not flip the call for an otherwise-consistent file: the file this
+    was found on has exactly that shape, and the single first-found-pair reading it
+    used to produce called the whole file newest-first, archiving the entry actually
+    appended last. An exact tie falls back to the first decisive pair in file order
+    (endpoints checked first) -- the historical tiebreak, kept so a genuinely balanced
+    file still resolves by its earliest strong signal rather than a coin flip.
     """
     keys = [k for k in (_stamp_key(e.splitlines()[0]) for e in entries) if k]
     if len(keys) < 2:
         return None
-    for a, b in ((keys[0], keys[-1]), *zip(keys, keys[1:])):
-        c = _cmp_stamps(a, b)
-        if c:
-            return c > 0
-    return None
+    votes = [c for c in (_cmp_stamps(a, b)
+                         for a, b in ((keys[0], keys[-1]), *zip(keys, keys[1:]))) if c]
+    if not votes:
+        return None
+    pos, neg = votes.count(1), votes.count(-1)
+    return (pos > neg) if pos != neg else (votes[0] > 0)
 
 
 def plan(text: str, keep_bytes: int, pin=PIN_DEFAULT) -> RotateResult:
